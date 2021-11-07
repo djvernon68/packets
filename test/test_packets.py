@@ -6,12 +6,12 @@ import logging
 import pandas
 from array import array
 
-from steelscript.packets.core.inetpkt import IP_CONST, Ethernet, ARP, IP, \
+from packets.core.inetpkt import IP_CONST, Ethernet, ARP, IP, \
     UDP, TCP, NullPkt
-from steelscript.packets.core.pcap import PCAPReader, PCAPWriter, \
+from packets.core.pcap import PCAPReader, PCAPWriter, \
     get_pkts_header
 
-from steelscript.packets.query.pcap_query import PcapQuery
+from packets.query.pcap_query import PcapQuery
 
 logger = logging.getLogger(__name__)
 

@@ -14,7 +14,7 @@ import socket
 import struct
 from threading import Event
 
-from steelscript.packets.core.inetpkt cimport Ethernet, PKT, NetflowSimple, \
+from packets.core.inetpkt cimport Ethernet, PKT, NetflowSimple, \
     PQ_NETFLOW_SIMPLE
 
 DEF USECCONST = 1000000.00

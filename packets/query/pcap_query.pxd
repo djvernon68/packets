@@ -8,7 +8,7 @@
 
 from libc.stdint cimport uint16_t
 
-from steelscript.packets.core.pcap cimport PCAPBase, pcap_pkthdr_t
+from packets.core.pcap cimport PCAPBase, pcap_pkthdr_t
 
 cdef:
     uint16_t ERRBUF_SIZE

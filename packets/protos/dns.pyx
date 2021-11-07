@@ -12,7 +12,7 @@ import socket
 from cpython.array cimport array
 from libc.stdint cimport uint16_t
 
-from steelscript.packets.core.inetpkt cimport PKT, set_bit, unset_bit, \
+from packets.core.inetpkt cimport PKT, set_bit, unset_bit, \
     set_short_nibble, get_short_nibble
 
 # Regex to see if data is a valid domain name

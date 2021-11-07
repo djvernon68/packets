@@ -11,7 +11,7 @@ import socket
 from array import array
 from collections import namedtuple
 
-from steelscript.packets.core.inetpkt import PKT
+from packets.core.inetpkt import PKT
 
 
 # Helper function to create named tuple from a dict.

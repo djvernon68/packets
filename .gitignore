@@ -3,7 +3,6 @@ dist
 .tmpdata
 *.egg-info
 RELEASE-VERSION
-steel_bootstrap.*
 
 *~
 *.pyc

@@ -15,9 +15,9 @@ import tzlocal
 import re
 import os
 
-from steelscript.packets.core.inetpkt cimport PKT, Ethernet, IP, TCP, ICMP, \
+from packets.core.inetpkt cimport PKT, Ethernet, IP, TCP, ICMP, \
     IGMP, UDP, ARP, MPLS, NullPkt, PQ_FRAME, PQ_TCP, PQ_UDP
-from steelscript.packets.core.pcap cimport PCAPSocket, PCAPReader, \
+from packets.core.pcap cimport PCAPSocket, PCAPReader, \
     pcap_pkthdr_t, findalldevs
 
 # Regex to determine if the field matches a payload offset pattern.

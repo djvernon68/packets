@@ -3,7 +3,7 @@
 import sys
 import argparse
 
-from steelscript.packets.core.pcap import netflow_replay_raw_sock, \
+from packets.core.pcap import netflow_replay_raw_sock, \
     netflow_replay_system_sock
 
 

@@ -10,7 +10,7 @@ from cpython.array cimport array
 from libc.stdint cimport int64_t, uint64_t, \
     int32_t, uint32_t, uint16_t, intptr_t
 
-from steelscript.packets.core.inetpkt cimport PKT
+from packets.core.inetpkt cimport PKT
 
 cpdef enum:
     # global
