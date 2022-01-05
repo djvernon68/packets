@@ -590,6 +590,8 @@ cpdef int netflow_replay_raw_sock(str device,
                                   str dest_ip,
                                   str dest_mac,
                                   uint16_t dest_port,
+                                  uint16_t new_version=0,
+                                  unsigned char new_type=0,
                                   str src_ip='',
                                   str src_mac='',
                                   unsigned char blast_mode=0):
@@ -603,6 +605,10 @@ cpdef int netflow_replay_raw_sock(str device,
     :param dest_ip: The IP address we want to send these packets to.
     :param dest_mac: The MAC address of the destination IP.
     :param dest_port: The port that the recipient device will be listening on.
+    :param new_version: re-write the netflow version to be new_version IF 
+           new_version is a positive uint16_t.
+    :param new_type: re-write the netflow v.5-8 engine_type to be new_type IF 
+           new_type is a positive unsigned char.
     :param src_ip: The IP address we want to send these packets from.
     :param src_mac: The MAC address we want to send these packets from.
     :param blast_mode: bool value. 0 == play at the same pace as in the pcap or
@@ -618,7 +624,7 @@ cpdef int netflow_replay_raw_sock(str device,
         unsigned char do_src, do_mac
         double now, ts, offset, add
         pcap_pkthdr_t hdr
-        bytes pkt
+        bytes pkt, the_flow
         Ethernet eth
 
     sender = PCAPSocket(devicename=device)
@@ -643,9 +649,11 @@ cpdef int netflow_replay_raw_sock(str device,
     eth.payload.dst = dest_ip
     eth.payload.payload.dport = dest_port
     eth.payload.payload.payload.unix_secs = int(now)
-    if eth.payload.payload.payload != 9:
+    if eth.payload.payload.payload.version != 9:
         eth.payload.payload.payload.unix_nano_seconds = int((now % 1) *
                                                             1000000)
+    if new_version > 0:
+        eth.payload.payload.payload.version = new_version
     sender.sendpacket(eth.pkt2net({'csum': 1, 'update': 1}))
     for ts, hdr, pkt in reader:
         eth = Ethernet(pkt, l7_ports={pcap_dst_port: NetflowSimple})
@@ -662,9 +670,15 @@ cpdef int netflow_replay_raw_sock(str device,
         eth.payload.dst = dest_ip
         eth.payload.payload.dport = dest_port
         eth.payload.payload.payload.unix_secs = int(now)
-        if eth.payload.payload.payload != 9:
+        if new_type > 0 and eth.payload.payload.payload.version in (5, 6, 7, 8):
+            #          eth/IP      /UDP    /Netflow/netflowdata
+            the_flow = eth.payload.payload.payload.payload
+            eth.payload.payload.payload.payload = the_flow[:4] + new_type.to_bytes(1, 'big') + the_flow[5:]
+        if eth.payload.payload.payload.version != 9:
             eth.payload.payload.payload.unix_nano_seconds = int((now % 1) *
                                                                 1000000)
+        if new_version > 0:
+            eth.payload.payload.payload.version = new_version
         sender.sendpacket(eth.pkt2net({'csum': 1, 'update': 1}))
     return 0
 
@@ -673,6 +687,8 @@ cpdef int netflow_replay_system_sock(str pcap_file,
                                      uint16_t pcap_dst_port,
                                      str dest_ip,
                                      uint16_t dest_port,
+                                     uint16_t new_version=0,
+                                     unsigned char new_type=0,
                                      unsigned char blast_mode=0):
     """
     Function to replay pcap files containing netflow versions 1-9.
@@ -681,6 +697,10 @@ cpdef int netflow_replay_system_sock(str pcap_file,
            interested in.
     :param dest_ip: The IP address we want to send these packets to.
     :param dest_port: The port that the recipient device will be listening on.
+    :param new_version: re-write the netflow version to be new_version IF 
+           new_version is a positive uint16_t.
+    :param new_type: re-write the netflow v.5-8 engine_type to be new_type IF 
+           new_type is a positive unsigned char.
     :param blast_mode: bool value. 0 == play at the same pace as in the pcap or
            at the speed defined by speedup. 1 means blast as fast as possible.
            Overrides speedup if set.
@@ -721,5 +741,9 @@ cpdef int netflow_replay_system_sock(str pcap_file,
         nf.unix_secs = int(now)
         if nf.version != 9:
             nf.unix_nano_seconds = int((now % 1) * 1000000)
+        if new_type > 0 and nf.version in (5, 6, 7, 8):
+            nf.payload = nf.payload[:4] + new_type.to_bytes(1, 'big') + nf.payload[5:]
+        if new_version > 0:
+            nf.version = new_version
         sender.sendto(nf.pkt2net({}), (dest_ip, dest_port))
     return 0

@@ -23,10 +23,6 @@ except ImportError:
         'for further instructions.'
     )
 
-install_requires = (
-    'tzlocal',
-)
-
 
 # Build scripts automatically
 scripts = {'console_scripts': [
@@ -47,7 +43,6 @@ setup_args = {
 
     'packages': find_packages(),
     'zip_safe': False,
-    'install_requires': install_requires,
     'extras_require': None,
     'test_suite': '',
     'include_package_data': True,

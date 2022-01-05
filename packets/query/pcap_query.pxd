@@ -34,7 +34,6 @@ cdef class PcapQuery:
         bint live
         public dict fields
         dict l7_ports
-        object local_tz
         public list field_functions, layer_order, wshark_fields
         double timeout
         public object stop_event

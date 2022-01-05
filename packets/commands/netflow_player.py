@@ -73,6 +73,19 @@ def parse_args(argv):
                               "the packets being sent as fast as possible."),
                         type=int,
                         default=0)
+    optional.add_argument('--new_version',
+                        help=("unsigned 16 bit value. Re-write the netflow version "
+                              "for all netflow packets sent to this value unless this is "
+                              "is set to 0 (the default)"),
+                        type=int,
+                        default=0)
+    optional.add_argument('--new_type',
+                        help=("unsigned 8 bit value. Re-write the netflow engine type "
+                              "for all netflow packets sent to this value unless this is "
+                              "is set to 0 (the default). This option will cause a segfault "
+                              "IF set to a value greater than 255."),
+                        type=int,
+                        default=0)
     return parser.parse_args()
 
 
@@ -87,6 +100,8 @@ def main():
                                            args.dest_ip,
                                            args.dest_mac,
                                            args.dest_port,
+                                           new_version=args.new_version,
+                                           new_type=args.new_type,
                                            src_ip=args.src_ip,
                                            src_mac=args.src_mac,
                                            blast_mode=args.blast)
@@ -98,6 +113,8 @@ def main():
                                           args.pcap_dst_port,
                                           args.dest_ip,
                                           args.dest_port,
+                                          new_version=args.new_version,
+                                          new_type=args.new_type,
                                           blast_mode=args.blast)
     sys.exit(rval)
 

@@ -209,7 +209,6 @@ cdef class PcapQuery:
                 self.layer_order.index(ptype), pfield))
         self.timeout = kwargs.get('timeout', 10.0)
         self.stop_event = kwargs.get('stop_event', Event())
-        self.local_tz = tzlocal.get_localzone()
 
     cpdef dict show_fields(self):
         return self.fields
