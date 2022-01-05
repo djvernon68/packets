@@ -31,7 +31,7 @@ scripts = {'console_scripts': [
 
 setup_args = {
     'name':                'packets',
-    'version':             '2.0.2',
+    'version':             '2.0.3',
 
     # Update the following as needed
     'author':              'David Vernon',
