@@ -631,7 +631,7 @@ cpdef int netflow_replay_raw_sock(str device,
     sender.setnonblock(1)
 
     reader = PCAPReader(filename=pcap_file)
-    reader.add_bpf_filter('udp dst port {0}'.format(pcap_dst_port))
+    reader.add_bpf_filter('ip and udp dst port {0}'.format(pcap_dst_port))
 
     if src_ip == '':
         do_src = 0
@@ -719,7 +719,7 @@ cpdef int netflow_replay_system_sock(str pcap_file,
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     reader = PCAPReader(filename=pcap_file)
-    reader.add_bpf_filter('udp dst port {0}'.format(pcap_dst_port))
+    reader.add_bpf_filter('ip and udp dst port {0}'.format(pcap_dst_port))
 
     ts, hdr, pkt = next(reader)
     now = time.time()
