@@ -11,7 +11,6 @@ from posix.time cimport clock_gettime, timespec, CLOCK_REALTIME
 from libc.stdint cimport uint16_t
 
 from threading import Event
-import tzlocal
 import re
 import os
 
