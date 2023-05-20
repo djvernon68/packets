@@ -33,7 +33,7 @@ cdef bint valid_dev(str dev):
         char * errors = <char *> malloc(ERRBUF_SIZE * sizeof(char))
     fad_rval = findalldevs(devices, errors)
     free(errors)
-    if not fad_rval and dev in devices:
+    if not fad_rval and dev.encode('utf-8') in devices:
         return 1
     return 0
 
@@ -206,7 +206,6 @@ cdef class PcapQuery:
                 self.layer_order.append(ptype)
             self.field_functions.append(get_field_val_f(
                 self.layer_order.index(ptype), pfield))
-        self.timeout = kwargs.get('timeout', 10.0)
         self.stop_event = kwargs.get('stop_event', Event())
 
     cpdef dict show_fields(self):

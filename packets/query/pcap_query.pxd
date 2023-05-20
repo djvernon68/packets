@@ -35,7 +35,6 @@ cdef class PcapQuery:
         public dict fields
         dict l7_ports
         public list field_functions, layer_order, wshark_fields
-        double timeout
         public object stop_event
 
     cpdef bint fields_supported(self, list field_names)
