@@ -38,6 +38,7 @@ From there we will develop examples of:
 
    - Sending a receiving PKT based packets with raw python sockets.
    - Reading and writing packets from PCAP files.
+   - Decoding and generating template-based NetFlow v9 packets.
    - Building a :py:class:`PKT <PKT>` based layer 7 packet class in pure python. In our case we will build DNS
    - Converting the python based DNS class to a cython based class.
    - Using PcapQuery to query data from built in :py:class:`PKT <PKT>` based classes.
@@ -396,6 +397,123 @@ following:
 You can now open up the http_fixed.pcap file and find that the packets are all
 present with exactly the same timestamps. Only the IPs have changes and all
 packets now have appropriate checksums.
+
+
+Decoding and generating NetFlow v9
+----------------------------------
+
+NetFlow v9 and IPFIX differ from fixed-format protocols because data records
+are described by templates sent by the exporter. Decoding a capture therefore
+requires a shared ``NetflowDecodeContext`` so that a template learned in one
+datagram remains available for later datagrams from the same exporter.
+
+The following example reads an Ethernet capture containing NetFlow v9 on UDP
+port 2055. Use the same context for every frame and explicitly register the
+NetFlow class as the decoder for that port::
+
+   from packets.core.inetpkt import Ethernet
+   from packets.core.pcap import PCAPReader
+   from packets.protos.netflow import Netflow, NetflowDecodeContext
+
+   context = NetflowDecodeContext()
+   reader = PCAPReader(filename='netflow.pcap', decode_context=context)
+
+   for timestamp, packet_header, packet_data in reader:
+       packet = Ethernet(packet_data,
+                         l7_ports={2055: Netflow},
+                         decode_context=context)
+       netflow = packet.get_layer('Netflow')
+       if netflow.pkt_name != 'Netflow':
+           continue
+
+       print('NetFlow version:', netflow.version)
+       for record in netflow.records:
+           print(record.fields.get('sourceIPv4Address'),
+                 record.fields.get('destinationIPv4Address'),
+                 record.fields.get('packetDeltaCount'))
+
+   reader.close()
+
+``record.fields`` contains decoded values keyed by their IANA names. A value
+can also be accessed by ``(private_enterprise_number, element_id)``; for
+example, ``record.fields[(0, 8)]`` is the standard
+``sourceIPv4Address`` element. If a data set arrives before its template,
+dispatch returns a byte-preserving ``NetflowSimple`` packet. Once the shared
+context learns that exporter's template, subsequent data packets are decoded
+into generated record classes. The UDP decoder supplies an exporter scope
+containing the source address and ports, preventing template IDs from one
+exporter from being applied to another.
+
+To generate NetFlow v9, first describe the fields in a ``NetflowTemplate``.
+The template creates and caches an associated record class and codec plan.
+Instantiate that record class with values, then put the template and data
+record into their respective flow sets::
+
+   import socket
+
+   from packets.protos.netflow import (
+       Netflow,
+       NetflowDecodeContext,
+       NetflowFlowSet,
+       NetflowTemplate,
+       NetflowTemplateField,
+       NetflowV9Header,
+   )
+
+   template = NetflowTemplate(
+       256,
+       [NetflowTemplateField(8, 4),    # sourceIPv4Address
+        NetflowTemplateField(12, 4),   # destinationIPv4Address
+        NetflowTemplateField(7, 2),    # sourceTransportPort
+        NetflowTemplateField(11, 2),   # destinationTransportPort
+        NetflowTemplateField(2, 4)],   # packetDeltaCount
+       version=9)
+
+   DataRecord = template.record_class
+   record = DataRecord(
+       template_id=template.template_id,
+       fields={'sourceIPv4Address': '192.0.2.10',
+               'destinationIPv4Address': '198.51.100.20',
+               'sourceTransportPort': 49152,
+               'destinationTransportPort': 2055,
+               'packetDeltaCount': 25},
+       template=template,
+       codec_plan=template.codec_plan)
+
+   template_set = NetflowFlowSet(set_id=0,
+                                 templates=[template],
+                                 version=9)
+   data_set = NetflowFlowSet(set_id=template.template_id,
+                             records=[record],
+                             version=9)
+   message = Netflow(
+       header=NetflowV9Header(sys_uptime=123456,
+                              unix_secs=1700000000,
+                              sequence=10,
+                              source_id=42),
+       flowsets=[template_set, data_set])
+
+   wire_data = message.pkt2net({'update': 1})
+
+The ``update`` option calculates both flow-set lengths, sets the v9 header
+count, and advances its packet sequence number. The result is a UDP payload
+that can be checked locally and sent with a normal datagram socket::
+
+   decoded = Netflow.dispatch(wire_data,
+                              context=NetflowDecodeContext(),
+                              exporter='192.0.2.1')
+   assert decoded.records[0].fields['packetDeltaCount'] == 25
+   assert decoded.pkt2net({}) == wire_data
+
+   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+   sock.sendto(wire_data, ('$collector_ip', 2055))
+   sock.close()
+
+This example sends the template and its data in one message. An exporter may
+send data-only messages later, but collectors must receive the template first,
+so production exporters normally retransmit templates periodically. Use a
+template ID of at least 256 and keep ``source_id`` stable for one observation
+domain.
 
 
 Building a PKT based packet class in pure Python

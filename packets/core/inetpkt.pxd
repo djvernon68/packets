@@ -108,6 +108,10 @@ cdef class PktWriter:
 
 cdef int w_grow(PktWriter w, Py_ssize_t need) except -1
 
+cdef PktWriter w_acquire()
+
+cdef void w_release(PktWriter w)
+
 
 cdef inline int w_u8(PktWriter w, unsigned char v) except -1:
     """Append one byte."""
@@ -452,6 +456,7 @@ cdef class IP_CONST:
 cdef class PKT:
     cdef:
         dict _l7_ports
+        object _decode_context, _decode_exporter
         public dict query_field_map
         public str pkt_name
         public uint16_t pq_type
@@ -795,7 +800,9 @@ cdef NullPkt _null_range(bytes owner, Py_ssize_t start,
                          Py_ssize_t end, dict l7_ports)
 cdef PKT _l7_range(bytes owner, const unsigned char[:] mv,
                    Py_ssize_t start, Py_ssize_t end, dict l7_ports,
-                   uint16_t sport, uint16_t dport)
+                   uint16_t sport, uint16_t dport,
+                   object decode_context, object exporter_source,
+                   str transport)
 cdef int _decode_udp(UDP pkt, bytes owner,
                      const unsigned char[:] mv, Py_ssize_t start,
                      Py_ssize_t end, dict l7_ports) except -1

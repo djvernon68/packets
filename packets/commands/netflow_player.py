@@ -7,6 +7,7 @@ import argparse
 
 from packets.core.pcap import netflow_replay_raw_sock, \
     netflow_replay_system_sock
+from packets.protos.netflow import NetflowDecodeContext
 
 
 def bounded_int(low, high):
@@ -188,6 +189,7 @@ def parse_args(argv):
 
 def main():
     args = parse_args(sys.argv[1:])
+    decode_context = NetflowDecodeContext(force_simple=True)
     if args.spoofing:
         rval = netflow_replay_raw_sock(args.device,
                                        args.file,
@@ -199,7 +201,8 @@ def main():
                                        new_type=args.new_type,
                                        src_ip=args.src_ip,
                                        src_mac=args.src_mac,
-                                       blast_mode=args.blast)
+                                       blast_mode=args.blast,
+                                       decode_context=decode_context)
     else:
         rval = netflow_replay_system_sock(args.file,
                                           args.pcap_dst_port,
@@ -207,7 +210,8 @@ def main():
                                           args.dest_port,
                                           new_version=args.new_version,
                                           new_type=args.new_type,
-                                          blast_mode=args.blast)
+                                          blast_mode=args.blast,
+                                          decode_context=decode_context)
     sys.exit(rval)
 
 if __name__ == "__main__":

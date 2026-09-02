@@ -246,6 +246,7 @@ cdef class PcapQuery:
 
         dev = kwargs.get('devicename')
         file = kwargs.get('filename')
+        self.decode_context = kwargs.get('decode_context')
         self.use_device = 0
         if dev and file:
             raise ValueError("'devicename' and 'filename' can't be specified "
@@ -275,9 +276,12 @@ cdef class PcapQuery:
             self.reader = PCAPSocket(devicename=self.srcname,
                                      snaplen=snaplen,
                                      promisc=promisc,
-                                     to_ms=to_ms)
+                                     to_ms=to_ms,
+                                     decode_context=self.decode_context)
         else:
-            self.reader = PCAPReader(filename=self.srcname)
+            self.reader = PCAPReader(filename=self.srcname,
+                                     decode_context=self.decode_context)
+        self.decode_context = self.reader.decode_context
 
         if self.reader and kwargs.get('bpf_filter'):
             rval = self.reader.add_bpf_filter(kwargs.get('bpf_filter'))
@@ -406,7 +410,8 @@ cdef class PcapQuery:
                     continue
                 break
             layers = list()
-            spkt = Ethernet(pkt, l7_ports=self.l7_ports)
+            spkt = Ethernet(pkt, l7_ports=self.l7_ports,
+                            decode_context=self.decode_context)
             for pq_type in self.layer_order:
                 if pq_type == PQ_FRAME:
                     layers.append(Frame(ts, hdr))
@@ -497,7 +502,8 @@ cdef class PcapQuery:
                 elif self.stop_event.is_set():
                     break
                 else:
-                    spkt = Ethernet(pkt, l7_ports=self.l7_ports)
+                    spkt = Ethernet(pkt, l7_ports=self.l7_ports,
+                                    decode_context=self.decode_context)
                     layers = list()
                     for pq_type in self.layer_order:
                         if pq_type == PQ_FRAME:

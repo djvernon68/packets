@@ -42,7 +42,7 @@ cdef class PcapQuery:
         dict l7_ports
         public list field_functions, layer_order, wshark_fields
         list field_descriptors
-        public object stop_event
+        public object stop_event, decode_context
 
     cdef tuple _extract_row(self, list layers)
 

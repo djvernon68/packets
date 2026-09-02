@@ -359,6 +359,7 @@ cdef class PCAPBase:
 cdef class PCAPSocket(PCAPBase):
     cdef:
         public object stop_event
+        public object decode_context
         # owns the encoded device name; a bare char* here dangled once
         # __init__ returned and its local bytes object was collected.
         bytes devicename
@@ -380,6 +381,7 @@ cdef class PCAPSocket(PCAPBase):
 
 cdef class PCAPReader(PCAPBase):
     cdef:
+        public object decode_context
         # owns the encoded file name; see the note on PCAPSocket.devicename.
         bytes filename
         pcap_t * reader
@@ -415,7 +417,8 @@ cpdef int netflow_replay_raw_sock(str device,
                                   unsigned char new_type=*,
                                   str src_ip=*,
                                   str src_mac=*,
-                                  unsigned char blast_mode=*) except -1
+                                  unsigned char blast_mode=*,
+                                  object decode_context=*) except -1
 
 cpdef int netflow_replay_system_sock(str pcap_file,
                                      uint16_t pcap_dst_port,
@@ -423,4 +426,5 @@ cpdef int netflow_replay_system_sock(str pcap_file,
                                      uint16_t dest_port,
                                      uint16_t new_version=*,
                                      unsigned char new_type=*,
-                                     unsigned char blast_mode=*) except -1
+                                     unsigned char blast_mode=*,
+                                     object decode_context=*) except -1

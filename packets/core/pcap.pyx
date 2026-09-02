@@ -17,6 +17,8 @@ from threading import Event
 from packets.core.inetpkt cimport Ethernet, IP, IP6, UDP, PKT, \
     NetflowSimple, PQ_NETFLOW_SIMPLE
 
+from packets.protos.netflow import Netflow, NetflowDecodeContext
+
 DEF USECCONST = 1000000.00
 DEF ERRBUF_SZ = 256
 
@@ -63,6 +65,15 @@ ETH_LOOP = 108
 ETH_LINUX_SLL = 113
 ETH_LTALK = 114
 PCAP_NETMASK_UNKNOWN = 0xffffffff
+
+
+cdef object _netflow_decode_context(dict kwargs):
+    cdef object context = kwargs.get('decode_context')
+
+    if context is None:
+        from packets.protos.netflow import NetflowDecodeContext
+        context = NetflowDecodeContext()
+    return context
 
 
 cdef struct PcapInfoState:
@@ -352,6 +363,7 @@ cdef class PCAPSocket(PCAPBase):
             int snaplen, promisc, to_ms, status
 
         errors[0] = 0
+        self.decode_context = _netflow_decode_context(kwargs)
         # self.devicename owns the encoded name for the life of the object;
         # dev is only valid while that reference is held.
         self.devicename = kwargs.get('devicename', '').encode()
@@ -521,6 +533,7 @@ cdef class PCAPReader(PCAPBase):
             object v_err
 
         errors[0] = 0
+        self.decode_context = _netflow_decode_context(kwargs)
         fname_srt = kwargs.get('filename', '')
         # self.filename owns the encoded name for the life of the object;
         # fname_p is only valid while that reference is held.
@@ -711,7 +724,8 @@ cdef bytes _build_netflow_replay_frame_for_family(
         uint16_t pcap_dst_port,
         double now,
         uint16_t new_version,
-        unsigned char new_type):
+        unsigned char new_type,
+        object decode_context):
     cdef:
         Ethernet captured_eth, replay_eth
         object captured_ip, captured_udp, nf, replay_ip
@@ -719,8 +733,8 @@ cdef bytes _build_netflow_replay_frame_for_family(
         str replay_src_ip, replay_src_mac
         bytes the_flow
 
-    captured_eth = Ethernet(
-        pkt, l7_ports={pcap_dst_port: NetflowSimple})
+    captured_eth = Ethernet(pkt, l7_ports={pcap_dst_port: Netflow},
+                            decode_context=decode_context)
     captured_ip = captured_eth.payload
     captured_udp = captured_ip.payload
     nf = captured_udp.payload
@@ -769,14 +783,17 @@ def _build_netflow_replay_frame(bytes pkt,
                                 uint16_t pcap_dst_port=2055,
                                 double now=0,
                                 uint16_t new_version=0,
-                                unsigned char new_type=0):
+                                unsigned char new_type=0,
+                                decode_context=None):
     """Build one replay carrier without opening a raw socket."""
     cdef int family = _address_family(dest_ip)
+    if decode_context is None:
+        decode_context = NetflowDecodeContext(force_simple=True)
     if src_ip and _address_family(src_ip) != family:
         raise ValueError("src_ip and dest_ip must use the same address family")
     return _build_netflow_replay_frame_for_family(
         pkt, family, dest_ip, dest_mac, dest_port, src_ip, src_mac,
-        pcap_dst_port, now, new_version, new_type)
+        pcap_dst_port, now, new_version, new_type, decode_context)
 
 cpdef int netflow_replay_raw_sock(str device,
                                   str pcap_file,
@@ -788,7 +805,8 @@ cpdef int netflow_replay_raw_sock(str device,
                                   unsigned char new_type=0,
                                   str src_ip='',
                                   str src_mac='',
-                                  unsigned char blast_mode=0) except -1:
+                                  unsigned char blast_mode=0,
+                                  object decode_context=None) except -1:
     """
     Function to replay pcap files containing netflow versions 1-9.
     :param device: Device to bind our outgoing socket to.
@@ -822,6 +840,8 @@ cpdef int netflow_replay_raw_sock(str device,
         bytes pkt, frame
         uint32_t sent, failed
 
+    if decode_context is None:
+        decode_context = NetflowDecodeContext(force_simple=True)
     family = _address_family(dest_ip)
     if src_ip and _address_family(src_ip) != family:
         raise ValueError("src_ip and dest_ip must use the same address family")
@@ -854,7 +874,7 @@ cpdef int netflow_replay_raw_sock(str device,
             now += add
         frame = _build_netflow_replay_frame_for_family(
             pkt, family, dest_ip, dest_mac, dest_port, src_ip, src_mac,
-            pcap_dst_port, now, new_version, new_type)
+            pcap_dst_port, now, new_version, new_type, decode_context)
         try:
             sender.sendpacket(frame)
             sent += 1
@@ -883,7 +903,8 @@ cpdef int netflow_replay_system_sock(str pcap_file,
                                      uint16_t dest_port,
                                      uint16_t new_version=0,
                                      unsigned char new_type=0,
-                                     unsigned char blast_mode=0) except -1:
+                                     unsigned char blast_mode=0,
+                                     object decode_context=None) except -1:
     """
     Function to replay pcap files containing netflow versions 1-9.
     :param pcap_file: The file containing the packets we want to replay.
@@ -914,13 +935,15 @@ cpdef int netflow_replay_system_sock(str pcap_file,
         object nf
         uint32_t sent, failed
 
+    if decode_context is None:
+        decode_context = NetflowDecodeContext(force_simple=True)
     family = _address_family(dest_ip)
     sender = socket.socket(family, socket.SOCK_DGRAM)
 
     reader = PCAPReader(filename=pcap_file)
     reader.add_bpf_filter('udp dst port {0}'.format(pcap_dst_port))
 
-    l7_ports = {pcap_dst_port: NetflowSimple}
+    l7_ports = {pcap_dst_port: Netflow}
     type_byte = new_type.to_bytes(1, 'big')
 
     first = 1
@@ -939,7 +962,8 @@ cpdef int netflow_replay_system_sock(str pcap_file,
             add = (ts + offset) - now
             time.sleep(add)
             now += add
-        eth = Ethernet(pkt, l7_ports=l7_ports)
+        eth = Ethernet(pkt, l7_ports=l7_ports,
+                       decode_context=decode_context)
         nf = eth.get_layer_by_type(PQ_NETFLOW_SIMPLE)
         nf.unix_secs = int(now)
         if nf.version != 9:

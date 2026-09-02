@@ -745,6 +745,8 @@ cdef class PKT:
             self._l7_ports = kwargs['l7_ports']
         else:
             self._l7_ports = None
+        self._decode_context = kwargs.get('decode_context')
+        self._decode_exporter = kwargs.get('exporter')
 
     property l7_ports:
         """Layer-7 registry, allocated on first public access when absent."""
@@ -5594,11 +5596,13 @@ cdef inline NullPkt _null_range(bytes owner, Py_ssize_t start,
 
 cdef inline PKT _l7_range(bytes owner, const unsigned char[:] mv,
                            Py_ssize_t start, Py_ssize_t end, dict l7_ports,
-                           uint16_t sport, uint16_t dport):
+                           uint16_t sport, uint16_t dport,
+                           object decode_context, object exporter_source,
+                           str transport):
     cdef:
         type pkt_cls = NullPkt
         NetflowSimple netflow
-        object owner_factory
+        object owner_factory, dispatcher, exporter
     if end > start and l7_ports:
         pkt_cls = _l7_pkt_cls(l7_ports, sport, dport)
     if pkt_cls is NullPkt:
@@ -5613,6 +5617,14 @@ cdef inline PKT _l7_range(bytes owner, const unsigned char[:] mv,
     owner_factory = getattr(pkt_cls, '_from_owner', None)
     if owner_factory is not None:
         return owner_factory(owner, start, end, l7_ports)
+    dispatcher = getattr(pkt_cls, 'dispatch', None)
+    if dispatcher is not None:
+        if isinstance(exporter_source, tuple):
+            exporter = exporter_source
+        else:
+            exporter = (exporter_source, sport, dport, transport)
+        return dispatcher(rd_bytes(mv, start, end),
+                          context=decode_context, exporter=exporter)
     # Configured layer-7 implementations have not opted into owner/range
     # parsing yet. Preserve their established independently-owned array input.
     return pkt_cls(array('B', rd_bytes(mv, start, end)))
@@ -5627,7 +5639,8 @@ cdef inline int _decode_udp(UDP pkt, bytes owner,
     pkt.ulen = rd_u16(mv, start + 4)
     pkt.checksum = rd_u16(mv, start + 6)
     pkt.payload = _l7_range(owner, mv, start + 8, end, l7_ports,
-                            pkt.sport, pkt.dport)
+                            pkt.sport, pkt.dport, pkt._decode_context,
+                            pkt._decode_exporter, 'udp')
     return 0
 
 
@@ -5658,7 +5671,8 @@ cdef inline int _decode_tcp(TCP pkt, bytes owner,
         if header_end > end:
             header_end = end
         pkt.payload = _l7_range(owner, mv, header_end, end, l7_ports,
-                                pkt.sport, pkt.dport)
+                                pkt.sport, pkt.dport, pkt._decode_context,
+                                pkt._decode_exporter, 'tcp')
         return 0
 
     if length == 8:
@@ -5723,6 +5737,10 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
     if pkt.proto == PROTO_UDP:
         udp = UDP.__new__(UDP)
         udp._l7_ports = l7_ports
+        udp._decode_context = pkt._decode_context
+        udp._decode_exporter = (pkt._decode_exporter
+                                if pkt._decode_exporter is not None
+                                else pkt.src)
         udp.pkt_name = 'UDP'
         udp.pq_type, udp.query_fields = _QI_UDP
         _decode_udp(udp, owner, mv, payload_start, end, l7_ports)
@@ -5730,6 +5748,10 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
     elif pkt.proto == PROTO_TCP:
         tcp = TCP.__new__(TCP)
         tcp._l7_ports = l7_ports
+        tcp._decode_context = pkt._decode_context
+        tcp._decode_exporter = (pkt._decode_exporter
+                                if pkt._decode_exporter is not None
+                                else pkt.src)
         tcp.pkt_name = 'TCP'
         tcp.pq_type, tcp.query_fields = _QI_TCP
         _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, {})
@@ -5824,6 +5846,10 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
     elif pkt._upper_proto == PROTO_UDP:
         udp = UDP.__new__(UDP)
         udp._l7_ports = l7_ports
+        udp._decode_context = pkt._decode_context
+        udp._decode_exporter = (pkt._decode_exporter
+                                if pkt._decode_exporter is not None
+                                else pkt.src)
         udp.pkt_name = 'UDP'
         udp.pq_type, udp.query_fields = _QI_UDP
         _decode_udp(udp, owner, mv, payload_start, end, l7_ports)
@@ -5831,6 +5857,10 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
     elif pkt._upper_proto == PROTO_TCP:
         tcp = TCP.__new__(TCP)
         tcp._l7_ports = l7_ports
+        tcp._decode_context = pkt._decode_context
+        tcp._decode_exporter = (pkt._decode_exporter
+                                if pkt._decode_exporter is not None
+                                else pkt.src)
         tcp.pkt_name = 'TCP'
         tcp.pq_type, tcp.query_fields = _QI_TCP
         _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, {})
@@ -5918,6 +5948,8 @@ cdef inline int _decode_ethernet(Ethernet pkt, bytes owner,
     if pkt.type == ETH_TYPE_IPV4:
         ip = IP.__new__(IP)
         ip._l7_ports = l7_ports
+        ip._decode_context = pkt._decode_context
+        ip._decode_exporter = pkt._decode_exporter
         ip.pkt_name = 'IP'
         ip.pq_type, ip.query_fields = _QI_IP
         _decode_ip(ip, owner, mv, payload_start, end, l7_ports)
@@ -5925,6 +5957,8 @@ cdef inline int _decode_ethernet(Ethernet pkt, bytes owner,
     elif pkt.type == ETH_TYPE_IPV6:
         ip6 = IP6.__new__(IP6)
         ip6._l7_ports = l7_ports
+        ip6._decode_context = pkt._decode_context
+        ip6._decode_exporter = pkt._decode_exporter
         ip6.pkt_name = 'IP6'
         ip6.pq_type, ip6.query_fields = _QI_IP6
         _decode_ip6(ip6, owner, mv, payload_start, end, l7_ports)

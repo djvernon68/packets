@@ -10,6 +10,8 @@ RELEASE-VERSION
 .DS_Store
 .idea/
 .tox/
+.eggs/
+.junie/
 *.so
 *.c
 setup-inplace.py
