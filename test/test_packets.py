@@ -15,7 +15,7 @@ from packets.core.inetpkt import IP_CONST, PKT, Ethernet, ARP, IP, \
     UDP, TCP, NullPkt, IP6, ICMP6, ICMP6Opt, MLDv2AddressRecord, ICMP, \
     IGMP, IGMPGroupRecord, MPLS, NetflowSimple
 from packets.core.pcap import PCAPReader, PCAPWriter, \
-    get_pkts_header, ip2int, int2ip, pcap_info, \
+    get_pkts_header, ip2int, int2ip, list_devices, pcap_info, \
     _build_netflow_replay_frame
 
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
@@ -864,7 +864,11 @@ class TestPackets(unittest.TestCase):
         self.assertEqual(parsed.vlan_id, 37)
         self.assertEqual(ip.options, b'\x01\x01\x00\x00')
         self.assertEqual(udp.sport, 34567)
-        self.assertTrue(udp.payload.pkt2net({}).startswith(b'phase-c'))
+        # Exact, not startswith: this frame is 57 bytes of datagram padded out
+        # to the 60 byte Ethernet minimum, and those 3 padding bytes used to
+        # arrive here as part of the UDP payload.
+        self.assertEqual(udp.payload.pkt2net({}), b'phase-c')
+        self.assertEqual(ip.trailer, b'\x00' * 3)
         self.assertEqual(parsed.pkt2net({}), wire)
 
         source[:] = array('B', b'\xff' * len(source))
@@ -939,22 +943,25 @@ class TestPackets(unittest.TestCase):
                              sport.to_bytes(2, 'big'))
 
     def test_phase_c2_transport_truncation(self):
+        """Truncated transport headers raise rather than decode.
+
+        This used to assert the opposite for TCP: a 19 byte segment came back
+        as a TCP layer with sport 0, and a data offset larger than the bytes
+        present came back with silently emptied options. Both were the
+        parser reporting a packet it had not actually read, which is what
+        every other layer here raises for, so they are now errors too.
+        """
         tcp_frame = Ethernet(
             dst_mac='03:02:03:04:05:13', src_mac='06:05:04:03:02:13',
             payload=IP(proto=C.PROTO_TCP, src='10.1.2.3', dst='10.3.2.1',
                        payload=TCP(sport=34567, dport=80,
                                    payload=NullPkt(b'payload'))))
         tcp_wire = tcp_frame.pkt2net({'csum': 1, 'update': 1})
-        short_tcp = Ethernet(tcp_wire[:14 + 20 + 19]).payload.payload
-        self.assertIsInstance(short_tcp, TCP)
-        self.assertEqual(short_tcp.sport, 0)
+        self.assertRaises(ValueError, Ethernet, tcp_wire[:14 + 20 + 19])
 
         bad_options = bytearray(tcp_wire[:14 + 20 + 20])
         bad_options[14 + 20 + 12] = 0xf0
-        clipped_tcp = Ethernet(bytes(bad_options)).payload.payload
-        self.assertEqual(clipped_tcp.data_offset, 15)
-        self.assertEqual(clipped_tcp.options, b'')
-        self.assertEqual(clipped_tcp.payload.pkt2net({}), b'')
+        self.assertRaises(ValueError, Ethernet, bytes(bad_options))
 
         ip6_frame = Ethernet(
             dst_mac='03:02:03:04:05:14', src_mac='06:05:04:03:02:14',
@@ -1711,19 +1718,94 @@ class TestPackets(unittest.TestCase):
         self.assertEqual(IGMP(raw_v3, length=12).version, 3)
 
     def test_IGMPGroupRecord_extended_roundtrip(self):
-        """IGMPGroupRecord with source addresses and aux data."""
-        raw = _struct.pack('!BBH', 4, 8, 1) + _socket.inet_aton('239.1.1.1') + \
+        """IGMPGroupRecord with source addresses and aux data.
+
+        aux_data_len is 2 here, not 8: RFC 3376 4.2.6 counts the auxiliary
+        data in 32 bit words, so 8 bytes of aux data is 2 words. This test
+        used to say 8 because the parser read the field as a byte count.
+        """
+        raw = _struct.pack('!BBH', 4, 2, 1) + _socket.inet_aton('239.1.1.1') + \
               _socket.inet_aton('10.0.0.1') + b'aux_data'
         rec = IGMPGroupRecord(raw)
         self.assertEqual(rec.num_src, 1)
         self.assertEqual(rec.aux_data, b'aux_data')
+        self.assertEqual(rec.byte_len, len(raw))
         self.assertEqual(rec.pkt2net({}), raw)
 
         # kwargs path
         rec_kw = IGMPGroupRecord(type=4, group_address='239.1.1.1',
                                  source_addresses=['10.0.0.1'],
-                                 aux_data=b'aux_data', aux_data_len=8)
+                                 aux_data=b'aux_data', aux_data_len=2)
         self.assertEqual(rec_kw.pkt2net({}), raw)
+
+    def test_IGMPGroupRecord_aux_data_len_counts_words(self):
+        """aux_data_len is a 32 bit word count, and it is bounds checked.
+
+        RFC 3376 4.2.6 counts the auxiliary data in 32 bit words, the same as
+        the MLDv2 record this mirrors. Reading it as a byte count truncated
+        aux_data to a quarter of its length, and because IGMP walks its
+        record list by adding byte_len to a running offset, it also started
+        the following record inside the aux data of the one before it -- so a
+        single record with aux data desynchronized every record behind it.
+
+        The read was also unchecked. rd_bytes clamps to the owner buffer
+        rather than to the end of the IGMP layer, so a record claiming aux
+        data the datagram does not contain quietly returned whatever followed
+        the datagram in the frame.
+        """
+        aux = b'\xde\xad\xbe\xef'
+        rec1 = (_struct.pack('!BBH', 1, 1, 1) +
+                _socket.inet_aton('239.1.1.1') +
+                _socket.inet_aton('10.0.0.1') + aux)
+        rec2 = (_struct.pack('!BBH', 2, 0, 1) +
+                _socket.inet_aton('239.2.2.2') +
+                _socket.inet_aton('2.2.2.2'))
+        # 8 byte header + 1 source + 1 word of aux, and 8 + 1 source.
+        self.assertEqual((len(rec1), len(rec2)), (16, 12))
+        body = _struct.pack('!BBHHH', C.IGMP_V3_MEMBER_REPORT, 0, 0, 0, 2) + \
+               rec1 + rec2
+
+        single = IGMPGroupRecord(rec1)
+        self.assertEqual(single.aux_data, aux)
+        self.assertEqual(single.byte_len, 16)
+        self.assertEqual(single.pkt2net({}), rec1)
+
+        # Standalone IGMP and the owner/offset path reached through IP have
+        # to agree, and both have to land record 2 on its own first byte.
+        for igmp in (IGMP(body), IP(self._igmp_wire(body)).payload):
+            self.assertEqual(igmp.version, 3)
+            self.assertEqual(igmp.num_records, 2)
+            self.assertEqual(igmp.group_records[0].aux_data, aux)
+            self.assertEqual(igmp.group_records[0].byte_len, 16)
+            self.assertEqual(igmp.group_records[1].type, 2)
+            self.assertEqual(igmp.group_records[1].group_address, '239.2.2.2')
+            self.assertEqual(igmp.group_records[1].source_addresses,
+                             ['2.2.2.2'])
+            self.assertEqual(igmp.pkt2net({}), body)
+
+        # A record whose aux data runs past the end of the datagram is an
+        # error, not a read into the bytes behind the datagram. The frame is
+        # padded out to the 60 byte Ethernet minimum, so those bytes exist in
+        # the owner buffer and are exactly what used to be returned.
+        greedy = (_struct.pack('!BBH', 1, 1, 1) +
+                  _socket.inet_aton('239.1.1.1') +
+                  _socket.inet_aton('10.0.0.1'))
+        short_body = _struct.pack('!BBHHH', C.IGMP_V3_MEMBER_REPORT,
+                                  0, 0, 0, 1) + greedy
+        self.assertRaises(ValueError, IGMPGroupRecord, greedy)
+        self.assertRaises(ValueError, IGMP, short_body)
+        frame = (b'\x01\x00\x5e\x00\x00\x16' + b'\x66\x77\x88\x99\xaa\xbb' +
+                 _struct.pack('!H', C.ETH_TYPE_IPV4) +
+                 self._igmp_wire(short_body) + b'\xee' * 18)
+        self.assertRaises(ValueError, Ethernet, frame)
+
+    @staticmethod
+    def _igmp_wire(body):
+        """An IPv4 datagram carrying ``body`` as IGMP."""
+        return (_struct.pack('!BBHHHBBH', 0x45, 0, 20 + len(body), 0, 0, 1,
+                             C.PROTO_IGMP, 0) +
+                _socket.inet_aton('10.1.2.3') +
+                _socket.inet_aton('224.0.0.22') + body)
 
     def test_MPLS_stack_roundtrip(self):
         """MPLS single and stacked label round-trip."""
@@ -1746,6 +1828,253 @@ class TestPackets(unittest.TestCase):
         self.assertIsInstance(mpls0.payload, MPLS)
         self.assertEqual(mpls0.payload.label, 100)
         self.assertEqual(mpls0.pkt2net({}), raw_stack)
+
+    def test_MPLS_deep_stack_is_bounded(self):
+        """A crafted label stack must not cost one stack frame per label.
+
+        RFC 3032 does not bound the label stack. The parser used to recurse
+        into itself for every label whose stack bit was clear, so a crafted
+        stack traded four bytes of input for a native stack frame and
+        eventually took the process down. The walk is now iterative and stops
+        creating layers at C.MPLS_MAX_STACK_DEPTH, keeping whatever is left as
+        an opaque payload so the packet still round-trips byte for byte.
+        """
+        depth = C.MPLS_MAX_STACK_DEPTH
+        label_s0 = _struct.pack('!I', (7 << 12) | (0 << 8) | 255)
+        inner = IP(src='10.0.0.1', dst='10.0.0.2', proto=17).pkt2net({})
+        bottom = _struct.pack('!I', (100 << 12) | (1 << 8) | 64) + inner
+
+        # At the cap every label is still decoded as its own layer.
+        raw = label_s0 * depth + bottom
+        mpls = MPLS(raw)
+        layer = mpls
+        for _ in range(depth):
+            self.assertEqual(layer.s, 0)
+            self.assertIsInstance(layer.payload, MPLS)
+            layer = layer.payload
+        self.assertEqual(layer.s, 1)
+        self.assertIsInstance(layer.payload, IP)
+        self.assertEqual(mpls.pkt2net({}), raw)
+
+        # One label past the cap the remainder is preserved, not decoded.
+        raw_over = label_s0 * (depth + 1) + bottom
+        over = MPLS(raw_over)
+        layer = over
+        for _ in range(depth):
+            self.assertIsInstance(layer.payload, MPLS)
+            layer = layer.payload
+        self.assertIsInstance(layer.payload, NullPkt)
+        self.assertEqual(over.pkt2net({}), raw_over)
+
+        # The pre-fix failure mode: far more labels than any call stack can
+        # hold must parse, round-trip, and stay bounded in layers.
+        huge = label_s0 * 200000 + bottom
+        parsed = MPLS(huge)
+        self.assertEqual(parsed.pkt2net({}), huge)
+        layers = 0
+        layer = parsed
+        while isinstance(layer.payload, MPLS):
+            layer = layer.payload
+            layers += 1
+        self.assertEqual(layers, depth)
+
+    @staticmethod
+    def _padded_udp_frame(pad=b'\xee' * 18, body=b''):
+        """A 60 byte Ethernet frame carrying a UDP datagram plus padding.
+
+        Built by hand rather than with pkt2net so the length fields and the
+        padding are exactly what a NIC would put on the wire: total_len and
+        ulen describe only the datagram, and the frame is padded out to the
+        60 byte minimum behind it.
+        """
+        udp = _struct.pack('!HHHH', 40000, 40001, 8 + len(body), 0) + body
+        ip = (_struct.pack('!BBHHHBBH', 0x45, 0, 20 + len(udp), 0, 0, 64,
+                           C.PROTO_UDP, 0) +
+              _socket.inet_aton('10.1.2.3') + _socket.inet_aton('10.3.2.1') +
+              udp)
+        return (b'\x00\x11\x22\x33\x44\x55' + b'\x66\x77\x88\x99\xaa\xbb' +
+                _struct.pack('!H', C.ETH_TYPE_IPV4) + ip + pad)
+
+    def test_IP_UDP_parse_stops_at_declared_length(self):
+        """Ethernet padding must not be decoded as UDP payload.
+
+        total_len and ulen say where the datagram ends; the frame it arrived
+        in is longer, because every NIC pads anything under 60 bytes. The
+        parser used to hand the whole remaining frame to UDP, so an ordinary
+        padded frame - not just crafted input - reported padding as payload,
+        fed those bytes to whatever Layer-7 class was registered, and
+        produced re-serialized lengths that disagreed with the wire.
+
+        The padding is not discarded either: it is kept on the layer whose
+        length field excluded it, so the frame still round-trips byte for
+        byte and 'update' still recomputes the datagram lengths.
+        """
+        pad = b'\xee' * 18
+        frame = self._padded_udp_frame(pad=pad)
+        self.assertEqual(len(frame), 60)
+
+        # Non-empty l7_ports forces the general parse path, an empty one takes
+        # the Ethernet/IP/UDP fast path. Both must agree: a frame decoding
+        # differently depending on which path it took is how this survived.
+        for l7_ports in ({}, {65000: _DownstreamProtocol}):
+            eth = Ethernet(frame, l7_ports=l7_ports)
+            ip = eth.payload
+            udp = ip.payload
+            self.assertEqual(ip.total_len, 28)
+            self.assertEqual(udp.ulen, 8)
+            self.assertEqual(udp.payload.pkt2net({}), b'')
+            self.assertEqual(ip.trailer, pad)
+            self.assertEqual(udp.trailer, b'')
+            self.assertEqual(eth.pkt2net({}), frame)
+            # Recomputing the lengths must reproduce them, not absorb the
+            # padding into them.
+            self.assertEqual(eth.pkt2net({'update': 1}), frame)
+            self.assertEqual(ip.total_len, 28)
+            self.assertEqual(udp.ulen, 8)
+
+        # The IP header checksum and the UDP checksum both have to come out
+        # the same as they would for the identical datagram in an unpadded
+        # frame, which is only true if the padding stays out of them.
+        bare = self._padded_udp_frame(pad=b'')
+        self.assertEqual(len(bare), 42)
+        padded_out = Ethernet(frame).pkt2net({'update': 1, 'csum': 1})
+        bare_out = Ethernet(bare).pkt2net({'update': 1, 'csum': 1})
+        self.assertEqual(padded_out[:42], bare_out[:42])
+        self.assertEqual(padded_out[42:], pad)
+        # Ethernet still pads a genuinely short frame out to the minimum.
+        self.assertEqual(bare_out[42:], b'\x00' * 18)
+
+        # Real payload ahead of the padding is still payload.
+        frame = self._padded_udp_frame(pad=b'\xee' * 8, body=b'\x01' * 10)
+        udp = Ethernet(frame).payload.payload
+        self.assertEqual(udp.ulen, 18)
+        self.assertEqual(udp.payload.pkt2net({}), b'\x01' * 10)
+        self.assertEqual(Ethernet(frame).pkt2net({}), frame)
+
+    def test_UDP_stops_at_ulen_standalone(self):
+        """A UDP layer parsed on its own honours its own ulen."""
+        udp = UDP(_struct.pack('!HHHH', 1, 2, 8, 0) + b'\xab' * 20)
+        self.assertEqual(udp.ulen, 8)
+        self.assertEqual(udp.payload.pkt2net({}), b'')
+        self.assertEqual(udp.trailer, b'\xab' * 20)
+        self.assertEqual(udp.pkt2net({}),
+                         _struct.pack('!HHHH', 1, 2, 8, 0) + b'\xab' * 20)
+
+        # A capture cut short by snaplen declares more than it carries. That
+        # has to stay readable, so a declared length past the available bytes
+        # is ignored rather than treated as an error.
+        short = UDP(_struct.pack('!HHHH', 1, 2, 1400, 0) + b'\xab' * 4)
+        self.assertEqual(short.ulen, 1400)
+        self.assertEqual(short.payload.pkt2net({}), b'\xab' * 4)
+        self.assertEqual(short.trailer, b'')
+
+        # A ulen that cannot even cover the header it sits in is malformed.
+        with self.assertRaisesRegex(ValueError, 'UDP'):
+            UDP(_struct.pack('!HHHH', 1, 2, 4, 0) + b'\xab' * 20)
+
+    def test_IP6_parse_stops_at_payload_len(self):
+        """payload_len bounds the IPv6 parse the same way total_len does."""
+        body = b'\xcd' * 4
+        udp = _struct.pack('!HHHH', 5000, 5001, 8 + len(body), 0) + body
+        trailer = b'\x77' * 12
+        wire = (_struct.pack('!IHBB', 6 << 28, len(udp), C.PROTO_UDP, 64) +
+                _socket.inet_pton(_socket.AF_INET6, '2001:db8::1') +
+                _socket.inet_pton(_socket.AF_INET6, '2001:db8::2') +
+                udp + trailer)
+        ip6 = IP6(wire)
+        self.assertEqual(ip6.payload_len, len(udp))
+        self.assertEqual(ip6.payload.payload.pkt2net({}), body)
+        self.assertEqual(ip6.trailer, trailer)
+        self.assertEqual(ip6.pkt2net({}), wire)
+        self.assertEqual(ip6.pkt2net({'update': 1}), wire)
+        self.assertEqual(ip6.payload_len, len(udp))
+
+        # The IPv6 UDP checksum is mandatory and covers ulen bytes, so the
+        # trailer must not reach it either.
+        bare = wire[:len(wire) - len(trailer)]
+        self.assertEqual(
+            ip6.pkt2net({'update': 1, 'csum': 1})[:len(bare)],
+            IP6(bare).pkt2net({'update': 1, 'csum': 1}))
+
+    def test_IP_rejects_short_header_length(self):
+        """ihl below 5 decided what the rest of the packet was parsed as.
+
+        ihl is where the Layer-4 header starts. Below 5 it points back inside
+        the IPv4 header itself, so those header bytes were decoded as the
+        payload: with ihl=4 the source port came out of the IP addresses. The
+        fast path already screened this out, so the two parse paths disagreed
+        about whether the packet was even legal.
+        """
+        wire = (_struct.pack('!BBHHHBBH', 0x44, 0, 40, 0, 0, 64,
+                             C.PROTO_UDP, 0) +
+                _socket.inet_aton('10.1.2.3') +
+                _socket.inet_aton('10.3.2.1') +
+                _struct.pack('!HHHH', 40000, 40001, 8, 0) + b'\x00' * 12)
+        with self.assertRaisesRegex(ValueError, 'IP'):
+            IP(wire)
+        eth = (b'\x00\x11\x22\x33\x44\x55' + b'\x66\x77\x88\x99\xaa\xbb' +
+               _struct.pack('!H', C.ETH_TYPE_IPV4) + wire)
+        with self.assertRaisesRegex(ValueError, 'IP'):
+            Ethernet(eth)
+
+        # Options the header claims but the capture does not carry are
+        # truncation, not something to silently shorten.
+        with self.assertRaisesRegex(ValueError, 'IP'):
+            IP(_struct.pack('!BBHHHBBH', 0x47, 0, 40, 0, 0, 64,
+                            C.PROTO_UDP, 0) +
+               _socket.inet_aton('10.1.2.3') +
+               _socket.inet_aton('10.3.2.1') + b'\x01\x01\x01\x01')
+
+    def test_TCP_rejects_truncated_segment(self):
+        """Truncation must raise, not produce a zeroed TCP layer.
+
+        Anything between 9 and 19 bytes fell through to the keyword defaults,
+        and since every caller that parses bytes passes no keywords the result
+        was a fully zeroed TCP layer with a NullPkt payload and no error at
+        all - the opposite of the descriptive ValueError the parser promises
+        everywhere else.
+        """
+        for length in (1, 7, 9, 15, 19):
+            with self.assertRaisesRegex(ValueError, 'TCP'):
+                TCP(b'\x00' * length)
+
+        ip = (_struct.pack('!BBHHHBBH', 0x45, 0, 30, 0, 0, 64,
+                           C.PROTO_TCP, 0) +
+              _socket.inet_aton('10.1.2.3') + _socket.inet_aton('10.3.2.1') +
+              b'\x00' * 10)
+        with self.assertRaisesRegex(ValueError, 'TCP'):
+            IP(ip)
+
+        # The 8 byte header an ICMP error quotes is a legal partial header,
+        # and the fields it does carry must come from the bytes given.
+        quote = TCP(_struct.pack('!HHI', 1234, 80, 0xdeadbeef))
+        self.assertEqual(quote.sport, 1234)
+        self.assertEqual(quote.dport, 80)
+        self.assertEqual(quote.sequence, 0xdeadbeef)
+
+    def test_TCP_rejects_invalid_data_offset(self):
+        """data_offset below 5, or past the captured bytes, must raise.
+
+        data_offset is where the header ends and the payload begins. It was
+        clamped instead of checked, so a zero offset handed the TCP header
+        itself to the Layer-7 parser and an oversized one produced truncated
+        options with a payload starting inside the header.
+        """
+        def segment(data_offset, body=b'\xaa' * 10):
+            off_flags = (data_offset << 12) | 0x018
+            return (_struct.pack('!HHIIHHHH', 1234, 80, 1, 2, off_flags,
+                                 8192, 0, 0) + body)
+
+        for bad in (0, 1, 4):
+            with self.assertRaisesRegex(ValueError, 'TCP'):
+                TCP(segment(bad))
+
+        with self.assertRaisesRegex(ValueError, 'TCP'):
+            TCP(segment(9, body=b'\xaa' * 10))
+
+        good = TCP(segment(5))
+        self.assertEqual(good.data_offset, 5)
+        self.assertEqual(good.payload.pkt2net({}), b'\xaa' * 10)
 
     def test_Ethernet_MPLS_roundtrip(self):
         """Ethernet frame carrying an MPLS stack.
@@ -1872,6 +2201,77 @@ class TestPackets(unittest.TestCase):
                 wire, '2001:db8::20', 'de:ad:be:ef:00:01', 9995,
                 '192.0.2.10', '', 2055, 1700000000.0)
 
+    def test_netflow_replay_raw_carrier_versioned_timestamp_rewrite(self):
+        """Replay must only rewrite bytes that really are a timestamp.
+
+        NetflowSimple names its header after the v1-v8 layout, but the later
+        versions reuse the same bytes. Replay used to write unix_secs and
+        unix_nano_seconds unconditionally, which for IPFIX overwrote the
+        sequence number and the observation domain id while leaving the field
+        that actually carries the export time untouched.
+
+        v1-v8:  unix_secs + unix_nano_seconds are the export timestamp.
+        v9:     unix_secs is the export time, unix_nano_seconds is the
+                flow sequence.
+        IPFIX:  sys_uptime is exportTime, unix_secs is the sequence number
+                and unix_nano_seconds is the observation domain id.
+        """
+        cases = [
+            # version, sys_uptime, unix_secs, nano, expected triple
+            (5, 1000, 555, 99, (1000, 1700000000, 250000)),
+            (9, 1000, 555, 99, (1000, 1700000000, 99)),
+            (10, 1000, 555, 99, (1700000000, 555, 99)),
+        ]
+        for version, uptime, secs, nano, expected in cases:
+            nf = NetflowSimple(version=version, count=16, sys_uptime=uptime,
+                               unix_secs=secs, unix_nano_seconds=nano)
+            captured = Ethernet(
+                src_mac='00:11:22:33:44:55', dst_mac='66:77:88:99:aa:bb',
+                payload=IP(src='10.1.2.3', dst='10.3.2.1',
+                           proto=C.PROTO_UDP,
+                           payload=UDP(sport=9999, dport=2055, payload=nf)))
+            wire = _build_netflow_replay_frame(
+                captured.pkt2net({'csum': 1, 'update': 1}), '192.0.2.20',
+                'de:ad:be:ef:00:01', 9995, '', '', 2055, 1700000000.25)
+            out_nf = Ethernet(
+                wire, l7_ports={9995: NetflowSimple}).payload.payload.payload
+            self.assertEqual(out_nf.version, version)
+            self.assertEqual((out_nf.sys_uptime, out_nf.unix_secs,
+                              out_nf.unix_nano_seconds), expected)
+
+    def test_netflow_replay_system_socket_preserves_ipfix_header(self):
+        """The system socket path shares the versioned rewrite rule."""
+        import os
+        import tempfile
+        nf = NetflowSimple(version=10, count=16, sys_uptime=1000,
+                           unix_secs=555, unix_nano_seconds=99)
+        captured = Ethernet(
+            src_mac='00:11:22:33:44:55', dst_mac='66:77:88:99:aa:bb',
+            payload=IP(src='10.1.2.3', dst='10.3.2.1', proto=C.PROTO_UDP,
+                       payload=UDP(sport=9999, dport=2055, payload=nf)))
+        fd, pcap_path = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        writer = PCAPWriter(filename=pcap_path, snaplen=65535)
+        writer.dump_pkt(captured.pkt2net({'csum': 1, 'update': 1}), 1000, 0)
+        writer.close()
+        sender = mock.Mock()
+        try:
+            with mock.patch.object(_pcap.socket, 'socket',
+                                   return_value=sender):
+                with mock.patch.object(_pcap.time, 'time',
+                                       return_value=1700000000.25):
+                    result = _pcap.netflow_replay_system_sock(
+                        pcap_path, 2055, '192.0.2.20', 9995, blast_mode=1)
+            self.assertEqual(result, 0)
+            datagram = sender.sendto.call_args[0][0]
+            replay_nf = NetflowSimple(datagram)
+            self.assertEqual(replay_nf.version, 10)
+            self.assertEqual(replay_nf.sys_uptime, 1700000000)
+            self.assertEqual(replay_nf.unix_secs, 555)
+            self.assertEqual(replay_nf.unix_nano_seconds, 99)
+        finally:
+            os.remove(pcap_path)
+
     def test_netflow_replay_system_socket_destination_family(self):
         import os
         import tempfile
@@ -1915,6 +2315,155 @@ class TestPackets(unittest.TestCase):
                 self.assertEqual(replay_nf.payload, b'flow-set')
             finally:
                 os.remove(pcap_path)
+
+    def test_netflow_replay_skips_non_netflow_packets(self):
+        """A matched packet that is not NetFlow is counted, not fatal.
+
+        The BPF filter a replay installs constrains only the UDP destination
+        port, so everything else sent to that port is handed to the rewrite
+        too. A datagram too short to hold a NetFlow header fails the decode
+        outright, which abandoned the rest of the capture; anything longer
+        reached a layer with none of the five header fields the rewrite
+        assigns and raised AttributeError part way through instead.
+        """
+        import contextlib
+        import io
+        import os
+        import tempfile
+        from packets.protos.netflow import NetflowDecodeContext
+
+        def frame(payload):
+            return Ethernet(
+                src_mac='00:11:22:33:44:55', dst_mac='66:77:88:99:aa:bb',
+                payload=IP(src='10.1.2.3', dst='10.3.2.1',
+                           proto=C.PROTO_UDP,
+                           payload=UDP(sport=9999, dport=2055,
+                                       payload=payload))
+            ).pkt2net({'csum': 1, 'update': 1})
+
+        good = frame(NetflowSimple(version=5, count=1, sys_uptime=1000,
+                                   unix_secs=1, payload=b'flow-data'))
+        # Four bytes cannot hold the 16 byte NetflowSimple header, so this
+        # one fails the decode outright.
+        short = frame(NullPkt(b'\xde\xad\xbe\xef'))
+        # An empty datagram decodes, but there is no Layer-7 range to give a
+        # NetFlow class, so the layer is a NullPkt with none of the fields
+        # the rewrite assigns.
+        empty = frame(NullPkt(b''))
+
+        fd, pcap_path = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        writer = PCAPWriter(filename=pcap_path, snaplen=65535)
+        writer.dump_pkt(short, 1000, 0)
+        writer.dump_pkt(empty, 1000, 0)
+        writer.dump_pkt(good, 1000, 0)
+        writer.close()
+        sender = mock.Mock()
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                with mock.patch.object(_pcap.socket, 'socket',
+                                       return_value=sender):
+                    with mock.patch.object(_pcap.time, 'time',
+                                           return_value=1700000000.0):
+                        result = _pcap.netflow_replay_system_sock(
+                            pcap_path, 2055, '192.0.2.20', 9995,
+                            blast_mode=1)
+            # The NetFlow packet still went out, and the skip is reported.
+            self.assertEqual(result, 1)
+            self.assertIn('skipped', err.getvalue())
+            self.assertEqual(sender.sendto.call_count, 1)
+            replay_nf = NetflowSimple(sender.sendto.call_args[0][0])
+            self.assertEqual(replay_nf.version, 5)
+            self.assertEqual(replay_nf.unix_secs, 1700000000)
+            self.assertEqual(replay_nf.payload, b'flow-data')
+
+            # A context that lets the full decoder run cannot be replayed at
+            # all: a Netflow keeps the fields the rewrite sets on a separate
+            # header object, so reaching for them raised AttributeError from
+            # inside the loop. Say so before the first packet instead.
+            self.assertRaises(ValueError, _pcap.netflow_replay_system_sock,
+                              pcap_path, 2055, '192.0.2.20', 9995,
+                              blast_mode=1,
+                              decode_context=NetflowDecodeContext())
+        finally:
+            os.remove(pcap_path)
+
+        # The single frame builder has nothing to hand back, so it says why.
+        self.assertRaises(ValueError, _build_netflow_replay_frame, short,
+                          '192.0.2.20', 'de:ad:be:ef:00:01', 9995)
+        self.assertRaises(ValueError, _build_netflow_replay_frame, empty,
+                          '192.0.2.20', 'de:ad:be:ef:00:01', 9995)
+        self.assertRaises(ValueError, _build_netflow_replay_frame, good,
+                          '192.0.2.20', 'de:ad:be:ef:00:01', 9995,
+                          decode_context=NetflowDecodeContext())
+
+    def test_resolve_snaplen_default_is_not_zero(self):
+        """A snaplen of 0 must mean the whole frame on every libpcap.
+
+        libpcap treats snaplen as a hard cap on the bytes it copies out of
+        each frame. Only libpcap 1.9 and later reads 0 as 'the maximum';
+        before that a live capture opened with the documented default
+        returned caplen 0 for every packet - an empty capture. PCAPSocket
+        resolves the value itself now, so the default means the same thing
+        whichever libpcap the extension is linked against.
+        """
+        self.assertEqual(_pcap.MAX_SNAPLEN, 262144)
+        for given in (0, -1, -65535, _pcap.MAX_SNAPLEN + 1):
+            self.assertEqual(_pcap._resolve_snaplen(given),
+                             _pcap.MAX_SNAPLEN, given)
+        for given in (1, 68, 1514, 65535, _pcap.MAX_SNAPLEN):
+            self.assertEqual(_pcap._resolve_snaplen(given), given, given)
+
+    def test_pcap_handles_reject_use_after_close(self):
+        """A closed handle raises instead of entering libpcap with NULL.
+
+        close() frees the pcap_t and NULLs it, but libpcap does not check
+        its handle argument, so these calls were undefined behaviour rather
+        than an exception. The declarations needed an exception value as
+        much as they needed the guard: a cpdef int with no 'except' clause
+        cannot propagate, so Cython printed the error and returned to the
+        caller as though the call had succeeded.
+        """
+        import os
+        import tempfile
+
+        reader = PCAPReader(filename=igmp_file)
+        reader.close()
+        self.assertRaises(ValueError, reader.add_bpf_filter, 'igmp')
+        self.assertRaises(ValueError, reader.open_pcap_dumper, '/dev/null')
+        # close() stays idempotent and iteration still just stops.
+        reader.close()
+        self.assertEqual(list(reader), [])
+
+        fd, out = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        try:
+            writer = PCAPWriter(filename=out, snaplen=65535)
+            writer.close()
+            self.assertRaises(ValueError, writer.open_pcap_dumper, out)
+            writer.close()
+        finally:
+            os.remove(out)
+
+    def test_PcapQuery_num_packets_row_count(self):
+        """query(num_packets=N) returns N rows, not N + 1.
+
+        pkts counts the rows already collected, so testing 'pkts >
+        num_packets' let one more match through before stopping. Nothing
+        asserted the cardinality, so a caller asking for one packet quietly
+        got two.
+        """
+        total = len(PcapQuery(filename=igmp_file,
+                              wshark_fields=['eth.src']).query())
+        self.assertEqual(total, 18)
+        for want in (1, 2, 5, total):
+            query = PcapQuery(filename=igmp_file, wshark_fields=['eth.src'])
+            self.assertEqual(len(query.query(num_packets=want)), want, want)
+        # Asking for more than the file holds is still every row, and 0
+        # still means no limit.
+        for want in (total + 5, 0):
+            query = PcapQuery(filename=igmp_file, wshark_fields=['eth.src'])
+            self.assertEqual(len(query.query(num_packets=want)), total, want)
 
     def test_NullPkt_buffer_types(self):
         """NullPkt from bytes vs array, and fake_proto_id."""
@@ -2564,6 +3113,235 @@ class TestPackets(unittest.TestCase):
                                  aux_data_len=1)
         for name in MLDv2AddressRecord.query_info()[1]:
             self.assertIsNotNone(rec.get_field_val(name), name)
+
+    def test_UDP_computed_zero_checksum_is_sent_as_ffff(self):
+        """RFC 768 reserves a zero UDP checksum for 'no checksum sent'.
+
+        The payload below is chosen so the ones complement sum folds to
+        zero. Storing that raw result silently turned the checksum off on
+        IPv4, and over IPv6 the checksum is not optional at all (RFC 8200
+        s8.1), so a zero there is an invalid datagram.
+        """
+        payload = b'\x60\x96'
+        ip = IP(proto=C.PROTO_UDP, src='10.1.2.3', dst='10.3.2.1',
+                payload=UDP(sport=34567, dport=53,
+                            payload=NullPkt(payload)))
+        wire = ip.pkt2net({'csum': 1, 'update': 1})
+        udp_bytes = wire[20:]
+
+        # This really is the fold-to-zero case: the same sum with the
+        # checksum field cleared comes out zero.
+        pheader = (_socket.inet_aton('10.1.2.3') +
+                   _socket.inet_aton('10.3.2.1') +
+                   _struct.pack('!HH', C.PROTO_UDP, len(udp_bytes)))
+        cleared = udp_bytes[:6] + b'\x00\x00' + udp_bytes[8:]
+        self.assertEqual(_cksum(pheader + cleared), 0)
+
+        parsed = IP(wire)
+        self.assertEqual(parsed.payload.checksum, 0xffff)
+        self.assertEqual(_struct.unpack('!H', udp_bytes[6:8])[0], 0xffff)
+        # 0xffff and 0 both verify, which is why zero could hide here.
+        self.assertEqual(_cksum(pheader + udp_bytes), 0)
+
+        v6 = IP6(next_header=C.PROTO_UDP, src=V6_SRC, dst=V6_DST,
+                 payload=UDP(sport=34567, dport=53,
+                             payload=NullPkt(payload)))
+        v6_wire = v6.pkt2net({'csum': 1, 'update': 1})
+        self.assertNotEqual(_struct.unpack('!H', v6_wire[46:48])[0], 0)
+
+    def test_IP_header_length_matches_the_options_written(self):
+        """iphl and total_len describe the header that is actually written.
+
+        total_len used to be iphl * 4 plus the payload, and iphl itself was
+        whatever the caller left it at, so an IP built with options but no
+        matching iphl emitted a header whose own declared length pointed
+        into the middle of it and a total_len that covered the wrong span.
+        """
+        ip = IP(proto=C.PROTO_UDP, src='10.1.2.3', dst='10.3.2.1',
+                options=b'\x01\x01\x00\x00',
+                payload=UDP(sport=34567, dport=53,
+                            payload=NullPkt(b'with-options')))
+        wire = ip.pkt2net({'csum': 1, 'update': 1})
+
+        self.assertEqual(ip.iphl, 6)
+        self.assertEqual(ip.total_len, len(wire))
+        self.assertEqual(wire[0], 0x46)
+        self.assertEqual(_struct.unpack('!H', wire[2:4])[0], len(wire))
+
+        parsed = IP(wire)
+        self.assertEqual(parsed.iphl, 6)
+        self.assertEqual(parsed.options, b'\x01\x01\x00\x00')
+        self.assertEqual(parsed.payload.sport, 34567)
+        self.assertEqual(parsed.payload.payload.pkt2net({}), b'with-options')
+        self.assertEqual(parsed.pkt2net({}), wire)
+
+        # Without 'update' the caller's values still go out untouched, so a
+        # deliberately wrong header is still possible.
+        bogus = IP(proto=C.PROTO_UDP, src='10.1.2.3', dst='10.3.2.1',
+                   iphl=15, payload=NullPkt(b''))
+        self.assertEqual(bogus.pkt2net({})[0], 0x4f)
+
+    def test_IP6_truncated_extension_chain_is_reported(self):
+        """A chain that runs off the end says so instead of failing open.
+
+        The walk stopped with an extension header's own next-header value
+        still in hand, and no decode branch matches one of those, so a
+        truncated chain and a protocol this library does not decode were
+        indistinguishable to a caller.
+        """
+        udp = UDP(sport=34567, dport=53,
+                  payload=NullPkt(b'ip6-hbh')).pkt2net({'update': 1})
+
+        # hdr_ext_len 0 means 8 bytes, which is exactly what is here.
+        whole = IP6(next_header=0, ext_headers=bytes([C.PROTO_UDP, 0]) +
+                    b'\x01\x00\x00\x00\x00\x00',
+                    src=V6_SRC, dst=V6_DST, payload=NullPkt(udp))
+        whole_wire = whole.pkt2net({'csum': 1, 'update': 1})
+        parsed_whole = IP6(whole_wire)
+        self.assertFalse(parsed_whole.ext_hdrs_truncated)
+        self.assertIsInstance(parsed_whole.payload, UDP)
+        self.assertEqual(parsed_whole.payload.sport, 34567)
+
+        # hdr_ext_len 5 claims 48 bytes; 8 are present.
+        cut = IP6(next_header=0, ext_headers=bytes([C.PROTO_UDP, 5]) +
+                  b'\x01\x00\x00\x00\x00\x00',
+                  src=V6_SRC, dst=V6_DST, payload=NullPkt(udp))
+        cut_wire = cut.pkt2net({'csum': 1, 'update': 1})
+        parsed_cut = IP6(cut_wire)
+        self.assertTrue(parsed_cut.ext_hdrs_truncated)
+        self.assertIsInstance(parsed_cut.payload, NullPkt)
+        self.assertEqual(parsed_cut.pkt2net({}), cut_wire)
+
+    def test_from_buffer_copies_a_caller_array(self):
+        """A mutable array handed to a constructor is copied, not adopted.
+
+        The owner/offset constructors already snapshot through tobytes();
+        the classes still parsing the old way took the caller's array as it
+        stood, so anything they kept a view of moved under them.
+        """
+        source = array('B', b'\x00\x01\x08\x00\x06\x04\x00\x01')
+        base = PKT()
+
+        found, buf = base.from_buffer((source,), {})
+        self.assertEqual(found, 1)
+        self.assertIsNot(buf, source)
+        source[0] = 0xff
+        self.assertEqual(buf[0], 0x00)
+
+        source[0] = 0x00
+        found, buf = base.from_buffer((), {'data': source})
+        self.assertEqual(found, 1)
+        self.assertIsNot(buf, source)
+        source[0] = 0xff
+        self.assertEqual(buf[0], 0x00)
+
+    def test_Ethernet_MPLS_forwards_l7_ports(self):
+        """MPLS under Ethernet reaches registered layer 7 classes.
+
+        This branch used to drop l7_ports for compatibility, so the very
+        same labels parsed through MPLS(...) directly saw the registry and
+        the ones arriving in a frame did not.
+        """
+        frame = Ethernet(
+            dst_mac='03:02:03:04:05:17', src_mac='06:05:04:03:02:17',
+            type=C.ETH_TYPE_MPLS_UCAST,
+            payload=MPLS(label=100, s=1, ttl=64,
+                         payload=IP(proto=C.PROTO_UDP, src='10.1.2.3',
+                                    dst='10.3.2.1',
+                                    payload=UDP(sport=34567, dport=5555,
+                                                payload=NullPkt(b'mpls-l7')))))
+        wire = frame.pkt2net({'csum': 1, 'update': 1})
+
+        parsed = Ethernet(wire, l7_ports={5555: _DynamicQueryProtocol})
+        udp = parsed.payload.payload.payload
+        self.assertIsInstance(udp, UDP)
+        self.assertIsInstance(udp.payload, _DynamicQueryProtocol)
+        self.assertEqual(udp.payload.get_field_val('dynamic.value'),
+                         'fallback')
+
+        # Same frame, no registry: the payload stays opaque and the frame
+        # still re-serializes byte for byte.
+        plain = Ethernet(wire)
+        self.assertIsInstance(plain.payload.payload.payload.payload, NullPkt)
+        self.assertEqual(plain.pkt2net({}), wire)
+
+    def test_PcapQuery_names_the_file_it_could_not_open(self):
+        """The message formatted the device, which is None on this branch."""
+        missing = '/no/such/directory/missing.pcap'
+        with self.assertRaises(ValueError) as caught:
+            PcapQuery(filename=missing, wshark_fields=['eth.src'])
+        self.assertIn(missing, str(caught.exception))
+        self.assertNotIn('None', str(caught.exception))
+
+    def test_open_pcap_dumper_failure_is_reported(self):
+        """A dumper that will not open raises instead of returning ERROR.
+
+        dump_hdr_pkt() quietly does nothing when there is no dumper, so a
+        caller that did not inspect the return value ran to completion and
+        wrote an empty file.
+        """
+        unwritable = '/no/such/directory/out.pcap'
+        reader = PCAPReader(filename=igmp_file)
+        try:
+            self.assertRaises(IOError, reader.open_pcap_dumper, unwritable)
+        finally:
+            reader.close()
+        self.assertRaises(IOError, PCAPWriter, filename=unwritable,
+                          snaplen=65535)
+
+    def test_live_setters_report_that_libpcap_ignores_them(self):
+        """pcap_set_* only apply before a handle is activated.
+
+        PCAPSocket opens with pcap_open_live(), which activates, so these
+        returned PCAP_ERROR_ACTIVATED and changed nothing. The code handed
+        that straight back, and a caller who did not check believed the
+        capture had been reconfigured.
+        """
+        devices = list_devices()
+        if not devices:
+            self.skipTest('libpcap will not enumerate devices here')
+        sock = None
+        for name in ('lo', 'lo0'):
+            if name in devices:
+                try:
+                    sock = _pcap.PCAPSocket(devicename=name)
+                except Exception:
+                    sock = None
+                break
+        if sock is None:
+            self.skipTest('cannot open a live capture here')
+        try:
+            self.assertRaises(ValueError, sock.set_snaplen, 1500)
+            self.assertRaises(ValueError, sock.set_promisc, 0)
+            self.assertRaises(ValueError, sock.set_timeout, 10)
+            # setnonblock is not one of the pre-activation settings and
+            # still works.
+            sock.setnonblock(1)
+            self.assertEqual(sock.getnonblock(), 1)
+        finally:
+            sock.close()
+
+    def test_pcap_info_agrees_with_reading_the_file(self):
+        """pcap_info scans with the GIL released; the numbers still match.
+
+        pcap_dispatch also answers -2 for a deliberate breakloop, which was
+        reported as a read error naming the wrong libpcap function.
+        """
+        info = pcap_info(igmp_file)
+        reader = PCAPReader(filename=igmp_file)
+        try:
+            pkts = reader.pkts()
+        finally:
+            reader.close()
+        self.assertEqual(info['total_packets'], len(pkts))
+        self.assertEqual(info['total_bytes'],
+                         sum(len(pkt[2]) for pkt in pkts))
+        self.assertLessEqual(info['first_timestamp'], info['last_timestamp'])
+
+        devices = list_devices()
+        self.assertIsInstance(devices, list)
+        for name in devices:
+            self.assertIsInstance(name, str)
 
 
 if __name__ == '__main__':

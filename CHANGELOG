@@ -1,6 +1,110 @@
 CHANGELOG
 ---------
 
+[2.1.2]
+ * **Declared lengths and header offsets now bound the parse.** `IP.total_len`,
+   `IP6`'s `payload_len` and `UDP.ulen` were read into fields but never used to
+   decide where a layer ended, so the padding every Ethernet NIC adds to a
+   short frame was decoded as UDP payload, handed to whatever Layer-7 class was
+   registered, and forwarded into NetFlow replay. Parsing now stops at the
+   declared length and the bytes behind it are kept on the new read/write
+   `PKT.trailer`, so a padded frame still re-serializes byte for byte while
+   staying out of the recomputed lengths and checksums; a declared length
+   longer than the bytes present is still accepted, so snaplen-truncated
+   captures and ICMP-quoted headers read as before. IPv4 `ihl` and TCP
+   `data_offset` are validated rather than clamped - `ihl=4` used to decode the
+   IPv4 address bytes as a UDP header and `data_offset=0` handed the TCP header
+   itself to the Layer-7 parser - and a TCP segment of 9 to 19 bytes raises
+   instead of falling through to the keyword defaults and returning a fully
+   zeroed layer.
+ * **Malformed input fails closed instead of drifting.** The MPLS label stack
+   walk is iterative and stops creating layers at `MPLS_MAX_STACK_DEPTH`, so a
+   crafted stack no longer trades four bytes of input for a native stack frame,
+   and the remainder is preserved as an opaque payload. `IGMPGroupRecord` reads
+   `aux_data_len` as the 32-bit word count RFC 3376 4.2.6 defines - which is
+   what the MLDv2 record it mirrors already did - and bounds it against the end
+   of the IGMP layer, so one such record no longer truncates its aux data,
+   desynchronizes the whole group-record list, or returns whatever followed the
+   datagram in the frame. A truncated IPv6 extension chain is distinguishable
+   from an upper-layer protocol this library does not decode through the new
+   readonly `IP6.ext_hdrs_truncated`. `PKT.from_buffer()` copies a caller's
+   `array`, so mutation isolation no longer depends on which parse path a layer
+   happened to use, and Ethernet forwards `l7_ports` into MPLS so encapsulated
+   TCP and UDP reach registered Layer-7 classes.
+ * **Serialized header fields describe the bytes actually written.** A computed
+   UDP checksum of zero goes out as 0xffff: RFC 768 reserves zero for "no
+   checksum sent", so a payload whose ones-complement sum happened to fold to
+   zero silently disabled the checksum on IPv4, and over IPv6, where the
+   checksum is not optional at all (RFC 8200 8.1), produced an invalid
+   datagram. Serializing `IP` with `update` derives `iphl` from the length of
+   `options` and `total_len` from the bytes written, instead of emitting a
+   header whose own declared length pointed into the middle of it; without
+   `update` the caller's values are still emitted untouched, which is how a
+   deliberately malformed header is produced.
+ * **NetFlow decoding follows the RFCs and the documented fallback.** The
+   Enterprise bit RFC 7011 3.2 defines for IPFIX was applied to v9 as well,
+   which has no such bit (RFC 3954 8), so a v9 template using the vendor
+   range (Cisco ASA NSEL exports 33000-33002 and 40000 and up) lost the top
+   bit of its element IDs and consumed 4 bytes of the following field as a
+   Private Enterprise Number, failing the whole template set; those exporters
+   never had a template learned and every data set they sent fell back to
+   `NetflowSimple`. A flowset the parser could not read now dispatches to
+   `NetflowSimple` too, rather than returning a partly decoded packet with no
+   signal to the caller. Record length now comes from the template, so a short
+   all-zero data record is no longer mistaken for the 4-byte set padding
+   RFC 3954 5.3 and RFC 7011 3.3.1 allow. v9 and IPFIX reject records that
+   belong to no flowset instead of writing a bare header, exceptions raised
+   while parsing a datagram reach the caller rather than being printed over a
+   half-initialized packet, and the generated record-class cache is bounded in
+   least-recently-used order, reachable through
+   `template_artifact_cache_info()`,
+   `set_template_artifact_cache_limit()` and `clear_template_artifact_cache()`.
+ * **One `NetflowSimple`, and replay that respects the version.**
+   `packets.protos.netflow` defined a second `NetflowSimple` and assigned it
+   over `packets.core.inetpkt.NetflowSimple` at import, which left `isinstance`
+   dependent on import order and disabled the core owner/offset Layer-7 fast
+   path for NetFlow; the protocol module now re-exports the core class, worth
+   about 28% on the Ethernet/IP/UDP/NetFlow decode path. Replay wrote
+   `unix_secs` and `unix_nano_seconds` unconditionally, which for IPFIX
+   overwrote the sequence number and the observation domain id while leaving
+   the real export time stale; both paths now share one helper that advances
+   `sys_uptime` for IPFIX, `unix_secs` for v9, and both timestamp fields for
+   v1-v8. They also count packets that are not NetFlow, name the first on
+   stderr and report the total in the exit status (the BPF filter a replay
+   installs constrains only the UDP destination port, so a short datagram used
+   to abandon the rest of the capture and a longer one raised part way
+   through), and reject a `decode_context` without `force_simple`. The 2055
+   overlap between `Netflow` and `NetflowSimple` in `default_ports()` is
+   documented.
+ * **libpcap failures are visible and handles are not leaked.** `findalldevs()`
+   frees the `pcap_if_t` chain `pcap_findalldevs` hands to the caller, so every
+   device lookup - including the check `PcapQuery` performs on construction -
+   no longer leaks. A `snaplen` of 0 is resolved to the whole frame before the
+   open, since only libpcap 1.9 and later reads it as "the maximum" and older
+   releases took it literally and captured zero bytes per packet. Calls on a
+   closed handle raise instead of passing a NULL `pcap_t` into libpcap, which
+   does not check it; the declarations gained exception values along with the
+   guards, because a `cpdef int` with no `except` clause cannot propagate one.
+   A dumper that cannot be opened raises rather than leaving `dump_hdr_pkt()`
+   quietly writing an empty file; `set_snaplen`, `set_promisc` and `set_timeout`
+   raise instead of handing back the `PCAP_ERROR_ACTIVATED` libpcap answers for
+   an already activated handle, naming the constructor keyword to use; and
+   `pcap_info()` scans with the GIL released and no longer reports a deliberate
+   `pcap_breakloop` as a read error naming the wrong libpcap function.
+ * **Query, CLI and packaging.** `PcapQuery.query(num_packets=N)` returns N
+   rows rather than one too many, and names the file it could not open instead
+   of formatting the device name, which is `None` on that branch.
+   `netflow-player --device` is checked against the devices libpcap reports,
+   exposed by the new `packets.core.pcap.list_devices()`; libpcap refusing to
+   enumerate them, which is what an unprivileged process sees, is treated as
+   "cannot tell" rather than as a failure. Cython is pinned below 3, whose
+   defaults for language level, undeclared exception values and `binding`
+   differ from the 0.x semantics these extensions rely on; `platforms` now
+   lists macOS as well as Linux; and the per-extension `cython_directives`
+   dictionaries were removed, since distutils does not know that keyword and
+   dropped it with a `UserWarning`, so neither directive had ever been applied.
+   Use `cythonize(..., compiler_directives=...)` to apply directives for real.
+
 [2.1.1]
  * Added stateful NetFlow v1/v5/v7/v9 and IPFIX decoding and generation.
  * Added scoped templates, fallback handling, replay support, and faster codecs.

@@ -31,7 +31,7 @@ scripts = {'console_scripts': [
 
 setup_args = {
     'name':                'packets',
-    'version':             '2.1',
+    'version':             '2.1.2',
 
     # Update the following as needed
     'author':              'David Vernon',
@@ -46,7 +46,10 @@ setup_args = {
     'extras_require': None,
     'test_suite': '',
     'include_package_data': True,
-    'platforms': 'Linux',
+    # pcap.pxd carries both the Linux and the macOS shape of the libpcap
+    # headers and the extension builds on either, so claiming Linux only
+    # was wrong.
+    'platforms': ['Linux', 'MacOS'],
     'classifiers': [
         'Intended Audience :: Developers',
         'Intended Audience :: Information Technology',
@@ -57,39 +60,39 @@ setup_args = {
         'Topic :: System :: Networking',
     ],
     'setup_requires': [
-        'cython',
+        # Pinned below 3. The extensions depend on Cython 0.x semantics in
+        # places that Cython 3 changes by default - notably the language
+        # level, the handling of a cdef function with no declared exception
+        # value, and binding for cdef class methods - so an unpinned build
+        # could silently produce a different module.
+        'cython>=0.28,<3',
         'setuptools>=18.0'
     ],
+    # NOTE: these carried cython_directives={'embedsignature': True,
+    # 'binding': True} until 2.1.2. distutils does not know that keyword and
+    # dropped it with 'UserWarning: Unknown Extension options', so neither
+    # directive was ever applied to any of these modules - UDP.__init__ has
+    # no embedded signature in a built extension, which is how it was
+    # caught. It is removed rather than repaired: turning binding on now
+    # would change how every cdef class method is exposed. To apply
+    # directives for real, build through cythonize(..., compiler_directives=
+    # {...}) instead of passing them to Extension().
     'ext_modules': [
         Extension("packets.core.pcap",
                   sources=["packets/core/pcap.pyx"],
-                  libraries=["pcap"],
-                  cython_directives={"embedsignature": True,
-                                     "binding": True}),
+                  libraries=["pcap"]),
         Extension("packets.core.inetpkt",
-                  sources=["packets/core/inetpkt.pyx"],
-                  cython_directives={"embedsignature": True,
-                                     "binding": True}),
+                  sources=["packets/core/inetpkt.pyx"]),
         Extension("packets.query.pcap_query",
-                  sources=["packets/query/pcap_query.pyx"],
-                  cython_directives={"embedsignature": True,
-                                     "binding": True}),
+                  sources=["packets/query/pcap_query.pyx"]),
         Extension("packets.protos.dns",
-                  sources=["packets/protos/dns.pyx"],
-                  cython_directives={"embedsignature": True,
-                                     "binding": True}),
+                  sources=["packets/protos/dns.pyx"]),
         Extension("packets.protos.netflow",
-                  sources=["packets/protos/netflow.pyx"],
-                  cython_directives={"embedsignature": True,
-                                     "binding": True}),
+                  sources=["packets/protos/netflow.pyx"]),
         Extension("packets.protos.dhcp",
-                  sources=["packets/protos/dhcp.pyx"],
-                  cython_directives={"embedsignature": True,
-                                     "binding": True}),
+                  sources=["packets/protos/dhcp.pyx"]),
         Extension("packets.protos.http",
-                  sources=["packets/protos/http.pyx"],
-                  cython_directives={"embedsignature": True,
-                                     "binding": True}),
+                  sources=["packets/protos/http.pyx"]),
     ],
     'entry_points': scripts
 }

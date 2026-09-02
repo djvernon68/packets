@@ -30,19 +30,6 @@ cdef class NetflowDecodeContext:
         public bint force_simple
 
 
-cdef class NetflowSimple(PKT):
-    cdef:
-        public uint16_t version, count
-        public uint32_t sys_uptime, unix_secs, unix_nano_seconds
-        public bytes payload
-
-    cpdef bytes pkt2net(self, dict kwargs)
-
-    cdef int _write(self, PktWriter w, dict kwargs) except -1
-
-    cpdef object get_field_val(self, str field)
-
-
 cdef class NetflowV1Header:
     cdef:
         public object version, count, sys_uptime, unix_secs, unix_nsecs
@@ -169,6 +156,11 @@ cdef class NetflowCodecPlan:
         dict aliases
         readonly object record_class
         readonly bint has_variable
+        # Byte length of one record for a template whose fields are all
+        # fixed length, else -1. _decode_data needs it to tell a short
+        # trailing run of zero bytes (set padding) from a genuine record
+        # that happens to be zero valued.
+        readonly Py_ssize_t fixed_length
         NetflowCodecOperation *c_operations
         Py_ssize_t operation_count
 
@@ -212,7 +204,11 @@ cdef class Netflow(PKT):
         bytes _wire_data
         bint _parsed, _requires_simple
 
-    cdef void _parse(self, bytes data)
+    # except -1, not void: _parse reads untrusted bytes, and a cdef
+    # function with no declared exception value cannot propagate at all -
+    # Cython prints the traceback and returns to the caller, leaving a half
+    # initialised packet behind with no way to tell that anything failed.
+    cdef int _parse(self, bytes data) except -1
 
     cpdef object get_field_val(self, str field)
 

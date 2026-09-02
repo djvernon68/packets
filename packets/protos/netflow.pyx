@@ -10,6 +10,8 @@ import socket
 import struct
 import zlib
 
+from collections import OrderedDict
+
 from cpython.array cimport array
 from cpython.mem cimport PyMem_Free, PyMem_Malloc
 from cpython.ref cimport Py_INCREF
@@ -33,6 +35,13 @@ cdef extern from "arpa/inet.h":
 from packets.core.inetpkt cimport PKT, PktWriter, _serialize, need_bytes, \
     rd_bytes, rd_u16, rd_u32, w_acquire, w_bytes, w_release, w_set_u16, \
     w_take, w_u8, w_u16, w_u32
+
+# NetflowSimple stays in packets.core.inetpkt and is re-exported here rather
+# than reimplemented. The core layer 7 dispatch has a C level fast path keyed
+# on that exact extension type (_l7_range -> _decode_netflow_simple), so a
+# second class of the same name would both break isinstance for callers that
+# import it from inetpkt and silently disable that fast path.
+from packets.core.inetpkt import NetflowSimple
 
 
 NETFLOW_PACKET_TYPE = 2055
@@ -151,9 +160,56 @@ INFORMATION_ELEMENTS = {
     217: ('exporterTransportPort', 'unsigned'),
 }
 
-_TEMPLATE_ARTIFACT_CACHE = {}
-cdef tuple _QI_NETFLOW_SIMPLE
+# Keyed on a template's field signature, so two exporters sending the same
+# template shape share one codec plan and one generated record class. Each
+# entry pins a dynamically created Python class for as long as it is here,
+# and a collector sees a new signature for every exporter that varies its
+# template or revises it, so an unbounded dict was a slow leak on any long
+# lived process: clearing the decode context did not touch it, because the
+# cache is deliberately wider than one context. Bounded and used in least
+# recently used order instead - an evicted signature simply costs one
+# rebuild the next time it is seen.
+_TEMPLATE_ARTIFACT_CACHE = OrderedDict()
+_TEMPLATE_ARTIFACT_CACHE_LIMIT = 512
 cdef tuple _QI_NETFLOW
+
+
+def template_artifact_cache_info():
+    """Current size and limit of the template codec plan cache.
+
+    Returns:
+        :tuple: (entries, limit).
+    """
+    return len(_TEMPLATE_ARTIFACT_CACHE), _TEMPLATE_ARTIFACT_CACHE_LIMIT
+
+
+def set_template_artifact_cache_limit(limit):
+    """Set how many template codec plans are kept, evicting if needed.
+
+    Args:
+        :limit (int): maximum entries to retain. Must be positive.
+
+    Returns:
+        :int: the limit now in force.
+    """
+    global _TEMPLATE_ARTIFACT_CACHE_LIMIT
+    if int(limit) < 1:
+        raise ValueError('template artifact cache limit must be positive')
+    _TEMPLATE_ARTIFACT_CACHE_LIMIT = int(limit)
+    _trim_template_artifact_cache()
+    return _TEMPLATE_ARTIFACT_CACHE_LIMIT
+
+
+def clear_template_artifact_cache():
+    """Drop every cached template codec plan and record class."""
+    _TEMPLATE_ARTIFACT_CACHE.clear()
+
+
+cdef int _trim_template_artifact_cache() except -1:
+    while len(_TEMPLATE_ARTIFACT_CACHE) > _TEMPLATE_ARTIFACT_CACHE_LIMIT:
+        _TEMPLATE_ARTIFACT_CACHE.popitem(last=False)
+    return 0
+
 
 cdef object _inet_aton = socket.inet_aton
 cdef object _inet_ntoa = socket.inet_ntoa
@@ -341,9 +397,29 @@ cdef bytes _encode_value(object field, object value):
     return encoded
 
 
-cdef tuple _parse_template_fields(bytes data, int offset, int count):
+cdef tuple _parse_template_fields(bytes data, int offset, int count,
+                                  int version):
+    """Read ``count`` template field specifiers starting at ``offset``.
+
+    The top bit of the field specifier means different things per version.
+    RFC 7011 3.2 defines it for IPFIX as the Enterprise bit: when set, the
+    low 15 bits are the element id and a 4 byte Private Enterprise Number
+    follows. RFC 3954 8 gives NetFlow v9 no such bit -- the whole 16 bits are
+    the field type, and 32768 and up are ordinary vendor field types. Cisco
+    ASA NSEL uses exactly that range (33000-33002, 40000 and up), so applying
+    the IPFIX rule to v9 both mangled the element id and consumed 4 bytes of
+    the next field as a PEN, which failed the template and left every data
+    set from that exporter to fall back to NetflowSimple.
+
+    :param data: the flowset body.
+    :param offset: where to start reading.
+    :param count: how many field specifiers to read.
+    :param version: NetFlow version, 9 or 10. Only 10 has the Enterprise bit.
+    :return: (fields, new offset, valid).
+    """
     cdef list fields = []
     cdef int raw_element_id, field_length, element_id
+    cdef bint enterprise_capable = version == 10
     cdef object enterprise_number, name, data_type
     cdef const unsigned char[:] mv = data
 
@@ -357,7 +433,7 @@ cdef tuple _parse_template_fields(bytes data, int offset, int count):
             return (fields, offset, False)
         enterprise_number = None
         element_id = raw_element_id
-        if raw_element_id & 0x8000:
+        if enterprise_capable and raw_element_id & 0x8000:
             element_id = raw_element_id & 0x7fff
             if offset + 4 > len(data):
                 return (fields, offset - 4, False)
@@ -444,6 +520,8 @@ cdef object _prepare_template(object template):
         return template
     signature = _template_signature(template)
     artifact = _TEMPLATE_ARTIFACT_CACHE.get(signature)
+    if artifact is not None:
+        _TEMPLATE_ARTIFACT_CACHE.move_to_end(signature)
     if artifact is None:
         plan = NetflowCodecPlan(template.fields, signature)
         checksum = zlib.crc32(repr(signature).encode('utf-8')) & 0xffffffff
@@ -453,6 +531,7 @@ cdef object _prepare_template(object template):
         plan.record_class = record_class
         artifact = (plan, record_class)
         _TEMPLATE_ARTIFACT_CACHE[signature] = artifact
+        _trim_template_artifact_cache()
     template.codec_plan, template.record_class = artifact
     return template
 
@@ -542,72 +621,6 @@ cdef class NetflowDecodeContext:
 
     def clear(self):
         self.registry.clear()
-
-
-cdef class NetflowSimple(PKT):
-    """Lightweight NetFlow header with an opaque payload."""
-
-    def __init__(self, *args, **kwargs):
-        cdef:
-            unsigned char use_buffer
-            array buf
-            const unsigned char[:] mv
-
-        self._base_l7(kwargs)
-        self.pkt_name = 'NetflowSimple'
-        self.pq_type, self.query_fields = _QI_NETFLOW_SIMPLE
-        use_buffer, buf = self.from_buffer(args, kwargs)
-        if use_buffer:
-            mv = buf
-            need_bytes(mv, NETFLOW_V1_HEADER_LEN, 'NetflowSimple')
-            self.version = rd_u16(mv, 0)
-            self.count = rd_u16(mv, 2)
-            self.sys_uptime = rd_u32(mv, 4)
-            self.unix_secs = rd_u32(mv, 8)
-            self.unix_nano_seconds = rd_u32(mv, 12)
-            self.payload = rd_bytes(mv, NETFLOW_V1_HEADER_LEN, -1)
-        else:
-            self.version = kwargs.get('version', 0)
-            self.count = kwargs.get('count', 0)
-            self.sys_uptime = kwargs.get('sys_uptime', 0)
-            self.unix_secs = kwargs.get('unix_secs', 0)
-            self.unix_nano_seconds = kwargs.get('unix_nano_seconds', 0)
-            self.payload = kwargs.get('payload', b'')
-
-    @classmethod
-    def query_info(cls):
-        return (NETFLOW_SIMPLE_PACKET_TYPE,
-                ('netflow.version', 'netflow.count', 'netflow.sys_uptime',
-                 'netflow.unix_secs', 'netflow.unix_nano_seconds'))
-
-    @classmethod
-    def default_ports(cls):
-        return [2005, 2055]
-
-    cpdef object get_field_val(self, str field):
-        if field == 'netflow.version':
-            return self.version
-        elif field == 'netflow.count':
-            return self.count
-        elif field == 'netflow.sys_uptime':
-            return self.sys_uptime
-        elif field == 'netflow.unix_secs':
-            return self.unix_secs
-        elif field == 'netflow.unix_nano_seconds':
-            return self.unix_nano_seconds
-        return None
-
-    cpdef bytes pkt2net(self, dict kwargs):
-        return _serialize(self, kwargs)
-
-    cdef int _write(self, PktWriter w, dict kwargs) except -1:
-        w_u16(w, self.version)
-        w_u16(w, self.count)
-        w_u32(w, self.sys_uptime)
-        w_u32(w, self.unix_secs)
-        w_u32(w, self.unix_nano_seconds)
-        w_bytes(w, self.payload)
-        return 0
 
 
 cdef inline void _read_v1_header(NetflowV1Header header,
@@ -1346,6 +1359,10 @@ cdef class NetflowCodecPlan:
         self.identities = tuple(identities)
         self.aliases = aliases
         self.has_variable = fixed_offset < 0
+        # fixed_offset carries the running total of the fixed field lengths
+        # and is set to -1 by the first variable length field, so it is
+        # already the record length for a fixed template and -1 otherwise.
+        self.fixed_length = fixed_offset
         self.record_class = NetflowDataRecord
         self.operation_count = len(operations)
         if self.operation_count:
@@ -1782,7 +1799,7 @@ cdef class Netflow(PKT):
             return NetflowSimple(*args, **kwargs)
         return packet
 
-    cdef void _parse(self, bytes data):
+    cdef int _parse(self, bytes data) except -1:
         cdef int offset, record_count
         cdef const unsigned char[:] mv = data
         cdef NetflowV1Header v1_header
@@ -1800,11 +1817,11 @@ cdef class Netflow(PKT):
         self.raw_data = data
         if len(data) < 2:
             self.version = 0
-            return
+            return 0
         self.version = rd_u16(mv, 0)
         if self.version == 1:
             if len(data) < NETFLOW_V1_HEADER_LEN:
-                return
+                return 0
             v1_header = NetflowV1Header.__new__(NetflowV1Header)
             _read_v1_header(v1_header, mv, 0)
             self.header = v1_header
@@ -1820,7 +1837,7 @@ cdef class Netflow(PKT):
             self.raw_data = rd_bytes(mv, offset, -1)
         elif self.version == 5:
             if len(data) < NETFLOW_V5_HEADER_LEN:
-                return
+                return 0
             v5_header = NetflowV5Header.__new__(NetflowV5Header)
             _read_v5_header(v5_header, mv, 0)
             self.header = v5_header
@@ -1836,7 +1853,7 @@ cdef class Netflow(PKT):
             self.raw_data = rd_bytes(mv, offset, -1)
         elif self.version == 7:
             if len(data) < NETFLOW_V7_HEADER_LEN:
-                return
+                return 0
             v7_header = NetflowV7Header.__new__(NetflowV7Header)
             _read_v7_header(v7_header, mv, 0)
             self.header = v7_header
@@ -1852,14 +1869,14 @@ cdef class Netflow(PKT):
             self.raw_data = rd_bytes(mv, offset, -1)
         elif self.version == 9:
             if len(data) < NETFLOW_V9_HEADER_LEN:
-                return
+                return 0
             v9_header = NetflowV9Header.__new__(NetflowV9Header)
             _read_v9_header(v9_header, mv, 0)
             self.header = v9_header
             self._parse_flowsets(data, NETFLOW_V9_HEADER_LEN, len(data))
         elif self.version == 10:
             if len(data) < IPFIX_HEADER_LEN:
-                return
+                return 0
             ipfix_header = IPFIXHeader.__new__(IPFIXHeader)
             _read_ipfix_header(ipfix_header, mv, 0)
             self.header = ipfix_header
@@ -1871,6 +1888,7 @@ cdef class Netflow(PKT):
                     min(len(data), self.header.length))
                 if self.header.length < len(data):
                     self.raw_data += data[self.header.length:]
+        return 0
 
     def _parse_flowsets(self, bytes data, int offset, int limit):
         cdef int set_id, set_length, end
@@ -1913,6 +1931,19 @@ cdef class Netflow(PKT):
         for flowset in self.flowsets:
             if not flowset.malformed and flowset.set_id >= 256:
                 self._decode_data(flowset, flowset.raw_data)
+
+        # Anything we could not read means this datagram is not fully
+        # understood, so dispatch has to hand back a NetflowSimple rather
+        # than a half decoded Netflow: a malformed template set leaves the
+        # data sets that reference it undecodable, and a malformed set
+        # header means the rest of the datagram was not framed at all.
+        # Previously only a missing template raised this, so a template set
+        # this parser could not read produced a Netflow with some flowsets
+        # decoded and some not, with no signal to the caller.
+        for flowset in self.flowsets:
+            if flowset.malformed:
+                self._requires_simple = True
+                break
 
     def _decode_flowset(self, flowset, bytes body):
         if ((self.version == 9 and flowset.set_id == 0) or
@@ -1964,7 +1995,7 @@ cdef class Netflow(PKT):
                     valid = True
                     while offset < scope_end:
                         parsed, new_offset, valid = _parse_template_fields(
-                            body, offset, 1)
+                            body, offset, 1, self.version)
                         if not valid or new_offset > scope_end:
                             valid = False
                             break
@@ -1974,7 +2005,7 @@ cdef class Netflow(PKT):
                     if valid:
                         while offset < option_end:
                             parsed, new_offset, valid = _parse_template_fields(
-                                body, offset, 1)
+                                body, offset, 1, self.version)
                             if not valid or new_offset > option_end:
                                 valid = False
                                 break
@@ -1990,7 +2021,7 @@ cdef class Netflow(PKT):
                         flowset.malformed = True
                         return
                     fields, new_offset, valid = _parse_template_fields(
-                        body, offset, field_count)
+                        body, offset, field_count, self.version)
                     if not valid:
                         flowset.padding = body[template_start:]
                         flowset.malformed = True
@@ -2010,7 +2041,7 @@ cdef class Netflow(PKT):
                 field_count = rd_u16(mv, offset + 2)
                 offset += 4
                 fields, new_offset, valid = _parse_template_fields(
-                    body, offset, field_count)
+                    body, offset, field_count, self.version)
                 if not valid:
                     flowset.padding = body[template_start:]
                     flowset.malformed = True
@@ -2047,6 +2078,8 @@ cdef class Netflow(PKT):
     def _decode_data(self, flowset, bytes body):
         cdef Py_ssize_t offset = 0
         cdef Py_ssize_t new_offset
+        cdef Py_ssize_t remaining
+        cdef Py_ssize_t record_length
         cdef NetflowCodecPlan codec_plan
         cdef NetflowDataRecord record
         cdef object template
@@ -2059,10 +2092,30 @@ cdef class Netflow(PKT):
             self._requires_simple = True
             return
         codec_plan = template.codec_plan
+        if codec_plan is None:
+            # A withdrawn template carries no codec plan, and codec_plan is
+            # a typed cdef reference: calling through it would be a C level
+            # crash rather than an AttributeError. Treat the set as one we
+            # have no template for.
+            self._requires_simple = True
+            return
+        # Byte length of one record, or -1 when the template has a variable
+        # length field and there is no such thing.
+        record_length = codec_plan.fixed_length
         flowset.raw_data = b''
         while offset < len(body):
-            if (len(body) - offset <= 3 and
-                    body[offset:] == b'\x00' * (len(body) - offset)):
+            remaining = len(body) - offset
+            # RFC 3954 s5.3 and RFC 7011 s3.3.1 allow a data set to be padded
+            # to a 4 byte boundary, so up to 3 trailing zero bytes are not a
+            # record. Length alone used to decide that, which threw away a
+            # genuine final record 1 to 3 bytes long whose fields were all
+            # zero: a template of one 2 byte field carrying two zero valued
+            # flows decoded as one, and header.count came back one short of
+            # what was on the wire. The template says how long a record is,
+            # so only rule one out when it cannot fit.
+            if (remaining <= 3 and
+                    (record_length < 0 or remaining < record_length) and
+                    body[offset:] == b'\x00' * remaining):
                 flowset.padding = body[offset:]
                 break
             new_offset = offset
@@ -2087,6 +2140,17 @@ cdef class Netflow(PKT):
 
     @classmethod
     def default_ports(cls):
+        """Layer 4 ports pcap_query decodes as a full NetFlow datagram.
+
+        NOTE: 2055 is also in NetflowSimple.default_ports(), so a caller
+        merging both classes into one l7_ports mapping silently keeps
+        whichever went in last. Pick one per port deliberately: Netflow
+        decodes flowsets and records, NetflowSimple keeps the datagram
+        opaque behind its header, which is what replay wants.
+
+        Returns:
+            :list: layer 4 ports for Netflow.
+        """
         return [NETFLOW_PACKET_PORT]
 
     cpdef object get_field_val(self, str field):
@@ -2113,6 +2177,8 @@ cdef class Netflow(PKT):
         cdef object record, flowset
         cdef int data_record_count = 0
         cdef int total_record_count = 0
+        cdef int orphans = 0
+        cdef set carried
         cdef Py_ssize_t start = w.n
 
         if self.header is None:
@@ -2141,6 +2207,32 @@ cdef class Netflow(PKT):
             data_record_count += len(flowset.records)
             total_record_count += (len(flowset.records) +
                                    len(flowset.templates))
+
+        # v9 and IPFIX put records inside a data flowset, which is what
+        # supplies the set id identifying the template they were encoded
+        # against - a bare record has nowhere to go. The loop below walks
+        # flowsets only, so records attached straight to .records were
+        # written nowhere and Netflow(version=9, records=[rec]).pkt2net()
+        # returned a header and nothing else, with no error. More records
+        # on the packet than the flowsets hold means at least one of them
+        # is such a record; the integer compare keeps the write path free
+        # of the identity walk in the ordinary case, where .records is just
+        # the flattened view of the flowsets that _parse built.
+        if len(self.records) > data_record_count:
+            carried = set()
+            for flowset in self.flowsets:
+                for record in flowset.records:
+                    carried.add(id(record))
+            for record in self.records:
+                if id(record) not in carried:
+                    orphans += 1
+            if orphans:
+                raise ValueError(
+                    "NetFlow v{0} carries records inside a NetflowFlowSet; "
+                    "{1} of {2} records on this packet belong to no flowset "
+                    "and cannot be serialized".format(
+                        self.version, orphans, len(self.records)))
+
         if kwargs.get('update'):
             if self.version == 9:
                 self.header.count = total_record_count
@@ -2158,8 +2250,4 @@ cdef class Netflow(PKT):
         return 0
 
 
-import packets.core.inetpkt as _inetpkt
-_inetpkt.NetflowSimple = NetflowSimple
-
-_QI_NETFLOW_SIMPLE = NetflowSimple.query_info()
 _QI_NETFLOW = Netflow.query_info()

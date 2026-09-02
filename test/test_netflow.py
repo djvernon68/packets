@@ -11,6 +11,7 @@ from packets.commands import netflow_player
 from packets.core.pcap import PCAPReader, PCAPWriter
 from packets.query.pcap_query import PcapQuery
 
+from packets.protos import netflow
 from packets.protos.netflow import IPFIXHeader, Netflow, NetflowCodecPlan, \
     NetflowDataRecord, NetflowDecodeContext, NetflowFlowSet, NetflowSimple, \
     NetflowTemplate, NetflowTemplateField, NetflowTemplateRegistry, \
@@ -154,6 +155,29 @@ class TestNetflow(unittest.TestCase):
         self.assertEqual(protocol.get_field_val('netflow.unix_secs'), 200)
         self.assertEqual(NetflowSimple.query_info()[0], 2005)
         self.assertEqual(NetflowSimple.default_ports(), [2005, 2055])
+
+    def test_netflow_simple_has_one_implementation(self):
+        """There must be exactly one NetflowSimple extension type.
+
+        This module used to define a second NetflowSimple and assign it over
+        packets.core.inetpkt.NetflowSimple at import. That made the two names
+        compare equal from Python while the core parser's C level layer 7 fast
+        path still tested against the original type, so the fast path went
+        dead and isinstance() depended on import order. Pinning the defining
+        module keeps a re-export from silently becoming a second class again.
+        """
+        self.assertIs(LegacyNetflowSimple, NetflowSimple)
+        self.assertEqual(NetflowSimple.__module__, 'packets.core.inetpkt')
+
+        # Registering the re-exported class must reach the core fast path and
+        # produce that same type, byte for byte.
+        wire = struct.pack('!HHIII', 5, 1, 100, 200, 300) + b'opaque'
+        frame = Ethernet(self.netflow_frame(wire),
+                         l7_ports={2055: NetflowSimple})
+        layer = frame.get_layer('NetflowSimple')
+        self.assertIsInstance(layer, NetflowSimple)
+        self.assertIsInstance(layer, LegacyNetflowSimple)
+        self.assertEqual(layer.pkt2net({}), wire)
 
     def test_netflow_nested_dispatch_and_mutable_source_isolation(self):
         wire = (struct.pack('!HHIII', 5, 0, 123456, 1500000000,
@@ -484,6 +508,115 @@ class TestNetflow(unittest.TestCase):
                          (None, 'bytes'))
         self.assertEqual((unknown.name, unknown.data_type), (None, 'bytes'))
 
+    def test_netflow_v9_high_element_ids_are_not_enterprise(self):
+        """NetFlow v9 has no enterprise bit, so 0x8000 is part of the id.
+
+        RFC 7011 3.2 gives IPFIX an Enterprise bit in the top bit of the
+        field specifier: when it is set the low 15 bits are the element id
+        and a 4 byte Private Enterprise Number follows. RFC 3954 8 gives v9
+        no such bit -- all 16 bits are the field type, and 32768 and up are
+        ordinary vendor field types. Cisco ASA NSEL uses exactly that range.
+
+        The parser applied the IPFIX rule to both versions, so a v9 template
+        carrying 33000 came out as element 232 and then consumed the next 4
+        bytes as a PEN. That desynchronized the rest of the template, the
+        whole set was marked malformed, no template was learned, and every
+        data set from that exporter fell back to NetflowSimple forever.
+        """
+        context = NetflowDecodeContext()
+        template_body = (struct.pack('!HH', 256, 3) +
+                         struct.pack('!HH', 8, 4) +
+                         struct.pack('!HH', 33000, 2) +
+                         struct.pack('!HH', 40000, 1))
+        template_wire = (struct.pack('!HHIIII', 9, 1, 100, 200, 10, 42) +
+                         struct.pack('!HH', 0, 4 + len(template_body)) +
+                         template_body)
+        packet = Netflow.dispatch(template_wire, context=context,
+                                  exporter='192.0.2.10')
+        self.assertIsInstance(packet, Netflow)
+        self.assertFalse(packet.flowsets[0].malformed)
+        template = packet.flowsets[0].templates[0]
+        self.assertEqual([f.element_id for f in template.fields],
+                         [8, 33000, 40000])
+        self.assertEqual([f.enterprise_number for f in template.fields],
+                         [None, None, None])
+        self.assertEqual(packet.pkt2net({}), template_wire)
+
+        data_body = b'\xc0\x00\x02\x01' + b'\x12\x34' + b'\x07'
+        data_wire = (struct.pack('!HHIIII', 9, 1, 101, 201, 11, 42) +
+                     struct.pack('!HH', 256, 4 + len(data_body)) + data_body)
+        decoded = Netflow.dispatch(data_wire, context=context,
+                                   exporter='192.0.2.10')
+        self.assertIsInstance(decoded, Netflow)
+        self.assertEqual(decoded.records[0].fields['sourceIPv4Address'],
+                         '192.0.2.1')
+        self.assertEqual(decoded.records[0].fields[33000], b'\x12\x34')
+        self.assertEqual(decoded.records[0].fields[40000], b'\x07')
+        self.assertEqual(decoded.pkt2net({}), data_wire)
+
+        # IPFIX must still apply the bit. 33000 is 0x8000 | 232, so the very
+        # bytes read above as element 33000 are element 232 with a private
+        # enterprise number here -- the two versions really do disagree about
+        # what this specifier means, which is why the parser needs to know
+        # which one it is reading.
+        ipfix_body = (struct.pack('!HH', 256, 1) +
+                      struct.pack('!HHI', 33000, 4, 32473))
+        ipfix_wire = (struct.pack('!HHIII', 10, 16 + 4 + len(ipfix_body),
+                                  200, 11, 42) +
+                      struct.pack('!HH', 2, 4 + len(ipfix_body)) + ipfix_body)
+        ipfix = Netflow(ipfix_wire, exporter='192.0.2.10',
+                        context=NetflowDecodeContext())
+        field = ipfix.flowsets[0].templates[0].fields[0]
+        self.assertEqual((field.element_id, field.enterprise_number),
+                         (232, 32473))
+        self.assertEqual(ipfix.pkt2net({}), ipfix_wire)
+
+    def test_netflow_malformed_flowset_falls_back_to_simple(self):
+        """A datagram we cannot fully read dispatches to NetflowSimple.
+
+        Only a data set whose template was unknown used to raise the fallback
+        flag. A template set the parser could not read left it clear, so
+        dispatch handed back a Netflow with some flowsets decoded, some
+        marked malformed and no signal to the caller that anything was
+        missing. Preserving such a datagram through NetflowSimple is what the
+        NetFlow support plan asks for.
+        """
+        context = NetflowDecodeContext()
+        # 40 field specifiers claimed, 8 bytes of body to hold them.
+        template_body = struct.pack('!HH', 256, 40) + struct.pack('!HH', 8, 4)
+        wire = (struct.pack('!HHIIII', 9, 1, 100, 200, 10, 42) +
+                struct.pack('!HH', 0, 4 + len(template_body)) + template_body)
+        packet = Netflow(wire, context=context, exporter='192.0.2.10')
+        self.assertTrue(packet.flowsets[0].malformed)
+        self.assertEqual(packet.pkt2net({}), wire)
+
+        simple = Netflow.dispatch(wire, context=context,
+                                  exporter='192.0.2.10')
+        self.assertIsInstance(simple, NetflowSimple)
+        self.assertEqual(simple.pkt2net({}), wire)
+
+        frame_wire = self.netflow_frame(wire)
+        frame = Ethernet(frame_wire, l7_ports={2055: Netflow},
+                         decode_context=context)
+        self.assertIsInstance(frame.get_layer('NetflowSimple'), NetflowSimple)
+        self.assertEqual(frame.pkt2net({}), frame_wire)
+
+        # A set header whose length runs past the datagram is the other way
+        # a flowset gets marked malformed, and it means the same thing.
+        truncated = (struct.pack('!HHIIII', 9, 1, 100, 200, 10, 42) +
+                     struct.pack('!HH', 0, 400) + template_body)
+        self.assertIsInstance(
+            Netflow.dispatch(truncated, context=context,
+                             exporter='192.0.2.10'), NetflowSimple)
+
+        # A datagram that reads cleanly is still a Netflow.
+        good_body = struct.pack('!HHHH', 256, 1, 8, 4)
+        good = (struct.pack('!HHIIII', 9, 1, 100, 200, 10, 42) +
+                struct.pack('!HH', 0, 4 + len(good_body)) + good_body)
+        self.assertIsInstance(
+            Netflow.dispatch(good, context=context, exporter='192.0.2.10'),
+            Netflow)
+
     def test_netflow_unknown_template_fallback_and_transition(self):
         context = NetflowDecodeContext()
         template_body = struct.pack('!HHHH', 256, 1, 8, 4)
@@ -609,9 +742,14 @@ class TestNetflow(unittest.TestCase):
         os.close(fd)
         original_raw = netflow_player.netflow_replay_raw_sock
         original_system = netflow_player.netflow_replay_system_sock
+        original_devices = netflow_player.known_devices
         original_argv = sys.argv
         netflow_player.netflow_replay_raw_sock = replay_raw
         netflow_player.netflow_replay_system_sock = replay_system
+        # --device is checked against the devices libpcap reports, and the
+        # name below is not on every host. What is under test here is that
+        # main() passes force_simple down, not this machine's NICs.
+        netflow_player.known_devices = lambda: ['eth0']
         try:
             sys.argv = ['netflow-player', '--file', filename,
                         '--dest_ip', '198.51.100.20', '--spoofing',
@@ -628,12 +766,160 @@ class TestNetflow(unittest.TestCase):
         finally:
             netflow_player.netflow_replay_raw_sock = original_raw
             netflow_player.netflow_replay_system_sock = original_system
+            netflow_player.known_devices = original_devices
             sys.argv = original_argv
             os.unlink(filename)
 
         self.assertEqual([call[0] for call in calls], ['raw', 'system'])
         for call in calls:
             self.assertTrue(call[1]['decode_context'].force_simple)
+
+    def test_netflow_v9_short_zero_record_is_not_padding(self):
+        """A 2 byte all zero flow record is a record, not set padding.
+
+        RFC 3954 s5.3 lets a data set be padded to a 4 byte boundary, so up
+        to 3 trailing bytes are not a record. The decoder decided that on
+        length alone, so the second of two zero valued records from a 2 byte
+        template was thrown away and header.count came back one short of
+        what was on the wire. How long a record is comes from the template.
+        """
+        context = NetflowDecodeContext()
+        template_body = struct.pack('!HHHH', 256, 1, 7, 2)
+        template_set = (struct.pack('!HH', 0, 4 + len(template_body)) +
+                        template_body)
+        data_body = b'\x00\x00' + b'\x00\x00'
+        data_set = struct.pack('!HH', 256, 4 + len(data_body)) + data_body
+        wire = (struct.pack('!HHIIII', 9, 3, 100, 200, 10, 42) +
+                template_set + data_set)
+
+        pkt = Netflow(wire, context=context, exporter='198.51.100.1')
+        self.assertEqual(len(pkt.records), 2)
+        self.assertEqual([record.raw_data for record in pkt.records],
+                         [b'\x00\x00', b'\x00\x00'])
+        self.assertEqual(pkt.flowsets[1].padding, b'')
+        self.assertEqual(pkt.pkt2net({}), wire)
+
+        # count is every record in the datagram, templates included.
+        updated = Netflow(pkt.pkt2net({'update': 1}),
+                          context=NetflowDecodeContext(),
+                          exporter='198.51.100.1')
+        self.assertEqual(updated.header.count, 3)
+
+        # Genuine padding is still padding: 2 zero bytes cannot hold a
+        # record from a 4 byte template.
+        wide_template = struct.pack('!HHHH', 257, 1, 8, 4)
+        wide_set = (struct.pack('!HH', 0, 4 + len(wide_template)) +
+                    wide_template)
+        padded_body = b'\x0a\x00\x00\x01' + b'\x00\x00'
+        padded_set = (struct.pack('!HH', 257, 4 + len(padded_body)) +
+                      padded_body)
+        padded_wire = (struct.pack('!HHIIII', 9, 2, 100, 200, 11, 42) +
+                       wide_set + padded_set)
+        padded = Netflow(padded_wire, context=NetflowDecodeContext(),
+                         exporter='198.51.100.2')
+        self.assertEqual(len(padded.records), 1)
+        self.assertEqual(padded.flowsets[1].padding, b'\x00\x00')
+        self.assertEqual(padded.pkt2net({}), padded_wire)
+
+    def test_netflow_v9_record_outside_a_flowset_is_reported(self):
+        """v9 and IPFIX records live in a flowset; a stray one is an error.
+
+        _write walks flowsets for these versions, so a record attached
+        straight to .records was written nowhere at all and pkt2net()
+        returned a header with no body and no complaint.
+        """
+        context = NetflowDecodeContext()
+        template_body = struct.pack('!HHHH', 256, 1, 7, 2)
+        template_set = (struct.pack('!HH', 0, 4 + len(template_body)) +
+                        template_body)
+        data_body = b'\x12\x34'
+        data_set = struct.pack('!HH', 256, 4 + len(data_body)) + data_body
+        wire = (struct.pack('!HHIIII', 9, 2, 100, 200, 10, 42) +
+                template_set + data_set)
+
+        pkt = Netflow(wire, context=context, exporter='198.51.100.1')
+        self.assertEqual(pkt.pkt2net({}), wire)
+
+        # The same record, also listed outside any flowset.
+        pkt.records.append(pkt.records[0])
+        self.assertEqual(pkt.pkt2net({}), wire)
+
+        stray = NetflowDataRecord(template_id=256, raw_data=b'\x56\x78')
+        pkt.records.append(stray)
+        with self.assertRaises(ValueError) as caught:
+            pkt.pkt2net({})
+        self.assertIn('belong to no flowset', str(caught.exception))
+
+    def test_netflow_template_artifact_cache_is_bounded(self):
+        """The codec plan cache evicts instead of growing forever.
+
+        Every distinct template signature pinned a generated record class
+        in a module level dict that nothing ever trimmed, so a collector
+        seeing many exporters or many template revisions leaked slowly.
+        """
+        entries, original_limit = netflow.template_artifact_cache_info()
+        netflow.clear_template_artifact_cache()
+        try:
+            netflow.set_template_artifact_cache_limit(8)
+            registry = NetflowTemplateRegistry()
+            for length in range(1, 41):
+                registry.register_template(
+                    9, '198.51.100.1', 42,
+                    NetflowTemplate(256,
+                                    [NetflowTemplateField(7, length)],
+                                    False, 9, False))
+            entries, limit = netflow.template_artifact_cache_info()
+            self.assertEqual(limit, 8)
+            self.assertLessEqual(entries, 8)
+            # An evicted signature simply costs one rebuild.
+            template = registry.resolve_template(9, '198.51.100.1', 42, 256)
+            self.assertIsNotNone(template.codec_plan)
+            self.assertRaises(ValueError,
+                              netflow.set_template_artifact_cache_limit, 0)
+        finally:
+            netflow.set_template_artifact_cache_limit(original_limit)
+            netflow.clear_template_artifact_cache()
+
+    def test_netflow_parse_errors_reach_the_caller(self):
+        """An exception raised while parsing propagates out of __init__.
+
+        _parse was declared 'cdef void', and a cdef function with no
+        exception value cannot propagate: Cython printed the traceback and
+        returned, handing back a half initialised packet that looked fine.
+        """
+        class Boom(object):
+            force_simple = False
+
+            def resolve_template(self, *args, **kwargs):
+                raise RuntimeError('resolve_template exploded')
+
+            def register_template(self, *args, **kwargs):
+                raise RuntimeError('register_template exploded')
+
+            def withdraw_templates(self, *args, **kwargs):
+                raise RuntimeError('withdraw_templates exploded')
+
+        data_body = b'\x12\x34'
+        data_set = struct.pack('!HH', 256, 4 + len(data_body)) + data_body
+        wire = (struct.pack('!HHIIII', 9, 1, 100, 200, 10, 42) + data_set)
+
+        with self.assertRaises(RuntimeError) as caught:
+            Netflow(wire, context=Boom(), exporter='198.51.100.1')
+        self.assertIn('resolve_template exploded', str(caught.exception))
+
+    def test_netflow_default_ports_overlap_on_2055(self):
+        """Both NetFlow classes claim 2055, and that is now documented.
+
+        A caller merging both into one l7_ports mapping keeps whichever
+        went in last, silently, and the two are not interchangeable.
+        """
+        self.assertEqual(Netflow.default_ports(), [2055])
+        self.assertEqual(NetflowSimple.default_ports(), [2005, 2055])
+        self.assertEqual(
+            set(Netflow.default_ports()) & set(NetflowSimple.default_ports()),
+            {2055})
+        for cls in (Netflow, NetflowSimple):
+            self.assertIn('2055', cls.default_ports.__doc__)
 
 
 if __name__ == '__main__':

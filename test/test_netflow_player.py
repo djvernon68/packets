@@ -4,6 +4,7 @@ import io
 import os
 import contextlib
 import unittest
+from unittest import mock
 
 from packets.commands import netflow_player
 
@@ -18,6 +19,15 @@ class TestNetflowPlayerArgs(unittest.TestCase):
     integer options were range checked, and a usage error came out as a
     traceback.
     """
+
+    def setUp(self):
+        # parse_args checks --device against the devices libpcap reports.
+        # The cases below name a loopback that only exists on some hosts,
+        # and the point of them is the parsing, not this machine's NICs.
+        patcher = mock.patch.object(netflow_player, 'known_devices',
+                                    return_value=['lo0', 'eth0'])
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def defaults(self, *extra):
         return ['--file', CAPTURE, '--dest_ip', '10.0.0.1'] + list(extra)
@@ -132,6 +142,28 @@ class TestNetflowPlayerArgs(unittest.TestCase):
         self.assertEqual(args.device, 'lo0')
         self.assertEqual(args.src_ip, '10.0.0.2')
         self.assertEqual(args.src_mac, 'aa:bb:cc:dd:ee:ff')
+
+    def test_spoofing_with_an_unknown_device_is_a_usage_error(self):
+        """A device that is not on this host is rejected by the parser.
+
+        Only '--device ' with an empty value used to be caught, so a typo
+        was carried all the way into PCAPSocket and came back as a
+        ValueError from the middle of the replay.
+        """
+        with self.usage_error():
+            netflow_player.parse_args(
+                self.defaults('--spoofing', '--device', 'not_a_nic'))
+
+    def test_device_is_not_checked_when_libpcap_will_not_enumerate(self):
+        """An empty device list means 'cannot tell', so nothing is rejected.
+
+        pcap_findalldevs needs privileges the suite may not have.
+        """
+        with mock.patch.object(netflow_player, 'known_devices',
+                               return_value=[]):
+            args = netflow_player.parse_args(
+                self.defaults('--spoofing', '--device', 'not_a_nic'))
+        self.assertEqual(args.device, 'not_a_nic')
 
     def test_spoofing_with_ipv6_source(self):
         args = netflow_player.parse_args(

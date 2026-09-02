@@ -5,7 +5,7 @@ import sys
 import socket
 import argparse
 
-from packets.core.pcap import netflow_replay_raw_sock, \
+from packets.core.pcap import list_devices, netflow_replay_raw_sock, \
     netflow_replay_system_sock
 from packets.protos.netflow import NetflowDecodeContext
 
@@ -35,6 +35,21 @@ def bounded_int(low, high):
                                              "".format(ival, low, high))
         return ival
     return check
+
+
+def known_devices():
+    """Capture device names libpcap reports, or an empty list.
+
+    Named rather than inlined so a test can stand in for it: the answer
+    depends on the host the suite happens to run on.
+
+    Returns:
+        :list: device names as str. Empty means libpcap would not say.
+    """
+    try:
+        return list_devices()
+    except Exception:
+        return []
 
 
 def readable_file(value):
@@ -180,6 +195,18 @@ def parse_args(argv):
     if args.spoofing and args.device == '':
         parser.error("A valid network device must be specified with --device "
                      "in order to use spoofing.")
+    if args.spoofing and args.device:
+        # Only the empty string used to be caught, so a typo reached
+        # PCAPSocket and surfaced as a ValueError out of the middle of the
+        # replay rather than as a usage message naming the real devices.
+        # known_devices() returns nothing when libpcap will not enumerate
+        # them - an unprivileged process cannot - and that is 'do not know',
+        # not 'no such device', so it is not treated as a failure.
+        devices = known_devices()
+        if devices and args.device not in devices:
+            parser.error("'{0}' is not a capture device on this system. "
+                         "Available devices: {1}"
+                         "".format(args.device, ', '.join(sorted(devices))))
     if (args.spoofing and args.src_ip and
             address_family(args.src_ip) != address_family(args.dest_ip)):
         parser.error("--src_ip and --dest_ip must use the same address family "

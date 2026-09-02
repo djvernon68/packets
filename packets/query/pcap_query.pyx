@@ -223,8 +223,11 @@ cdef class PcapQuery:
                 4 protocols like TCP and UDP to decode payload.
             :bpf_filter (str): A BPF filter to add to the packet source. Works
                 for both device and file queries.
-            :snaplen (int): Length of data to read off the wires. Only effects
-                devicename PcapQuery objects.
+            :snaplen (int): Length of data to read off the wires. Default is
+                0, meaning the whole frame; PCAPSocket resolves that to
+                libpcap's maximum, because libpcap before 1.9 reads a snaplen
+                of 0 as zero bytes per packet. Only effects devicename
+                PcapQuery objects.
             :promisc (int): Operate the network socket in promiscuous mode.
                 Only effects devicename PcapQuery objects.
             :to_ms (int): The number of millisecs to wait and buffer packets
@@ -262,14 +265,17 @@ cdef class PcapQuery:
             if valid_file(file):
                 self.srcname = file
             else:
+                # file, not dev: dev is None on this branch, so a bad
+                # filename reported 'Could not open None for reading'.
                 raise ValueError('Could not open {} for reading. Please check '
                                  'permissions or specify a valid file.'
-                                 ''.format(dev))
+                                 ''.format(file))
         else:
             raise ValueError("Either 'devicename' or 'filename' must be "
                              "defined.")
 
         if self.use_device:
+            # 0 means the whole frame; PCAPSocket resolves it.
             snaplen = kwargs.get('snaplen', 0)
             promisc = kwargs.get('promisc', 1)
             to_ms = kwargs.get('to_ms', 50)
@@ -432,9 +438,9 @@ cdef class PcapQuery:
                 Default is 0.0 meaning no start time.
             :endtime (double): Timestamp of the last packet of interest.
                 Default is 0.0 meaning no end time.
-            :num_packets (int): Number of packets to inspect prior to
-                returning.
+            :num_packets (int): Maximum number of rows to return.
                 Default is 0 meaning all packets.
+                NOTE: before 2.1.2 this returned num_packets + 1 rows.
                 NOTE: if both endtime and num_packets are specified then the
                 first one to match will be in effect.
                 num_packets is the count of packets that match the timeframe
@@ -488,7 +494,7 @@ cdef class PcapQuery:
                     # num_packets or stop_event ends the query.
                     if et and time.time() > endtime:
                         break
-                    elif count_packets and pkts > num_packets:
+                    elif count_packets and pkts >= num_packets:
                         break
                     continue
                 break
@@ -497,7 +503,10 @@ cdef class PcapQuery:
                     continue
                 elif et and ts > endtime:
                     break
-                elif count_packets and pkts > num_packets:
+                # pkts is the number of rows already collected, so the test
+                # is '>=': at 'pkts > num_packets' the loop went on to accept
+                # one more match and returned num_packets + 1 rows.
+                elif count_packets and pkts >= num_packets:
                     break
                 elif self.stop_event.is_set():
                     break

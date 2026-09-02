@@ -314,6 +314,7 @@ cpdef str int2ip(uint32_t addr)
 
 cpdef char *lookupdev(char *errtext)
 cpdef int findalldevs(list devices, char *errtext)
+cpdef list list_devices()
 cdef int lookupnet(const char *device,
                    bpf_u_int32 *net,
                    bpf_u_int32 *mask,
@@ -335,7 +336,9 @@ cdef class PCAPBase:
         bint have_dumper
         double start_ts, end_ts
 
-    cdef int _open_pcap_dumper(self, str file_name, pcap_t * sock)
+    # except -1: a dumper that could not be opened has to reach the caller.
+    # Returning ERROR left dump_hdr_pkt() silently discarding every packet.
+    cdef int _open_pcap_dumper(self, str file_name, pcap_t * sock) except -1
     cpdef void close_pcap_dumper(self)
     cpdef void dump_hdr_pkt(self,
                             pcap_pkthdr_t hdr,
@@ -367,15 +370,21 @@ cdef class PCAPSocket(PCAPBase):
         bpf_u_int32 net
         bpf_u_int32 mask
 
-    cpdef int set_snaplen(self, int snaplen)
-    cpdef int set_promisc(self, int promisc)
-    cpdef int set_timeout(self, int timeout)
-    cpdef int getnonblock(self)
-    cpdef int setnonblock(self, int nonblock)
+    # except? -1 on all of these: close() NULLs self.sock, and libpcap does
+    # not check its handle argument, so each of them has to be able to say
+    # 'closed' rather than crash inside libpcap. Without an exception value
+    # a cdef int function cannot propagate at all - Cython 0.28 prints the
+    # exception and returns as though it had not happened. The '?' is there
+    # because -1 is also a genuine libpcap return code.
+    cpdef int set_snaplen(self, int snaplen) except? -1
+    cpdef int set_promisc(self, int promisc) except? -1
+    cpdef int set_timeout(self, int timeout) except? -1
+    cpdef int getnonblock(self) except? -1
+    cpdef int setnonblock(self, int nonblock) except? -1
     # except -1: as add_bpf_filter, a failed send must reach the caller.
     cpdef int sendpacket(self, bytes pktdata) except -1
     cpdef int add_bpf_filter(self, str bpf_filter) except -1
-    cpdef int open_pcap_dumper(self, str file_name)
+    cpdef int open_pcap_dumper(self, str file_name) except? -1
     cpdef void close(self)
 
 
@@ -389,7 +398,7 @@ cdef class PCAPReader(PCAPBase):
 
     cpdef list pkts(self)
     cpdef void close(self)
-    cpdef int open_pcap_dumper(self, str file_name)
+    cpdef int open_pcap_dumper(self, str file_name) except? -1
     cpdef int add_bpf_filter(self, str bpf_filter) except -1
 
 
@@ -400,7 +409,7 @@ cdef class PCAPWriter(PCAPBase):
 
 
     cpdef void close(self)
-    cpdef int open_pcap_dumper(self, str file_name)
+    cpdef int open_pcap_dumper(self, str file_name) except? -1
 
 
 cpdef pcap_pkthdr_t get_pkts_header(double ts, bytes data)

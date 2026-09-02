@@ -65,6 +65,70 @@ ETH_LOOP = 108
 ETH_LINUX_SLL = 113
 ETH_LTALK = 114
 PCAP_NETMASK_UNKNOWN = 0xffffffff
+# libpcap's own MAXIMUM_SNAPLEN, and the value tcpdump passes for "capture
+# the whole frame". snaplen is a hard cap on the bytes libpcap copies out of
+# each frame, so a snaplen of 0 does not mean "no limit": libpcap before 1.9
+# takes it literally and hands back caplen 0 for every packet, an entirely
+# empty capture. Newer libpcap silently substitutes this value instead, so
+# the meaning of the documented default used to depend on the libpcap the
+# extension happened to link against. See _resolve_snaplen below.
+MAX_SNAPLEN = 262144
+
+
+cpdef int _resolve_snaplen(int snaplen):
+    """Turn a caller's snaplen into one libpcap will not read as "nothing".
+
+    Callers who want every byte of every frame say ``snaplen=0``, which is
+    the documented default. Only libpcap 1.9 and later reads that as "the
+    maximum"; older releases cap the capture at zero bytes and the caller
+    gets a live capture in which every packet is empty. Mapping the value
+    here makes the default mean the same thing on every libpcap.
+
+    Args:
+        :snaplen (int): the caller's requested snaplen.
+
+    Returns:
+        :int: snaplen if it is a usable positive length, else MAX_SNAPLEN.
+    """
+    if snaplen <= 0 or snaplen > MAX_SNAPLEN:
+        return MAX_SNAPLEN
+    return snaplen
+
+
+cdef int _check_setter(int rval, str call, str keyword) except? -1:
+    """Report a libpcap setter that could not take effect.
+
+    pcap_set_snaplen(), pcap_set_promisc() and pcap_set_timeout() only
+    apply between pcap_create() and pcap_activate(). PCAPSocket opens its
+    handle with pcap_open_live(), which does all three in one step, so the
+    handle a caller reaches these through is already activated and libpcap
+    answers PCAP_ERROR_ACTIVATED and changes nothing. The return code was
+    handed straight back and is easy to drop, so a caller was left thinking
+    the capture had been reconfigured when it had not.
+    """
+    if rval == ERROR_ACTIVATED:
+        raise ValueError(
+            "PCAPSocket.{0}() cannot change a capture that is already "
+            "running; libpcap only accepts this before the handle is "
+            "activated. Pass {1} to PCAPSocket() instead."
+            "".format(call, keyword))
+    if rval < 0:
+        raise ValueError("PCAPSocket.{0}() failed: libpcap returned {1}"
+                         "".format(call, rval))
+    return rval
+
+
+cdef int _need_handle(pcap_t * handle, str call) except -1:
+    """Refuse to hand libpcap a NULL pcap_t *.
+
+    close() NULLs the handle it just freed, and nothing stops a caller from
+    reaching for the object afterwards. libpcap does not check its handle
+    argument, so passing NULL through is undefined behaviour: the process
+    dies inside libpcap rather than raising something the caller can catch.
+    """
+    if handle is NULL:
+        raise ValueError("{0} on a closed capture handle".format(call))
+    return 0
 
 
 cdef object _netflow_decode_context(dict kwargs):
@@ -168,17 +232,46 @@ cpdef char *lookupdev(char *errtext):
 cpdef int findalldevs(list devices, char *errtext):
     cdef:
         int rval
-        pcap_if_t * ifaces
+        pcap_if_t * ifaces = NULL
         pcap_if_t * current
-        pcap_addr * cur_addr
     rval = ERROR
     rval = pcap_findalldevs(&ifaces, errtext)
     if not rval:
-        current = ifaces
-        while current:
-            devices.append(current.name)
-            current = current.next
+        try:
+            current = ifaces
+            while current:
+                devices.append(current.name)
+                current = current.next
+        finally:
+            # pcap_findalldevs mallocs the whole pcap_if_t chain, addresses
+            # and names included, and hands ownership to us. The names
+            # appended above are Cython's own copies of those C strings, so
+            # the chain has to go back: without this every device lookup -
+            # including the valid_dev() check PcapQuery does on construction
+            # - leaked the entire interface list.
+            pcap_freealldevs(ifaces)
     return rval
+
+cpdef list list_devices():
+    """Names of the capture devices libpcap can see on this host.
+
+    findalldevs() is the C shaped call - it fills a list handed to it and
+    needs an error buffer - so anything outside this module that just wants
+    to know whether a device name is real had no reasonable way to ask.
+
+    Returns:
+        :list: device names as str, empty if libpcap could not enumerate
+            them. An empty list means 'could not tell', not 'none exist':
+            an unprivileged process is usually not allowed to look.
+    """
+    cdef:
+        list raw = []
+        char errors[ERRBUF_SZ]
+
+    if findalldevs(raw, errors):
+        return []
+    return [name.decode('utf-8', 'replace') for name in raw]
+
 
 cdef int lookupnet(const char *device,
                    bpf_u_int32 * net,
@@ -263,7 +356,7 @@ cdef class PCAPBase:
             self.dumper = NULL
             self.have_dumper = 0
 
-    cdef int _open_pcap_dumper(self, str file_name, pcap_t * sock):
+    cdef int _open_pcap_dumper(self, str file_name, pcap_t * sock) except -1:
         cdef:
             char * filename = b''
             bytes encoded
@@ -272,10 +365,16 @@ cdef class PCAPBase:
         filename = encoded
         self.dumper = pcap_dump_open(sock, filename)
         if self.dumper is NULL:
-            return ERROR
-        else:
-            self.have_dumper = 1
-            return 0
+            # Raising, not returning ERROR. A caller who did not inspect the
+            # return value carried on dumping into a NULL dumper, which
+            # dump_hdr_pkt quietly ignores, so a run that looked entirely
+            # successful wrote an empty file - or no file at all.
+            raise IOError("Could not open {0} for writing: {1}"
+                          "".format(file_name,
+                                    pcap_geterr(sock).decode('utf-8',
+                                                             'replace')))
+        self.have_dumper = 1
+        return 0
 
     cpdef void close_pcap_dumper(self):
         if self.dumper is not NULL:
@@ -334,7 +433,8 @@ cdef class PCAPBase:
 
         if rval == ERROR:
             raise Exception("Failed to compile BPF filter: {0}"
-                            "".format(pcap_geterr(sock).decode()))
+                            "".format(pcap_geterr(sock).decode('utf-8',
+                                                               'replace')))
         rval = pcap_setfilter(sock, &bpfprog)
         # pcap_compile mallocs the bpf_insn program; free it once installed.
         pcap_freecode(&bpfprog)
@@ -368,7 +468,9 @@ cdef class PCAPSocket(PCAPBase):
         # dev is only valid while that reference is held.
         self.devicename = kwargs.get('devicename', '').encode()
         dev = self.devicename
-        snaplen = kwargs.get('snaplen', 0)
+        # 0, the documented default, means "the whole frame". libpcap only
+        # reads it that way from 1.9 on, so resolve it here instead.
+        snaplen = _resolve_snaplen(kwargs.get('snaplen', 0))
         promisc = kwargs.get('promisc', 1)
         to_ms = kwargs.get('to_ms', 100)
         self.sock = open_live(dev,
@@ -421,37 +523,51 @@ cdef class PCAPSocket(PCAPBase):
             mask = socket.ntohl(self.mask)
             return int2ip(mask)
 
-    cpdef int set_snaplen(self, int snaplen):
-        return pcap_set_snaplen(self.sock, snaplen)
+    # These all reach libpcap through self.sock, which close() sets to NULL.
+    # They need the except clause as much as the guard: a cpdef int with no
+    # declared exception value cannot propagate, so Cython would print the
+    # ValueError raised below and return to the caller as though nothing had
+    # happened. -1 is also a real libpcap return code, hence 'except?'.
+    cpdef int set_snaplen(self, int snaplen) except? -1:
+        _need_handle(self.sock, 'PCAPSocket.set_snaplen()')
+        return _check_setter(pcap_set_snaplen(self.sock, snaplen),
+                             'set_snaplen', 'snaplen')
 
-    cpdef int set_promisc(self, int promisc):
-        return pcap_set_promisc(self.sock, promisc)
+    cpdef int set_promisc(self, int promisc) except? -1:
+        _need_handle(self.sock, 'PCAPSocket.set_promisc()')
+        return _check_setter(pcap_set_promisc(self.sock, promisc),
+                             'set_promisc', 'promisc')
 
-    cpdef int set_timeout(self, int timeout):
-        return pcap_set_timeout(self.sock, timeout)
+    cpdef int set_timeout(self, int timeout) except? -1:
+        _need_handle(self.sock, 'PCAPSocket.set_timeout()')
+        return _check_setter(pcap_set_timeout(self.sock, timeout),
+                             'set_timeout', 'to_ms')
 
-
-    cpdef int getnonblock(self):
+    cpdef int getnonblock(self) except? -1:
         cdef:
             char errors[ERRBUF_SZ]
             int rval
+        _need_handle(self.sock, 'PCAPSocket.getnonblock()')
         rval = pcap_getnonblock(self.sock, errors)
         return rval
 
-    cpdef int setnonblock(self, int nonblock):
+    cpdef int setnonblock(self, int nonblock) except? -1:
         cdef:
             char errors[ERRBUF_SZ]
             int rval
 
+        _need_handle(self.sock, 'PCAPSocket.setnonblock()')
         rval = pcap_setnonblock(self.sock, nonblock, errors)
         return rval
 
     cpdef int sendpacket(self, bytes pktdata) except -1:
         cdef:
             const unsigned char * buff = b''
-            pcap_t * sock = self.sock
+            pcap_t * sock
             int rval, _len
 
+        _need_handle(self.sock, 'PCAPSocket.sendpacket()')
+        sock = self.sock
         buff = pktdata
         _len = len(pktdata)
         with nogil:
@@ -459,14 +575,17 @@ cdef class PCAPSocket(PCAPBase):
 
         if rval == ERROR:
             raise Exception("pcap_sendpacket failed: {0}"
-                            "".format(pcap_geterr(self.sock).decode()))
+                            "".format(pcap_geterr(self.sock).decode(
+                                'utf-8', 'replace')))
         else:
             return _len
 
-    cpdef int open_pcap_dumper(self, str file_name):
+    cpdef int open_pcap_dumper(self, str file_name) except? -1:
+        _need_handle(self.sock, 'PCAPSocket.open_pcap_dumper()')
         return self._open_pcap_dumper(file_name, self.sock)
 
     cpdef int add_bpf_filter(self, str bpf_filter) except -1:
+        _need_handle(self.sock, 'PCAPSocket.add_bpf_filter()')
         return self._add_bpf_filter(bpf_filter, self.sock, self.mask)
 
     def __iter__(self):
@@ -558,10 +677,12 @@ cdef class PCAPReader(PCAPBase):
             pcap_close(self.reader)
             self.reader = NULL
 
-    cpdef int open_pcap_dumper(self, str file_name):
+    cpdef int open_pcap_dumper(self, str file_name) except? -1:
+        _need_handle(self.reader, 'PCAPReader.open_pcap_dumper()')
         return self._open_pcap_dumper(file_name, self.reader)
 
     cpdef int add_bpf_filter(self, str bpf_filter) except -1:
+        _need_handle(self.reader, 'PCAPReader.add_bpf_filter()')
         return self._add_bpf_filter(bpf_filter, self.reader, NETMASK_UNKNOWN)
 
     def __iter__(self):
@@ -622,6 +743,9 @@ cdef class PCAPWriter(PCAPBase):
             int rval
             str fn
 
+        # Not run through _resolve_snaplen: this is the snaplen recorded in
+        # the file header of a capture we write, not a cap on a live read,
+        # and the field is a uint16_t that MAX_SNAPLEN would overflow.
         self.snaplen = kwargs.get('snaplen', 0)
         fn = kwargs.get('filename', '')
 
@@ -632,12 +756,12 @@ cdef class PCAPWriter(PCAPBase):
             v_err = ValueError("PCAPWriter failed to open a dead pcap_t *")
             raise v_err
         if fn:
-            rval = self.open_pcap_dumper(fn)
-            if rval:
-                v_err = ValueError("PCAPWriter could not open a pcap_dumper_t")
-                raise v_err
+            # _open_pcap_dumper raises on failure, so there is no return
+            # value left to check here.
+            self.open_pcap_dumper(fn)
 
-    cpdef int open_pcap_dumper(self, str file_name):
+    cpdef int open_pcap_dumper(self, str file_name) except? -1:
+        _need_handle(self.pcap_dead, 'PCAPWriter.open_pcap_dumper()')
         return self._open_pcap_dumper(file_name, self.pcap_dead)
 
     cpdef void close(self):
@@ -672,24 +796,35 @@ cpdef dict pcap_info(str filename):
     cdef:
         PCAPReader rdr
         PcapInfoState state
+        pcap_t * handle
         int status
         str err_txt
         dict rval
 
     rdr = PCAPReader(filename=filename)
+    handle = rdr.reader
     state.packets = 0
     state.byte_count = 0
     state.first_ts = 0
     state.last_ts = 0
     try:
         while True:
-            status = pcap_dispatch(rdr.reader, 256, _pcap_info_callback,
-                                   <u_char *>&state)
+            # nogil: _pcap_info_callback touches nothing but the C struct it
+            # is handed, and this loop walks an entire capture file, so
+            # holding the interpreter lock across it stalled every other
+            # thread for the length of the scan.
+            with nogil:
+                status = pcap_dispatch(handle, 256, _pcap_info_callback,
+                                       <u_char *>&state)
             if status == 0:
                 break
+            if status == ERROR_BREAK:
+                # pcap_breakloop() was called on this handle. A deliberate
+                # stop, not a read failure - it used to be reported as one.
+                break
             if status < 0:
-                err_txt = pcap_geterr(rdr.reader).decode('utf-8', 'replace')
-                raise IOError("pcap_next_ex failed reading {0}: {1}"
+                err_txt = pcap_geterr(handle).decode('utf-8', 'replace')
+                raise IOError("pcap_dispatch failed reading {0}: {1}"
                               "".format(filename, err_txt))
     finally:
         rdr.close()
@@ -698,6 +833,66 @@ cpdef dict pcap_info(str filename):
             'total_packets': state.packets,
             'total_bytes': state.byte_count}
     return rval
+
+
+cdef int _retime_netflow_simple(object nf, double now) except -1:
+    """Move a NetflowSimple header's export timestamp forward to ``now``.
+
+    NetflowSimple names its five header fields after the v1-v8 layout, but v9
+    and IPFIX put different things in the same bytes, so which field carries
+    the export time - and which must be left alone - depends on the version:
+
+      * v1-v8: unix_secs / unix_nano_seconds are the export timestamp.
+      * v9 (RFC 3954): unix_secs is still the export time, but the bytes
+        NetflowSimple calls unix_nano_seconds are the flow sequence number.
+      * IPFIX / v10 (RFC 7011): the header is version, length, exportTime,
+        sequenceNumber, observationDomainID. Only sys_uptime lines up with
+        exportTime; unix_secs and unix_nano_seconds are the sequence number
+        and the observation domain id, and rewriting either corrupts the
+        stream for the collector.
+    """
+    if nf.version == 10:
+        nf.sys_uptime = int(now)
+        return 0
+    nf.unix_secs = int(now)
+    if nf.version != 9:
+        nf.unix_nano_seconds = int((now % 1) * 1000000)
+    return 0
+
+
+cdef object _replay_netflow_layer(Ethernet eth):
+    """The NetflowSimple layer of a captured frame, or None.
+
+    The BPF filter a replay installs constrains only the UDP destination
+    port, so everything else sent to that port arrives here too - and 2055
+    sees plenty. get_layer_by_type() answers with an empty NullPkt when the
+    layer is absent, and a decode context that does not force the simple
+    representation produces a full Netflow instead, which keeps its header
+    fields on a separate header object. Neither has the five header fields
+    the rewrite below assigns, so reaching for them raised AttributeError
+    part way through a replay and abandoned the rest of the capture.
+    """
+    cdef PKT layer = eth.get_layer_by_type(PQ_NETFLOW_SIMPLE)
+    if isinstance(layer, NetflowSimple):
+        return layer
+    return None
+
+
+cdef int _require_simple_context(object decode_context, str call) except -1:
+    """A replay needs the simple NetFlow representation, not a decoded one.
+
+    Replay rewrites header fields by name and re-serializes the datagram
+    byte for byte, which is what NetflowSimple is for. A context that lets
+    the full decoder run yields a Netflow whose header fields live on a
+    header object, so every frame would be skipped as unusable; saying so
+    up front beats reporting a capture's worth of skipped packets.
+    """
+    if decode_context is not None and not decode_context.force_simple:
+        raise ValueError(
+            "{0} needs a NetflowDecodeContext(force_simple=True); replay "
+            "rewrites the NetFlow header in place and re-sends the original "
+            "bytes".format(call))
+    return 0
 
 
 cdef int _address_family(str address) except -1:
@@ -735,9 +930,11 @@ cdef bytes _build_netflow_replay_frame_for_family(
 
     captured_eth = Ethernet(pkt, l7_ports={pcap_dst_port: Netflow},
                             decode_context=decode_context)
+    nf = _replay_netflow_layer(captured_eth)
+    if nf is None:
+        return None
     captured_ip = captured_eth.payload
     captured_udp = captured_ip.payload
-    nf = captured_udp.payload
 
     if src_ip:
         replay_src_ip = src_ip
@@ -751,14 +948,12 @@ cdef bytes _build_netflow_replay_frame_for_family(
     else:
         replay_src_mac = captured_eth.src_mac
 
-    nf.unix_secs = int(now)
+    _retime_netflow_simple(nf, now)
     if new_type > 0 and nf.version in (5, 6, 7, 8):
         the_flow = nf.payload
         if len(the_flow) >= 5:
             nf.payload = (the_flow[:4] + new_type.to_bytes(1, 'big') +
                           the_flow[5:])
-    if nf.version != 9:
-        nf.unix_nano_seconds = int((now % 1) * 1000000)
     if new_version > 0:
         nf.version = new_version
 
@@ -787,13 +982,21 @@ def _build_netflow_replay_frame(bytes pkt,
                                 decode_context=None):
     """Build one replay carrier without opening a raw socket."""
     cdef int family = _address_family(dest_ip)
+    cdef bytes frame
+    _require_simple_context(decode_context, '_build_netflow_replay_frame()')
     if decode_context is None:
         decode_context = NetflowDecodeContext(force_simple=True)
     if src_ip and _address_family(src_ip) != family:
         raise ValueError("src_ip and dest_ip must use the same address family")
-    return _build_netflow_replay_frame_for_family(
+    frame = _build_netflow_replay_frame_for_family(
         pkt, family, dest_ip, dest_mac, dest_port, src_ip, src_mac,
         pcap_dst_port, now, new_version, new_type, decode_context)
+    if frame is None:
+        # The replay loops count and skip these; a caller asking for one
+        # frame has nothing to be handed back, so say why.
+        raise ValueError("packet carries no NetFlow payload on UDP port "
+                         "{0}".format(pcap_dst_port))
+    return frame
 
 cpdef int netflow_replay_raw_sock(str device,
                                   str pcap_file,
@@ -827,7 +1030,13 @@ cpdef int netflow_replay_raw_sock(str device,
            at the speed defined by speedup. 1 means blast as fast as possible.
            Overrides speedup if set.
     :param speedup: divide the inter-packet gap by this number.
-    :return: std unix 0 or 1 for all is well and something went wrong.
+    :param decode_context: optional NetflowDecodeContext. It must have
+           force_simple set: replay rewrites the NetFlow header in place and
+           re-sends the original bytes, which is what NetflowSimple is for.
+    :return: std unix 0 or 1 for all is well and something went wrong. 1 is
+           also returned when nothing matched pcap_dst_port, when a send
+           failed, or when a matched packet carried no NetFlow and was
+           skipped; each case is described on stderr.
     """
 
     cdef:
@@ -838,8 +1047,9 @@ cpdef int netflow_replay_raw_sock(str device,
         double now, ts, offset, add
         pcap_pkthdr_t hdr
         bytes pkt, frame
-        uint32_t sent, failed
+        uint32_t sent, failed, skipped
 
+    _require_simple_context(decode_context, 'netflow_replay_raw_sock()')
     if decode_context is None:
         decode_context = NetflowDecodeContext(force_simple=True)
     family = _address_family(dest_ip)
@@ -854,7 +1064,7 @@ cpdef int netflow_replay_raw_sock(str device,
 
     first = 1
     offset = 0
-    sent = failed = 0
+    sent = failed = skipped = 0
     # There used to be a copy of this body ahead of the loop, to establish
     # offset from the first packet. It had drifted: it applied neither
     # src_mac nor src_ip - the two things --spoofing exists for - nor
@@ -872,9 +1082,23 @@ cpdef int netflow_replay_raw_sock(str device,
             add = (ts + offset) - now
             time.sleep(add)
             now += add
-        frame = _build_netflow_replay_frame_for_family(
-            pkt, family, dest_ip, dest_mac, dest_port, src_ip, src_mac,
-            pcap_dst_port, now, new_version, new_type, decode_context)
+        # 'udp dst port N' matches anything sent to that port, NetFlow or
+        # not, and a datagram too short to hold a NetFlow header fails the
+        # decode outright. Either way it is one packet to account for, not a
+        # reason to abandon the rest of the capture.
+        try:
+            frame = _build_netflow_replay_frame_for_family(
+                pkt, family, dest_ip, dest_mac, dest_port, src_ip, src_mac,
+                pcap_dst_port, now, new_version, new_type, decode_context)
+        except (ValueError, AttributeError) as e:
+            frame = None
+            if not skipped:
+                sys.stderr.write("netflow_replay_raw_sock: skipping a packet "
+                                 "that did not decode as NetFlow: {0}\n"
+                                 "".format(e))
+        if frame is None:
+            skipped += 1
+            continue
         try:
             sender.sendpacket(frame)
             sent += 1
@@ -892,7 +1116,14 @@ cpdef int netflow_replay_raw_sock(str device,
         return 1
     if failed:
         sys.stderr.write("netflow_replay_raw_sock: {0} of {1} packets failed "
-                         "to send\n".format(failed, sent + failed))
+                         "to send\n".format(failed,
+                                            sent + failed + skipped))
+        return 1
+    if skipped:
+        sys.stderr.write("netflow_replay_raw_sock: {0} of {1} packets matched "
+                         "'udp dst port {2}' but carried no NetFlow and were "
+                         "skipped\n".format(skipped, sent + skipped,
+                                            pcap_dst_port))
         return 1
     return 0
 
@@ -919,7 +1150,12 @@ cpdef int netflow_replay_system_sock(str pcap_file,
     :param blast_mode: bool value. 0 == play at the same pace as in the pcap or
            at the speed defined by speedup. 1 means blast as fast as possible.
            Overrides speedup if set.
-    :return: std unix 0 or 1 for all is well and something went wrong.
+    :param decode_context: optional NetflowDecodeContext. It must have
+           force_simple set: see netflow_replay_raw_sock.
+    :return: std unix 0 or 1 for all is well and something went wrong. 1 is
+           also returned when nothing matched pcap_dst_port, when a send
+           failed, or when a matched packet carried no NetFlow and was
+           skipped; each case is described on stderr.
     """
 
     cdef:
@@ -933,8 +1169,9 @@ cpdef int netflow_replay_system_sock(str pcap_file,
         dict l7_ports
         Ethernet eth
         object nf
-        uint32_t sent, failed
+        uint32_t sent, failed, skipped
 
+    _require_simple_context(decode_context, 'netflow_replay_system_sock()')
     if decode_context is None:
         decode_context = NetflowDecodeContext(force_simple=True)
     family = _address_family(dest_ip)
@@ -948,7 +1185,7 @@ cpdef int netflow_replay_system_sock(str pcap_file,
 
     first = 1
     offset = 0
-    sent = failed = 0
+    sent = failed = skipped = 0
     # As in netflow_replay_raw_sock: the pre-loop send this replaces had
     # drifted from the loop body and applied neither new_type nor
     # new_version, so the first flow of every replay carried the capture's
@@ -962,18 +1199,31 @@ cpdef int netflow_replay_system_sock(str pcap_file,
             add = (ts + offset) - now
             time.sleep(add)
             now += add
-        eth = Ethernet(pkt, l7_ports=l7_ports,
-                       decode_context=decode_context)
-        nf = eth.get_layer_by_type(PQ_NETFLOW_SIMPLE)
-        nf.unix_secs = int(now)
-        if nf.version != 9:
-            nf.unix_nano_seconds = int((now % 1) * 1000000)
-        if new_type > 0 and nf.version in (5, 6, 7, 8):
-            the_flow = nf.payload
-            if len(the_flow) >= 5:
-                nf.payload = the_flow[:4] + type_byte + the_flow[5:]
-        if new_version > 0:
-            nf.version = new_version
+        # As in netflow_replay_raw_sock: the BPF filter constrains only the
+        # destination port, so account for a packet that is not NetFlow
+        # rather than letting it end the replay.
+        nf = None
+        try:
+            eth = Ethernet(pkt, l7_ports=l7_ports,
+                           decode_context=decode_context)
+            nf = _replay_netflow_layer(eth)
+            if nf is not None:
+                _retime_netflow_simple(nf, now)
+                if new_type > 0 and nf.version in (5, 6, 7, 8):
+                    the_flow = nf.payload
+                    if len(the_flow) >= 5:
+                        nf.payload = the_flow[:4] + type_byte + the_flow[5:]
+                if new_version > 0:
+                    nf.version = new_version
+        except (ValueError, AttributeError) as e:
+            nf = None
+            if not skipped:
+                sys.stderr.write("netflow_replay_system_sock: skipping a "
+                                 "packet that did not decode as NetFlow: "
+                                 "{0}\n".format(e))
+        if nf is None:
+            skipped += 1
+            continue
         try:
             sender.sendto(nf.pkt2net({}), (dest_ip, dest_port))
             sent += 1
@@ -989,6 +1239,13 @@ cpdef int netflow_replay_system_sock(str pcap_file,
         return 1
     if failed:
         sys.stderr.write("netflow_replay_system_sock: {0} of {1} packets "
-                         "failed to send\n".format(failed, sent + failed))
+                         "failed to send\n".format(failed,
+                                                   sent + failed + skipped))
+        return 1
+    if skipped:
+        sys.stderr.write("netflow_replay_system_sock: {0} of {1} packets "
+                         "matched 'udp dst port {2}' but carried no NetFlow "
+                         "and were skipped\n".format(skipped, sent + skipped,
+                                                     pcap_dst_port))
         return 1
     return 0

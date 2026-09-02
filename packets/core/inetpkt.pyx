@@ -45,6 +45,18 @@ ETH_TYPE_8021Q = 0x8100
 ETH_TYPE_IPV6 = 0x86dd
 ETH_TYPE_MPLS_UCAST = 0x8847
 ETH_TYPE_MPLS_MCAST = 0x8848
+# RFC 3032 puts no ceiling on the MPLS label stack, so the parser has to. A
+# label stack is a chain of layer objects, and every layer in it is also a
+# frame in the parse, serialize and teardown walks, so an attacker supplied
+# stack would otherwise trade 4 bytes of input for unbounded native stack.
+# Deployed stacks are a handful of labels deep; past this the remaining bytes
+# are kept as an opaque payload so the packet still round trips byte for byte.
+MPLS_MAX_STACK_DEPTH = 64
+# Smallest legal TCP data offset, in 32 bit words: a header with no options.
+TCP_MIN_DATA_OFFSET = 5
+# An ICMP error quotes only the first 8 bytes of the TCP header that caused
+# it, so that exact length is a valid partial header rather than truncation.
+TCP_QUOTE_LEN = 8
 ICMP_TYPE_ECHO_REPLY = 0
 ICMP_TYPE_DU = 3
 ICMP_TYPE_SRC_QUENCH = 4
@@ -200,6 +212,9 @@ cdef class IP_CONST:
         self.ETH_TYPE_IPV6 = ETH_TYPE_IPV6
         self.ETH_TYPE_MPLS_UCAST = ETH_TYPE_MPLS_UCAST
         self.ETH_TYPE_MPLS_MCAST = ETH_TYPE_MPLS_MCAST
+        self.MPLS_MAX_STACK_DEPTH = MPLS_MAX_STACK_DEPTH
+        self.TCP_MIN_DATA_OFFSET = TCP_MIN_DATA_OFFSET
+        self.TCP_QUOTE_LEN = TCP_QUOTE_LEN
         self.ICMP_TYPE_ECHO_REPLY = ICMP_TYPE_ECHO_REPLY
         self.ICMP_TYPE_DU = ICMP_TYPE_DU
         self.ICMP_TYPE_SRC_QUENCH = ICMP_TYPE_SRC_QUENCH
@@ -760,6 +775,28 @@ cdef class PKT:
                 raise TypeError('l7_ports must be a dict')
             self._l7_ports = value
 
+    property trailer:
+        """Bytes that followed this layer's own declared length.
+
+        IP, IP6 and UDP all carry a length field, and the frame handed to
+        them is often longer than that field says: every Ethernet NIC pads
+        short frames out to 60 bytes, and captures can carry a trailer. Those
+        extra bytes are not payload, so parsing stops at the declared length
+        and leaves them here. They are written back out after the payload, so
+        a padded frame still re-serializes to the bytes it was parsed from,
+        and they are excluded from the length and checksum fields recomputed
+        by ``pkt2net({'update': 1, 'csum': 1})``.
+
+        Empty for a layer with no length field, for a layer whose length
+        field accounted for every byte, and for any packet built from
+        keyword arguments.
+        """
+        def __get__(self):
+            return self._trailer if self._trailer is not None else b''
+
+        def __set__(self, bytes val):
+            self._trailer = val if val else None
+
     @classmethod
     def query_info(cls):
         """ Used by pcap_query to determine what query fields this packet type
@@ -910,16 +947,23 @@ cdef class PKT:
                 is present. Otherwise an empty array.
         """
         cdef object arg0
+        # An array the caller handed in is copied, not adopted. array('B')
+        # is mutable and the caller keeps its reference, so returning it as
+        # is left the parse exposed to whatever they did to it afterwards -
+        # any slice a constructor kept was a live view of their buffer. The
+        # owner/offset constructors already copy through tobytes(), so this
+        # is the same isolation guarantee for the classes still parsing the
+        # old way, at the cost of one copy they were about to make anyway.
         if len(args) == 1:
             arg0 = args[0]
             if isinstance(arg0, array):
-                return 1, arg0
+                return 1, array('B', arg0)
             elif isinstance(arg0, bytes):
                 return 1, array('B', arg0)
         if 'data' in kwargs:
             arg0 = kwargs['data']
             if isinstance(arg0, array):
-                return 1, arg0
+                return 1, array('B', arg0)
             elif isinstance(arg0, bytes):
                 return 1, array('B', arg0)
         return 0, _EMPTY_BUF
@@ -1439,6 +1483,14 @@ cdef class NetflowSimple(PKT):
         Used by pcap_query to automatically decode layer 7 protocols.
         The default Layer 4 ports for netflow are 2005 and 2055.
 
+        NOTE: 2055 is claimed by packets.protos.netflow.Netflow as well, so
+        a caller building one l7_ports mapping out of both classes gets
+        whichever it merged last on that port, silently. The two are not
+        interchangeable: NetflowSimple keeps the datagram opaque behind its
+        header, which is what replay and pass-through want, while Netflow
+        decodes flowsets and records. Decide per port which one you mean,
+        for instance {2005: NetflowSimple, 2055: Netflow}.
+
         Returns:
             :list: layer 4 ports for NetflowSimple.
         """
@@ -1734,6 +1786,14 @@ cdef class UDP(PKT):
             ph[39] = _ipv6_pheader.nh
             w_set_u16(w, start + 6, 0)
             self.checksum = w_cksum(w, start, cksum_acc(ph, 40, 0))
+            # RFC 768: a computed UDP checksum of zero goes on the wire as
+            # 0xffff, because zero is the encoding for 'no checksum sent'.
+            # Over IPv6 the checksum is not optional at all (RFC 8200 s8.1),
+            # so zero there is simply an invalid datagram. Storing whatever
+            # the fold produced meant a payload whose ones complement sum
+            # happened to come out zero silently turned the checksum off.
+            if self.checksum == 0:
+                self.checksum = 0xffff
             w_set_u16(w, start + 6, self.checksum)
         elif _csum and isinstance(_ipv4_pheader, Ip4Ph):
             ph_addr(ph, _ipv4_pheader.src, 4)
@@ -1744,7 +1804,17 @@ cdef class UDP(PKT):
             ph[11] = <unsigned char>(self.ulen & 0xff)
             w_set_u16(w, start + 6, 0)
             self.checksum = w_cksum(w, start, cksum_acc(ph, 12, 0))
+            # See the IPv6 branch above: RFC 768 reserves zero for 'no
+            # checksum', so a computed zero is transmitted as 0xffff.
+            if self.checksum == 0:
+                self.checksum = 0xffff
             w_set_u16(w, start + 6, self.checksum)
+
+        # Frame bytes that sat behind ulen when this packet was parsed. Both
+        # checksum branches above run w_cksum over start..w.n, so these have
+        # to go out after them as well as after the length patch.
+        if self._trailer is not None:
+            w_bytes(w, self._trailer)
         return 0
 
     cdef app_layer(self, array buf):
@@ -2494,9 +2564,28 @@ cdef class ICMP(PKT):
 
 @cython.final
 cdef class IGMPGroupRecord(PKT):
+    """One Group Record from an IGMPv3 membership report (RFC 3376 4.2.4).
+
+    The IPv4 counterpart of MLDv2AddressRecord. Both count their auxiliary
+    data in 32 bit words, per RFC 3376 4.2.6 and RFC 3810 5.2.10.
+    """
 
     def __init__(self, *args, **kwargs):
+        """Initialize an IGMPGroupRecord object.
 
+        Args:
+            :args (list): Optional one element list of network order bytes.
+            :data (bytes): Optional network order bytes of one record.
+            :type (unsigned char): Record type. 1-6 per RFC 3376 4.2.12.
+            :aux_data_len (unsigned char): Auxiliary data length in 32 bit
+                words, as RFC 3376 4.2.6 defines it. This is a word count,
+                not a byte count: 4 bytes of aux_data means 1 here.
+            :num_src (uint16_t): Number of source addresses. Derived from
+                source_addresses when that is given.
+            :group_address (str): Dot notation IPv4 multicast address.
+            :source_addresses (list): Dot notation IPv4 source addresses.
+            :aux_data (bytes): Auxiliary data.
+        """
         self._base_l7(kwargs)
         self.pkt_name = 'IGMPGroupRecord'
         self.pq_type, self.query_fields = _QI_IGMPGroupRecord
@@ -2504,7 +2593,7 @@ cdef class IGMPGroupRecord(PKT):
 
         cdef:
             unsigned char use_buffer
-            uint16_t start
+            Py_ssize_t start, aux_len
             array buf
             const unsigned char[:] mv
         use_buffer, buf = self.from_buffer(args, kwargs)
@@ -2516,16 +2605,14 @@ cdef class IGMPGroupRecord(PKT):
             self.aux_data_len = mv[1]
             self.num_src = rd_u16(mv, 2)
             self._group_address = rd_bytes(mv, 4, 8)
+            start = 8 + (4 * <Py_ssize_t>self.num_src)
             if self.num_src:
-                start = 8 + (4 * self.num_src)
                 need_bytes(mv, start, 'IGMPGroupRecord')
                 self._source_addresses = rd_bytes(mv, 8, start)
             if self.aux_data_len:
-                if not self.num_src:
-                    self.aux_data = rd_bytes(mv, 8, 8+self.aux_data_len)
-                else:
-                    self.aux_data = \
-                        rd_bytes(mv, start, start+self.aux_data_len)
+                aux_len = 4 * <Py_ssize_t>self.aux_data_len
+                need_bytes(mv, start + aux_len, 'IGMPGroupRecord')
+                self.aux_data = rd_bytes(mv, start, start + aux_len)
         else:
             self.type = kwargs.get('type', 0)
             self.aux_data_len = kwargs.get('aux_data_len', 0)
@@ -2535,8 +2622,15 @@ cdef class IGMPGroupRecord(PKT):
             self.aux_data = kwargs.get('aux_data', b'')
 
     property byte_len:
+        """Size of this record on the wire.
+
+        aux_data_len is a 32 bit word count, so it is multiplied by 4 here.
+        IGMP walks its record list by adding this to the running offset, so
+        reading the field as a byte count did not merely mis-size one
+        record: it desynchronized every record behind it.
+        """
         def __get__(self):
-            return 8 + (self.num_src * 4) + self.aux_data_len
+            return 8 + (self.num_src * 4) + (self.aux_data_len * 4)
 
     property group_address:
         def __get__(self):
@@ -3303,7 +3397,7 @@ cdef class IP(PKT):
         """
         cdef:
             bint _csum, _update, _icmp
-            Py_ssize_t start, hdr_end
+            Py_ssize_t start, hdr_end, hdr_bytes
 
         _icmp = kwargs.get('for_icmp', 0)
         if _icmp:
@@ -3315,6 +3409,18 @@ cdef class IP(PKT):
 
         # support a user passing in a pheader of their own for negative testing
         kwargs['ipv4_pheader'] = kwargs.get('ipv4_pheader', self.ipv4_pheader)
+
+        if _update:
+            # options is what decides how long the header written below
+            # actually is, so iphl is derived from it rather than trusted.
+            # A caller who set options without touching iphl used to emit a
+            # header whose own declared length pointed into the middle of
+            # it, and a receiver would start reading layer 4 from there.
+            # Serialize without 'update' to put a deliberately wrong iphl on
+            # the wire, exactly as for total_len and the checksum.
+            hdr_bytes = IPV4_MIN_HDR_LEN * 4 + len(self.options)
+            if hdr_bytes <= 60 and hdr_bytes % 4 == 0:
+                self.iphl = <unsigned char>(hdr_bytes >> 2)
 
         start = w.n
         w_u8(w, self._version_iphl)
@@ -3339,7 +3445,11 @@ cdef class IP(PKT):
                 (<PKT>self.payload)._write(w, kwargs)
 
         if _update:
-            self.total_len = <uint16_t>(self.iphl * 4 + (w.n - hdr_end))
+            # The bytes actually written, not iphl * 4: those two disagree
+            # whenever options is not exactly (iphl - 5) * 4 bytes long, and
+            # the old form described a header that was never emitted, so
+            # total_len covered the wrong span of the datagram.
+            self.total_len = <uint16_t>(w.n - start)
             w_set_u16(w, start + 2, self.total_len)
 
         if _csum:
@@ -3347,6 +3457,11 @@ cdef class IP(PKT):
             self.checksum = cksum_fin(
                 cksum_acc(w.b + start, hdr_end - start, 0))
             w_set_u16(w, start + 10, self.checksum)
+
+        # Frame bytes that sat behind total_len when this packet was parsed,
+        # written last so they stay outside the length patched above.
+        if self._trailer is not None:
+            w_bytes(w, self._trailer)
         return 0
 
     property version:
@@ -3761,6 +3876,11 @@ cdef class IP6(PKT):
             self.payload_len = <uint16_t>(len(self._ext_hdrs) +
                                           (w.n - hdr_end))
             w_set_u16(w, start + 4, self.payload_len)
+
+        # Frame bytes that sat behind payload_len when this packet was
+        # parsed, written last so they stay outside the length patched above.
+        if self._trailer is not None:
+            w_bytes(w, self._trailer)
         return 0
 
     property ext_headers:
@@ -4096,9 +4216,8 @@ cdef class ICMP6Opt(PKT):
 cdef class MLDv2AddressRecord(PKT):
     """One Multicast Address Record from an MLDv2 report (RFC 3810 5.2.12).
 
-    The IPv6 counterpart of IGMPGroupRecord. Note that RFC 3810 counts the
-    auxiliary data in 32 bit words, which is what this class does; the older
-    IGMPGroupRecord treats the same field as a byte count.
+    The IPv6 counterpart of IGMPGroupRecord. Both count their auxiliary data
+    in 32 bit words, per RFC 3810 5.2.10 and RFC 3376 4.2.6.
     """
 
     def __init__(self, *args, **kwargs):
@@ -4903,6 +5022,11 @@ cdef class MPLS(PKT):
     """ Very limited implementation of MPLS (RFC 3031). Supports IPv4, IPv6
     and Ethernet payloads, and only detects the difference by looking at the
     first nibble of the payload bytes.
+
+    RFC 3031 does not bound the label stack, so parsing does. At most
+    IP_CONST.MPLS_MAX_STACK_DEPTH labels become MPLS layers; a longer stack
+    keeps the labels past that point as an opaque NullPkt payload, which
+    still serializes back to the bytes that were parsed.
     """
 
     def __init__(self, *args, **kwargs):
@@ -5133,6 +5257,52 @@ cdef inline void _need_range(Py_ssize_t start, Py_ssize_t end,
                          'got %d' % (name, least, available))
 
 
+cdef inline Py_ssize_t _declared_end(Py_ssize_t start, Py_ssize_t end,
+                                     Py_ssize_t declared,
+                                     Py_ssize_t header_len,
+                                     str name) except -1:
+    """Return where a layer ends according to its own length field.
+
+    A layer is handed the range its parent had left over, which is not the
+    same thing as the length the layer's own header declares. Every Ethernet
+    NIC pads a frame out to 60 bytes and a capture can carry a trailer, so
+    for short packets the leftover range routinely runs past the end of the
+    real IP datagram or UDP datagram. Parsing all of it treats padding as
+    payload: an inflated ``udp.payload``, a layer 7 parser handed bytes that
+    were never sent, and lengths that no longer agree with the wire.
+
+    Only shrinking is done here. A capture truncated by snaplen has a length
+    field larger than the bytes present, and reading such a file has to stay
+    possible, so a declared length past ``end`` is ignored rather than
+    treated as an error -- the individual header reads below still bound
+    themselves with _need_range.
+
+    A declared length of zero means "not stated": that is what every packet
+    built from keyword arguments and serialized without ``update`` carries,
+    and for IPv6 it is also how a jumbogram is signalled.
+
+    :param start: first byte of this layer.
+    :param end: one past the last byte the parent left for this layer.
+    :param declared: the value of this layer's length field, counted from
+        ``start``.
+    :param header_len: size of the header the length field must at minimum
+        account for.
+    :param name: layer name, used in the error message.
+    :return: the end offset to parse to.
+    """
+    cdef Py_ssize_t declared_end
+    if declared <= 0:
+        return end
+    if declared < header_len:
+        raise ValueError('%s: length field says %d bytes, less than the %d '
+                         'byte header it has to cover'
+                         % (name, declared, header_len))
+    declared_end = start + declared
+    if declared_end < end:
+        return declared_end
+    return end
+
+
 cdef bytes _owned_buffer(tuple args, dict kwargs):
     """Return the public parse input as one immutable owner, or None."""
     cdef object value
@@ -5274,7 +5444,7 @@ cdef int _decode_igmp_group_record(IGMPGroupRecord pkt, bytes owner,
                                    Py_ssize_t end) except -1:
     cdef:
         const unsigned char[:] mv = owner
-        Py_ssize_t src_end
+        Py_ssize_t src_end, aux_len
     pkt._source_addresses = pkt._group_address = pkt.aux_data = b''
     _need_range(start, end, 8, 'IGMPGroupRecord')
     pkt.type = mv[start]
@@ -5286,8 +5456,16 @@ cdef int _decode_igmp_group_record(IGMPGroupRecord pkt, bytes owner,
         _need_range(start, end, src_end - start, 'IGMPGroupRecord')
         pkt._source_addresses = rd_bytes(mv, start + 8, src_end)
     if pkt.aux_data_len:
-        pkt.aux_data = rd_bytes(mv, src_end,
-                                src_end + pkt.aux_data_len)
+        # RFC 3376 4.2.6 counts the auxiliary data in 32 bit words, the same
+        # as MLDv2 below. Reading it as bytes both truncated aux_data and,
+        # because IGMP advances by byte_len, moved the next record's start.
+        aux_len = 4 * <Py_ssize_t>pkt.aux_data_len
+        # rd_bytes clamps to the owner buffer, not to this record's end, so
+        # without a range check a record claiming aux data it does not have
+        # silently read the bytes of whatever followed it in the frame.
+        _need_range(start, end, src_end + aux_len - start,
+                    'IGMPGroupRecord')
+        pkt.aux_data = rd_bytes(mv, src_end, src_end + aux_len)
     return 0
 
 
@@ -5510,7 +5688,7 @@ cdef inline int _decode_eth_ip_udp_fast(Ethernet pkt, bytes owner,
                                         Py_ssize_t end) except -1:
     cdef:
         Py_ssize_t ip_start = 14
-        Py_ssize_t udp_start, raw_start
+        Py_ssize_t udp_start, raw_start, datagram_end
         unsigned char iphl, hl_bytes
         IP ip
         UDP udp
@@ -5549,7 +5727,15 @@ cdef inline int _decode_eth_ip_udp_fast(Ethernet pkt, bytes owner,
     _need_range(ip_start, end, hl_bytes, 'IP')
     udp_start = ip_start + hl_bytes
     if iphl > 5:
-        ip.options = rd_bytes(mv, ip_start + 20, min(udp_start, end))
+        ip.options = rd_bytes(mv, ip_start + 20, udp_start)
+    # The same length clamps the general _decode_ip / _decode_udp path
+    # applies. Ethernet pads every frame under 60 bytes, so without these a
+    # short datagram taking this path would report padding as its payload,
+    # and which path a frame took would change what it decoded to.
+    datagram_end = _declared_end(ip_start, end, ip.total_len, hl_bytes, 'IP')
+    if datagram_end < end:
+        ip._trailer = rd_bytes(mv, datagram_end, end)
+        end = datagram_end
     if udp_start >= end:
         ip.payload = PKT()
         pkt.payload = ip
@@ -5564,6 +5750,10 @@ cdef inline int _decode_eth_ip_udp_fast(Ethernet pkt, bytes owner,
     udp.dport = rd_u16(mv, udp_start + 2)
     udp.ulen = rd_u16(mv, udp_start + 4)
     udp.checksum = rd_u16(mv, udp_start + 6)
+    datagram_end = _declared_end(udp_start, end, udp.ulen, 8, 'UDP')
+    if datagram_end < end:
+        udp._trailer = rd_bytes(mv, datagram_end, end)
+        end = datagram_end
 
     raw_start = udp_start + 8
     raw = NullPkt.__new__(NullPkt)
@@ -5633,12 +5823,19 @@ cdef inline PKT _l7_range(bytes owner, const unsigned char[:] mv,
 cdef inline int _decode_udp(UDP pkt, bytes owner,
                             const unsigned char[:] mv, Py_ssize_t start,
                             Py_ssize_t end, dict l7_ports) except -1:
+    cdef Py_ssize_t body_end
     _need_range(start, end, 8, 'UDP')
     pkt.sport = rd_u16(mv, start)
     pkt.dport = rd_u16(mv, start + 2)
     pkt.ulen = rd_u16(mv, start + 4)
     pkt.checksum = rd_u16(mv, start + 6)
-    pkt.payload = _l7_range(owner, mv, start + 8, end, l7_ports,
+    # ulen counts the header and the data behind it, so it is what says where
+    # the datagram stops. Anything past it belongs to the frame, not to this
+    # layer, and must not reach the layer 7 parser.
+    body_end = _declared_end(start, end, pkt.ulen, 8, 'UDP')
+    if body_end < end:
+        pkt._trailer = rd_bytes(mv, body_end, end)
+    pkt.payload = _l7_range(owner, mv, start + 8, body_end, l7_ports,
                             pkt.sport, pkt.dport, pkt._decode_context,
                             pkt._decode_exporter, 'udp')
     return 0
@@ -5662,27 +5859,42 @@ cdef inline int _decode_tcp(TCP pkt, bytes owner,
         pkt.window = rd_u16(mv, start + 14)
         pkt.checksum = rd_u16(mv, start + 16)
         pkt.urg_ptr = rd_u16(mv, start + 18)
+        if pkt.data_offset < TCP_MIN_DATA_OFFSET:
+            # data_offset is where the header ends and the payload begins.
+            # Below 5 it points back inside the header, so the header bytes
+            # themselves used to be handed to the layer 7 parser.
+            raise ValueError('TCP: data offset field is %d 32 bit words, '
+                             'less than the %d word minimum header'
+                             % (pkt.data_offset, TCP_MIN_DATA_OFFSET))
         header_end = start + (pkt.data_offset * 4)
+        if header_end > end:
+            # The options the header claims are not in the capture. Clamping
+            # silently produced short options and a payload starting inside
+            # the header.
+            raise ValueError('TCP: truncated packet, data offset field needs '
+                             '%d header bytes, got %d'
+                             % (pkt.data_offset * 4, length))
         if pkt.data_offset > 5:
-            pkt._options = rd_bytes(mv, start + 20,
-                                    min(header_end, end))
+            pkt._options = rd_bytes(mv, start + 20, header_end)
         else:
             pkt._options = b''
-        if header_end > end:
-            header_end = end
         pkt.payload = _l7_range(owner, mv, header_end, end, l7_ports,
                                 pkt.sport, pkt.dport, pkt._decode_context,
                                 pkt._decode_exporter, 'tcp')
         return 0
 
-    if length == 8:
-        pkt.sport = rd_u16(mv, start)
-        pkt.dport = rd_u16(mv, start + 2)
-        pkt.sequence = rd_u32(mv, start + 4)
-    else:
-        pkt.sport = kwargs.get('sport', 0)
-        pkt.dport = kwargs.get('dport', 0)
-        pkt.sequence = kwargs.get('sequence', 0)
+    if length != TCP_QUOTE_LEN:
+        # Anything shorter than a full header that is not the 8 byte quote an
+        # ICMP error carries is truncated. This used to fall through to the
+        # keyword defaults below, and since every caller that parses bytes
+        # passes no keywords the result was a silent, fully zeroed TCP layer
+        # with a NullPkt payload rather than an error.
+        raise ValueError('TCP: truncated packet, need at least 20 bytes for '
+                         'a header or exactly %d for an ICMP quote, got %d'
+                         % (TCP_QUOTE_LEN, length))
+    pkt.sport = rd_u16(mv, start)
+    pkt.dport = rd_u16(mv, start + 2)
+    pkt.sequence = rd_u32(mv, start + 4)
     pkt.acknowledgment = kwargs.get('acknowledgment', 0)
     pkt.data_offset = kwargs.get('data_offset', 5)
     pkt.flag_ns = kwargs.get('flag_ns', 0)
@@ -5707,7 +5919,7 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
                            Py_ssize_t end, dict l7_ports) except -1:
     cdef:
         unsigned char iphl, hl_bytes
-        Py_ssize_t payload_start
+        Py_ssize_t payload_start, datagram_end
         UDP udp
         TCP tcp
         ICMP icmp
@@ -5717,6 +5929,14 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
     pkt.options = b''
     pkt._version_iphl = mv[start]
     iphl = pkt.iphl
+    if iphl < IPV4_MIN_HDR_LEN:
+        # ihl is where the layer 4 header starts. Below 5 it points back
+        # inside the IPv4 header itself, which used to be decoded as the
+        # payload -- so a single crafted nibble decided what the rest of the
+        # packet was parsed as.
+        raise ValueError('IP: header length field is %d 32 bit words, less '
+                         'than the %d word minimum header'
+                         % (iphl, IPV4_MIN_HDR_LEN))
     pkt.tos = mv[start + 1]
     pkt.total_len = rd_u16(mv, start + 2)
     pkt.ident = rd_u16(mv, start + 4)
@@ -5727,9 +5947,17 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
     pkt.src_nochk = rd_bytes(mv, start + 12, start + 16)
     pkt.dst_nochk = rd_bytes(mv, start + 16, start + 20)
     hl_bytes = iphl * 4
+    _need_range(start, end, hl_bytes, 'IP')
     payload_start = start + hl_bytes
     if iphl > 5:
-        pkt.options = rd_bytes(mv, start + 20, min(payload_start, end))
+        pkt.options = rd_bytes(mv, start + 20, payload_start)
+    # total_len covers the header and the data behind it, so it is what says
+    # where the datagram stops. The frame it arrived in is usually longer:
+    # Ethernet pads anything under 60 bytes, and that padding is not payload.
+    datagram_end = _declared_end(start, end, pkt.total_len, hl_bytes, 'IP')
+    if datagram_end < end:
+        pkt._trailer = rd_bytes(mv, datagram_end, end)
+        end = datagram_end
     if payload_start >= end:
         pkt.payload = PKT()
         return 0
@@ -5771,8 +5999,12 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         igmp._s_qrv = igmp.qqic = 0
         igmp.group_records = list()
         igmp._source_addresses = b''
-        _decode_igmp(igmp, owner, payload_start, end,
-                     pkt.total_len - hl_bytes)
+        # The bytes actually available, which the clamp above has already made
+        # equal to total_len - hl_bytes whenever total_len was stated. Deriving
+        # it from the range rather than subtracting keeps a total_len smaller
+        # than the header from reaching a uint16 conversion, and gives the
+        # version guard a real length when total_len is 0.
+        _decode_igmp(igmp, owner, payload_start, end, end - payload_start)
         pkt.payload = igmp
     else:
         pkt.payload = _null_range(owner, payload_start, end, l7_ports)
@@ -5781,15 +6013,30 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
 
 cdef inline unsigned char _walk_ip6_ext_range(
         const unsigned char[:] mv, Py_ssize_t start, Py_ssize_t end,
-        unsigned char first_nh, Py_ssize_t *ext_len, bint *incomplete):
+        unsigned char first_nh, Py_ssize_t *ext_len, bint *incomplete,
+        bint *truncated):
+    """Walk the IPv6 extension header chain, reporting how it ended.
+
+    incomplete says the bytes after the chain are not an upper layer
+    header, which is true both for a non-first fragment and for a chain
+    that ran off the end of the capture. truncated distinguishes the second
+    case, because the caller has no other way to tell: the walk stops with
+    the next-header value of an extension header still in hand, and no
+    decode branch matches one of those, so a truncated chain and a protocol
+    this library does not know looked exactly alike.
+    """
     cdef:
         Py_ssize_t off = start
         unsigned char cur = first_nh
         unsigned char nxt, hlen
         Py_ssize_t size
     incomplete[0] = 0
+    truncated[0] = 0
     while _is_ip6_ext(cur):
         if off + 2 > end:
+            # Not even the two bytes naming the next header are present.
+            incomplete[0] = 1
+            truncated[0] = 1
             break
         nxt = mv[off]
         hlen = mv[off + 1]
@@ -5803,6 +6050,11 @@ cdef inline unsigned char _walk_ip6_ext_range(
         else:
             size = (<Py_ssize_t>hlen + 1) * 8
         if size <= 0 or off + size > end:
+            # The chain runs past the bytes we have, so the extension header
+            # after this one - and with it the real upper layer protocol -
+            # is unknowable.
+            incomplete[0] = 1
+            truncated[0] = 1
             break
         off += size
         cur = nxt
@@ -5815,8 +6067,9 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
                             Py_ssize_t end, dict l7_ports) except -1:
     cdef:
         Py_ssize_t ext_len = 0
-        Py_ssize_t payload_start
+        Py_ssize_t payload_start, datagram_end, declared
         bint incomplete = 0
+        bint truncated = 0
         UDP udp
         TCP tcp
         ICMP6 icmp6
@@ -5830,8 +6083,22 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
     pkt.hop_limit = mv[start + 7]
     pkt.src_nochk = rd_bytes(mv, start + 8, start + 24)
     pkt.dst_nochk = rd_bytes(mv, start + 24, start + 40)
+    # payload_len counts everything after the 40 byte header, so the datagram
+    # ends there. Clamped before the extension header walk so padding cannot
+    # be mistaken for another extension header either. A payload_len of 0 is
+    # a jumbogram, whose real length lives in a hop by hop option, so it is
+    # left to _declared_end to treat as unstated.
+    declared = 0
+    if pkt.payload_len:
+        declared = IPV6_HDR_LEN + <Py_ssize_t>pkt.payload_len
+    datagram_end = _declared_end(start, end, declared, IPV6_HDR_LEN, 'IP6')
+    if datagram_end < end:
+        pkt._trailer = rd_bytes(mv, datagram_end, end)
+        end = datagram_end
     pkt._upper_proto = _walk_ip6_ext_range(
-        mv, start + IPV6_HDR_LEN, end, pkt._nh, &ext_len, &incomplete)
+        mv, start + IPV6_HDR_LEN, end, pkt._nh, &ext_len, &incomplete,
+        &truncated)
+    pkt.ext_hdrs_truncated = truncated
     pkt.ipv6_pheader.nh = pkt._upper_proto
     if ext_len:
         pkt._ext_hdrs = rd_bytes(mv, start + IPV6_HDR_LEN,
@@ -5882,37 +6149,55 @@ cdef int _decode_mpls(MPLS pkt, bytes owner, const unsigned char[:] mv,
                       dict l7_ports) except -1:
     cdef:
         Py_ssize_t payload_start
+        Py_ssize_t depth = 0
+        MPLS label = pkt
         MPLS mpls
         IP ip
         IP6 ip6
         Ethernet eth
-    _need_range(start, end, 4, 'MPLS')
-    pkt._data = rd_u32(mv, start)
-    payload_start = start + 4
-    if payload_start >= end:
-        pkt.payload = NullPkt()
-        return 0
-    if not pkt.s:
+    # The label stack is walked iteratively, not by recursing into
+    # _decode_mpls: a crafted stack must not cost one native stack frame per
+    # label. Each pass either hands the stack on to the next label or breaks
+    # out to decode the bottom of stack payload below.
+    while True:
+        _need_range(start, end, 4, 'MPLS')
+        label._data = rd_u32(mv, start)
+        payload_start = start + 4
+        if payload_start >= end:
+            label.payload = NullPkt()
+            return 0
+        if label.s:
+            break
+        if depth >= MPLS_MAX_STACK_DEPTH:
+            # Past any real deployment. Keep the rest of the stack as opaque
+            # bytes rather than building an unbounded chain of layers: the
+            # packet still re-serializes byte for byte.
+            label.payload = _null_range(owner, payload_start, end, l7_ports)
+            return 0
         mpls = MPLS.__new__(MPLS)
         mpls._l7_ports = l7_ports
         mpls.pkt_name = 'MPLS'
         mpls.pq_type, mpls.query_fields = _QI_MPLS
-        _decode_mpls(mpls, owner, mv, payload_start, end, l7_ports)
-        pkt.payload = mpls
-    elif mv[payload_start] >> 4 == IPV4_VER:
+        label.payload = mpls
+        label = mpls
+        start = payload_start
+        depth += 1
+    # label is the bottom of stack label reached by the walk above, which is
+    # pkt itself for the common single label case.
+    if mv[payload_start] >> 4 == IPV4_VER:
         ip = IP.__new__(IP)
         ip._l7_ports = l7_ports
         ip.pkt_name = 'IP'
         ip.pq_type, ip.query_fields = _QI_IP
         _decode_ip(ip, owner, mv, payload_start, end, l7_ports)
-        pkt.payload = ip
+        label.payload = ip
     elif mv[payload_start] >> 4 == IPV6_VER:
         ip6 = IP6.__new__(IP6)
         ip6._l7_ports = l7_ports
         ip6.pkt_name = 'IP6'
         ip6.pq_type, ip6.query_fields = _QI_IP6
         _decode_ip6(ip6, owner, mv, payload_start, end, l7_ports)
-        pkt.payload = ip6
+        label.payload = ip6
     else:
         eth = Ethernet.__new__(Ethernet)
         eth._l7_ports = l7_ports
@@ -5921,7 +6206,7 @@ cdef int _decode_mpls(MPLS pkt, bytes owner, const unsigned char[:] mv,
         eth.tpid = 0
         eth._tci = 0
         _decode_ethernet(eth, owner, mv, payload_start, end, l7_ports)
-        pkt.payload = eth
+        label.payload = eth
     return 0
 
 
@@ -5973,12 +6258,15 @@ cdef inline int _decode_ethernet(Ethernet pkt, bytes owner,
         pkt.payload = arp
     elif pkt.type in (ETH_TYPE_MPLS_UCAST, ETH_TYPE_MPLS_MCAST):
         mpls = MPLS.__new__(MPLS)
-        # Preserve Ethernet's historical MPLS boundary: l7_ports was not
-        # forwarded by this branch, unlike direct MPLS construction.
-        mpls._l7_ports = None
+        # l7_ports is forwarded here as it is everywhere else. This branch
+        # used to drop it to preserve an Ethernet specific quirk, which left
+        # MPLS encapsulated TCP and UDP unable to reach any registered layer
+        # 7 class while the very same labels parsed through MPLS(...)
+        # directly could.
+        mpls._l7_ports = l7_ports
         mpls.pkt_name = 'MPLS'
         mpls.pq_type, mpls.query_fields = _QI_MPLS
-        _decode_mpls(mpls, owner, mv, payload_start, end, mpls._l7_ports)
+        _decode_mpls(mpls, owner, mv, payload_start, end, l7_ports)
         pkt.payload = mpls
     else:
         pkt.payload = _null_range(owner, payload_start, end, None)

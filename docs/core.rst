@@ -52,6 +52,34 @@ and that data as an ``array('B')``. A subclass may be given either ``bytes`` or
 an ``array('B')``; from_buffer normalizes both to the array. Packet instances
 do not retain the buffer after ``__init__`` returns.
 
+PKT also provides a read/write ``trailer`` attribute, holding the bytes that
+followed a layer's own declared length.
+
+A layer is handed whatever the layer above it had left over, which is not the
+same as the length the layer's own header declares. Every Ethernet NIC pads a
+frame out to a 60 byte minimum, and captures can carry a trailer, so for short
+packets the leftover bytes routinely run past the end of the real datagram.
+:py:class:`IP`, :py:class:`IP6` and :py:class:`UDP` therefore parse only as far
+as ``total_len``, ``payload_len`` and ``ulen`` say, and keep the remaining
+bytes in ``trailer`` rather than reporting them as payload.
+
+Those bytes are written back out after the payload, so a padded frame still
+serializes to exactly what was parsed, and they are excluded from the lengths
+and checksums recomputed by ``pkt2net({'update': 1, 'csum': 1})``.
+``trailer`` is empty for a layer with no length field, for a layer whose length
+field accounted for every byte, and for any packet built from keyword
+arguments.
+
+A declared length *longer* than the bytes present is not an error: a capture
+cut short by snaplen and the header quoted inside an ICMP error both look that
+way, and both stay readable. A declared length too short to cover the layer's
+own header raises ``ValueError``.
+
+NOTE: ``from_buffer()`` copies an ``array('B')`` a caller passes in rather than
+adopting it, so mutating that array afterwards cannot change an already parsed
+packet. The owner and offset constructors already snapshot their input; this
+is the same guarantee for the classes still parsing the older way.
+
 
 :py:class:`Ethernet` Class
 --------------------------
@@ -68,6 +96,11 @@ Ethernet PcapQuery supported fields:
    - eth.type: returns Ethernet.type
    - eth.src: returns Ethernet.src_mac
    - eth.dst: returns Ethernet.dst_mac
+
+NOTE: ``l7_ports`` is forwarded to every layer below, MPLS included. Until
+2.1.2 the MPLS branch dropped it, so MPLS encapsulated TCP and UDP arriving in
+a frame never reached a registered layer 7 class while the same labels parsed
+through :py:class:`MPLS` directly did.
 
 
 :py:class:`IP` Class
@@ -115,6 +148,21 @@ IP PcapQuery supported fields:
    - ip.dst: returns IP.dst
    - ip.checksum: returns IP.checksum
 
+NOTE: ``total_len`` bounds the parse. Bytes behind it - Ethernet padding, or a
+capture trailer - are kept in ``PKT.trailer`` rather than decoded as payload.
+See the :py:class:`PKT` section above.
+
+NOTE: ``iphl`` is where the layer 4 header begins, so a value below the 5 word
+minimum header raises ``ValueError`` rather than starting the layer 4 parse
+inside the IPv4 header. So does an ``iphl`` claiming option bytes the capture
+does not carry.
+
+NOTE: ``pkt2net({'update': 1})`` derives ``iphl`` from the length of
+``options`` and takes ``total_len`` from the bytes actually written, so the two
+always describe the header that went out. Serializing *without* ``update``
+emits the values as set, which is how a deliberately malformed header is
+produced.
+
 
 :py:class:`IP6` Class
 ---------------------
@@ -159,6 +207,18 @@ IP6 PcapQuery supported fields:
    - ipv6.hlim: returns IP6.hlim
    - ipv6.src: returns IP6.src
    - ipv6.dst: returns IP6.dst
+
+NOTE: ``payload_len`` bounds the parse, and is applied before the extension
+header chain is walked so trailing frame bytes cannot be mistaken for another
+extension header. Bytes behind it are kept in ``PKT.trailer``. A
+``payload_len`` of zero means jumbogram, whose real length lives in a hop by
+hop option, and is treated as unstated.
+
+NOTE: the readonly ``ext_hdrs_truncated`` attribute is True when the extension
+header chain ran past the bytes present. The real upper layer protocol is then
+unknowable and the remainder is kept as an opaque :py:class:`NullPkt`, which is
+also what an upper layer protocol this library does not decode produces - the
+attribute is what tells the two apart.
 
 
 :py:class:`ARP` Class
@@ -235,6 +295,17 @@ UDP PcapQuery supported fields:
    - udp.payload: returns UDP.payload as bytes
    - udp.payload.offset[x:y]: returns UDP.payload bytes x to y as bytes
 
+NOTE: ``ulen`` bounds the parse, so Ethernet padding behind a short datagram is
+kept in ``PKT.trailer`` instead of being reported as payload and handed to a
+registered layer 7 class. See the :py:class:`PKT` section above.
+
+NOTE: RFC 768 reserves a checksum of zero to mean 'no checksum sent', so when
+the computed checksum comes out zero ``0xffff`` is written instead. The two
+validate identically. Over IPv6 the checksum is not optional at all (RFC 8200
+section 8.1), so zero there would be an invalid datagram. A checksum of zero
+is still written when no checksum was requested.
+
+
 :py:class:`TCP` Class
 ---------------------
 Implements RFC 793 Transmission Control Protocol with some additions and
@@ -288,6 +359,14 @@ TCP PcapQuery supported fields:
    - tcp.urgent_pointer: returns TCP.urg_ptr
    - tcp.payload: returns TCP.payload as bytes
    - tcp.payload.offset[x:y: returns TCP.payload bytes x to y as bytes
+
+NOTE: parsing fewer than 20 bytes raises ``ValueError``, with one exception:
+exactly 8 bytes is the partial header an ICMP error quotes, and only sport,
+dport and sequence are read from it.
+
+NOTE: ``data_offset`` is where the payload begins, so a value below the 5 word
+minimum header, or one pointing past the captured bytes, raises ``ValueError``
+rather than being clamped.
 
 
 :py:class:`ICMP` Class
@@ -413,8 +492,8 @@ ICMP6Opt PcapQuery supported fields:
 A single Multicast Address Record from an MLDv2 Report, RFC 3810 section 5.2.
 This is the IPv6 counterpart of :py:class:`IGMPGroupRecord <IGMPGroupRecord>`.
 
-NOTE: per RFC 3810 this class counts Aux Data Len in 32 bit words. The older
-IGMPGroupRecord treats the same field as a byte count.
+NOTE: per RFC 3810 section 5.2.10 this class counts Aux Data Len in 32 bit
+words, the same as :py:class:`IGMPGroupRecord <IGMPGroupRecord>`.
 
 .. autoclass:: MLDv2AddressRecord
    :members: __init__ query_info get_field_val pkt2net
@@ -466,6 +545,16 @@ IGMP PcapQuery supported fields:
 ---------------------------------
 A single Group Record from an IGMPv3 Membership Report.
 
+NOTE: per RFC 3376 section 4.2.6 ``aux_data_len`` counts the auxiliary data in
+32 bit words, not bytes, the same as
+:py:class:`MLDv2AddressRecord <MLDv2AddressRecord>`. Four bytes of
+``aux_data`` means ``aux_data_len`` of 1. Before 2.1.2 this class read the
+field as a byte count, which truncated ``aux_data`` and, because IGMP walks
+its record list by adding ``byte_len`` to a running offset, started the
+following record inside the aux data of the one before it. A record claiming
+more auxiliary data than the datagram contains now raises ``ValueError``
+instead of returning the bytes that followed the datagram in the frame.
+
 .. autoclass:: IGMPGroupRecord
    :members: __init__ query_info get_field_val pkt2net
    :show-inheritance:
@@ -508,6 +597,11 @@ MPLS PcapQuery supported fields:
 
 NOTE: There should only ever be a single MPLS layer in a packet with the s bit
 set to 1. There can be a number with bottom of stack bit set to 0
+
+NOTE: RFC 3031 does not bound the label stack, so the parser does. At most
+``IP_CONST.MPLS_MAX_STACK_DEPTH`` labels become :py:class:`MPLS` layers; a
+longer stack keeps the remaining labels as an opaque :py:class:`NullPkt`
+payload, which still serializes back to the original bytes.
 
 
 

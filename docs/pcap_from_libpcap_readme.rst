@@ -168,9 +168,14 @@
             netmask: The netmask address for this device if derivable
             
         calls:
-            int set_snaplen(int snaplen) - set the snaplen on a running PCAPSocket
-            int set_promisc(int promisc) - set/unset promisc
-            int set_timeout(int timeout) - set timeout in ms.
+            int set_snaplen(int snaplen) - libpcap only accepts this before a
+                handle is activated, and PCAPSocket opens an activated one, so
+                as of 2.1.2 this raises ValueError. Pass snaplen to
+                PCAPSocket() instead.
+            int set_promisc(int promisc) - as set_snaplen. Pass promisc to
+                PCAPSocket().
+            int set_timeout(int timeout) - as set_snaplen. Pass to_ms to
+                PCAPSocket().
             int getnonblock() - find out if this socket is in blocking mode
             int setnonblock(int nonblock) - set/unset nonblocking
             int sendpacket(bytes pktdata) - send packet data via this socket

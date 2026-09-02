@@ -25,6 +25,17 @@ that times out without a packet is not the end of the capture, so both
 ``endtime``, by ``num_packets``, or by setting the ``stop_event`` passed to the
 constructor -- which is the only one of the three available to another thread.
 
+``num_packets`` is a maximum number of rows, and 0 means no limit. Before
+2.1.2 it returned one row more than asked for.
+
+``snaplen`` applies to ``devicename`` queries only, and is passed to
+:py:class:`PCAPSocket <packets.core.pcap.PCAPSocket>`, which resolves the
+default of 0 to libpcap's maximum. See the pcap API page.
+
+A ``filename`` that cannot be read raises ``ValueError`` naming that file.
+Before 2.1.2 the message formatted the device name, which is unset on that
+branch, so it read "Could not open None for reading".
+
 .. currentmodule:: packets.query.pcap_query
 
 :py:class:`PcapQuery` Class

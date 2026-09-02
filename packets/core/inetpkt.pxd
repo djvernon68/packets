@@ -216,6 +216,11 @@ cdef:
     uint16_t ETH_TYPE_IPV6
     uint16_t ETH_TYPE_MPLS_UCAST
     uint16_t ETH_TYPE_MPLS_MCAST
+    # MPLS
+    Py_ssize_t MPLS_MAX_STACK_DEPTH
+    # TCP
+    unsigned char TCP_MIN_DATA_OFFSET
+    Py_ssize_t TCP_QUOTE_LEN
     # ICMP
     unsigned char ICMP_TYPE_ECHO_REPLY
     unsigned char ICMP_TYPE_DU
@@ -368,6 +373,9 @@ cdef class IP_CONST:
         readonly uint16_t ETH_TYPE_IPV6
         readonly uint16_t ETH_TYPE_MPLS_UCAST
         readonly uint16_t ETH_TYPE_MPLS_MCAST
+        readonly Py_ssize_t MPLS_MAX_STACK_DEPTH
+        readonly unsigned char TCP_MIN_DATA_OFFSET
+        readonly Py_ssize_t TCP_QUOTE_LEN
         readonly unsigned char ICMP_TYPE_ECHO_REPLY
         readonly unsigned char ICMP_TYPE_DU
         readonly unsigned char ICMP_TYPE_SRC_QUENCH
@@ -457,6 +465,11 @@ cdef class PKT:
     cdef:
         dict _l7_ports
         object _decode_context, _decode_exporter
+        # Bytes that followed this layer's own declared length. A layer whose
+        # header carries a length field parses only that many bytes and keeps
+        # whatever the frame had behind them here, so Ethernet padding stays
+        # out of the payload without being lost on the way back to the wire.
+        bytes _trailer
         public dict query_field_map
         public str pkt_name
         public uint16_t pq_type
@@ -668,6 +681,14 @@ cdef class IP6(PKT):
         public unsigned char hop_limit
         public uint16_t payload_len
         public PKT payload
+        # True when the extension header chain ran past the bytes present,
+        # so the real upper layer protocol could not be reached and the
+        # remainder was kept as opaque bytes. The walk used to stop at that
+        # point without telling anyone, and since the last next-header value
+        # it held was always an extension header the payload landed in the
+        # same fall through branch a genuinely unknown protocol would - the
+        # two were indistinguishable to a caller.
+        readonly bint ext_hdrs_truncated
 
     cpdef bytes pkt2net(self, dict kwargs)
 
@@ -815,7 +836,8 @@ cdef int _decode_ip(IP pkt, bytes owner,
                     Py_ssize_t end, dict l7_ports) except -1
 cdef unsigned char _walk_ip6_ext_range(
         const unsigned char[:] mv, Py_ssize_t start, Py_ssize_t end,
-        unsigned char first_nh, Py_ssize_t *ext_len, bint *incomplete)
+        unsigned char first_nh, Py_ssize_t *ext_len, bint *incomplete,
+        bint *truncated)
 cdef int _decode_ip6(IP6 pkt, bytes owner,
                      const unsigned char[:] mv, Py_ssize_t start,
                      Py_ssize_t end, dict l7_ports) except -1
