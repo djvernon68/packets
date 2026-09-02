@@ -19,6 +19,28 @@ This is deliberately a packet/message example, not an HTTP stack.  It does not
 perform TCP stream reassembly, TLS, HTTP/2, content decompression, routing, or
 server/client behavior.  Callers must supply one complete message buffer; any
 bytes belonging to a later pipelined message are exposed as ``data``.
+
+A fixed ``Content-Length`` body may still be split across TCP segments by the
+path MTU, so a single captured packet can carry only the leading part of it.
+Rather than reject such a fragment, whatever bytes are present are kept as the
+(partial) ``body``, ``data`` is left empty, and ``body_complete`` is set to
+false so callers can tell that stream reassembly is required to see the rest.
+
+The remaining segments of that body -- the packets carrying its middle or its
+end -- have no start line of their own.  The ``HTTP`` dispatcher does not reject
+them either: a buffer with no parseable request or response start line becomes
+an ``HTTPBodyFragment`` whose opaque bytes are kept in ``data`` (with
+``body_complete`` false).  A caller can therefore collect the first message plus
+its follow-on fragments in capture order and reassemble the whole body itself;
+this module still performs no TCP stream reassembly inside the decoder.
+
+For callers that want that reassembly done for them, the module-level
+``get_http_streams`` helper is the deliberately-separate layer above the
+per-packet decoder: it groups decoded packets into bidirectional TCP
+connections, orders each direction by sequence number, concatenates the
+``HTTPRequest`` / ``HTTPResponse`` / ``HTTPBodyFragment`` payloads back into a
+continuous stream, and re-parses whole request/response ``HTTP`` objects from
+it.  See its docstring for the returned mapping.
 """
 
 cimport cython
@@ -366,6 +388,72 @@ cdef bint _looks_like_response(const unsigned char[:] mv,
             mv[start + 4] == 47)
 
 
+cdef Py_ssize_t _find_crlf_within(const unsigned char[:] mv,
+                                  Py_ssize_t start, Py_ssize_t end):
+    """Find a CRLF inside an explicit [start, end) range only."""
+    cdef Py_ssize_t i = start
+    while i + 1 < end:
+        if mv[i] == 13 and mv[i + 1] == 10:
+            return i
+        i += 1
+    return -1
+
+
+cdef bint _looks_like_response_line(const unsigned char[:] mv,
+                                    Py_ssize_t start, Py_ssize_t end):
+    """Confirm a CRLF-terminated ``HTTP/1.x <status> <reason>`` start line.
+
+    The dispatcher must tell a genuine response apart from body bytes that
+    merely happen to begin with ``HTTP/``, so the whole status line is checked
+    rather than only its first five bytes.
+    """
+    cdef:
+        Py_ssize_t line_end
+        bytes line
+        list parts
+
+    if not _looks_like_response(mv, start, end):
+        return 0
+    line_end = _find_crlf_within(mv, start, end)
+    if line_end < 0:
+        return 0
+    line = rd_bytes(mv, start, line_end)
+    parts = line.split(b' ', 2)
+    if len(parts) != 3 or not _is_http1_version(parts[0]):
+        return 0
+    if len(parts[1]) != 3 or not _is_decimal(parts[1]):
+        return 0
+    return 1
+
+
+cdef bint _looks_like_request_line(const unsigned char[:] mv,
+                                   Py_ssize_t start, Py_ssize_t end):
+    """Confirm a CRLF-terminated request start line before dispatching.
+
+    A continuation packet carrying only the middle or end of a body has no
+    parseable start line, so the dispatcher checks that the first line is a
+    valid ``method target [version]`` before handing the bytes to
+    ``HTTPRequest``; otherwise the bytes are kept as an ``HTTPBodyFragment``.
+    """
+    cdef:
+        Py_ssize_t line_end
+        bytes line
+        list parts
+
+    line_end = _find_crlf_within(mv, start, end)
+    if line_end < 0:
+        return 0
+    line = rd_bytes(mv, start, line_end)
+    parts = line.split(b' ')
+    if len(parts) != 2 and len(parts) != 3:
+        return 0
+    if not _is_token(parts[0]) or not _is_request_target(parts[1]):
+        return 0
+    if len(parts) == 3 and not _is_http1_version(parts[2]):
+        return 0
+    return 1
+
+
 @cython.final
 cdef class HTTPRequest(PKT):
     """An HTTP/0.9 or HTTP/1.x request and any following stream bytes."""
@@ -382,6 +470,7 @@ cdef class HTTPRequest(PKT):
         self.trailers = list()
         self.body = b''
         self.data = b''
+        self.body_complete = 1
         self._chunked = 0
         self._chunk_wire = b''
         self._chunk_body = b''
@@ -405,6 +494,7 @@ cdef class HTTPRequest(PKT):
         self.body = _owned_bytes(kwargs.get('body', b''))
         self.data = _owned_bytes(kwargs.get('data', b''))
         self.trailers = _owned_headers(kwargs.get('trailers', ()))
+        self.body_complete = 1
         self._chunked = _has_final_chunked(self.headers)
         _content_length(self.headers)
 
@@ -430,6 +520,7 @@ cdef class HTTPRequest(PKT):
         pkt.trailers = list()
         pkt.body = b''
         pkt.data = b''
+        pkt.body_complete = 1
         pkt._chunked = 0
         pkt._chunk_wire = b''
         pkt._chunk_body = b''
@@ -449,6 +540,7 @@ cdef class HTTPRequest(PKT):
             tuple parsed
             object content_length
 
+        self.body_complete = 1
         line_end = _find_crlf(mv, 0)
         if line_end < 0:
             raise ValueError('HTTP request: missing or incomplete start line')
@@ -494,11 +586,18 @@ cdef class HTTPRequest(PKT):
             self.data = rd_bytes(mv, body_end, -1)
         elif content_length is not None:
             if content_length > mv.shape[0] - offset:
-                raise ValueError('HTTP request: incomplete fixed body')
-            body_end = offset + content_length
-            self.body = rd_bytes(mv, offset, body_end)
-            self.trailers = list()
-            self.data = rd_bytes(mv, body_end, -1)
+                # The declared body is longer than the bytes present: this is a
+                # fragment split across TCP segments by the path MTU.  Keep the
+                # partial body instead of rejecting it and flag it incomplete.
+                self.body = rd_bytes(mv, offset, -1)
+                self.body_complete = 0
+                self.trailers = list()
+                self.data = b''
+            else:
+                body_end = offset + content_length
+                self.body = rd_bytes(mv, offset, body_end)
+                self.trailers = list()
+                self.data = rd_bytes(mv, body_end, -1)
         else:
             # Requests without framing have no safely attributable body.  The
             # remainder may be a pipeline and is therefore preserved as data.
@@ -598,6 +697,7 @@ cdef class HTTPResponse(PKT):
         self.trailers = list()
         self.body = b''
         self.data = b''
+        self.body_complete = 1
         self._chunked = 0
         self._chunk_wire = b''
         self._chunk_body = b''
@@ -618,6 +718,7 @@ cdef class HTTPResponse(PKT):
         self.body = _owned_bytes(kwargs.get('body', b''))
         self.data = _owned_bytes(kwargs.get('data', b''))
         self.trailers = _owned_headers(kwargs.get('trailers', ()))
+        self.body_complete = 1
         self._chunked = _has_final_chunked(self.headers)
         _content_length(self.headers)
 
@@ -640,6 +741,7 @@ cdef class HTTPResponse(PKT):
         pkt.trailers = list()
         pkt.body = b''
         pkt.data = b''
+        pkt.body_complete = 1
         pkt._chunked = 0
         pkt._chunk_wire = b''
         pkt._chunk_body = b''
@@ -660,6 +762,7 @@ cdef class HTTPResponse(PKT):
             object content_length
             int status_code
 
+        self.body_complete = 1
         line_end = _find_crlf(mv, 0)
         if line_end < 0:
             raise ValueError('HTTP response: missing or incomplete start line')
@@ -694,11 +797,18 @@ cdef class HTTPResponse(PKT):
             self.data = rd_bytes(mv, body_end, -1)
         elif content_length is not None:
             if content_length > mv.shape[0] - offset:
-                raise ValueError('HTTP response: incomplete fixed body')
-            body_end = offset + content_length
-            self.body = rd_bytes(mv, offset, body_end)
-            self.trailers = list()
-            self.data = rd_bytes(mv, body_end, -1)
+                # The declared body is longer than the bytes present: this is a
+                # fragment split across TCP segments by the path MTU.  Keep the
+                # partial body instead of rejecting it and flag it incomplete.
+                self.body = rd_bytes(mv, offset, -1)
+                self.body_complete = 0
+                self.trailers = list()
+                self.data = b''
+            else:
+                body_end = offset + content_length
+                self.body = rd_bytes(mv, offset, body_end)
+                self.trailers = list()
+                self.data = rd_bytes(mv, body_end, -1)
         elif ((status_code >= 100 and status_code < 200) or
               status_code == 204 or status_code == 304):
             # These statuses have no close-delimited payload; remaining bytes
@@ -777,8 +887,96 @@ cdef class HTTPResponse(PKT):
 
 
 @cython.final
+cdef class HTTPBodyFragment(PKT):
+    """Opaque continuation bytes from a packet with no HTTP start line.
+
+    A fixed-length or chunked body can be spread across several TCP segments by
+    the path MTU.  Only the first segment carries the request or response start
+    line; a segment holding the middle or the end of the body has no parseable
+    framing of its own.  Rather than reject such a packet, the dispatcher keeps
+    its bytes verbatim in ``data`` and leaves ``body_complete`` false, so a
+    caller can gather these fragments in capture order and reassemble the whole
+    message from the stream.  This type never appears for a buffer that begins a
+    valid request or response; it is produced only by the ``HTTP`` dispatcher.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._base_l7(kwargs)
+        self.pkt_name = 'HTTPBodyFragment'
+        self.pq_type, self.query_fields = HTTPBodyFragment.query_info()
+        self.data = b''
+        # A continuation fragment is, by definition, an incomplete message.
+        self.body_complete = 0
+
+        if len(args) == 1:
+            self.data = _owned_bytes(args[0])
+            return
+        elif len(args) != 0:
+            raise TypeError(
+                'HTTPBodyFragment accepts one raw buffer or data=')
+
+        self.data = _owned_bytes(kwargs.get('data', b''))
+
+    @classmethod
+    def _from_owner(cls, bytes owner, Py_ssize_t start, Py_ssize_t end,
+                    dict l7_ports):
+        cdef:
+            HTTPBodyFragment pkt
+            const unsigned char[:] mv
+
+        if start < 0 or end < start or end > len(owner):
+            raise ValueError('HTTPBodyFragment: invalid owner range')
+
+        # The range is copied to an owned bytes object so the fragment survives
+        # the outer packet exactly like a parsed message's public byte fields.
+        pkt = cls.__new__(cls)
+        pkt.l7_ports = l7_ports
+        pkt.pkt_name = 'HTTPBodyFragment'
+        pkt.pq_type, pkt.query_fields = HTTPBodyFragment.query_info()
+        pkt.body_complete = 0
+        mv = owner
+        pkt.data = rd_bytes(mv, start, end)
+        return pkt
+
+    cpdef object get_header(self, object name, object default=None):
+        # A continuation fragment carries no header section.
+        return default
+
+    cpdef list get_headers(self, object name):
+        return list()
+
+    @classmethod
+    def query_info(cls):
+        return (HTTP_PACKET_TYPE, ('http.body_length',))
+
+    @classmethod
+    def default_ports(cls):
+        return [HTTP_PACKET_PORT]
+
+    cpdef object get_field_val(self, str field):
+        if field == 'http.body_length':
+            return len(self.data)
+        return None
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        # The bytes are opaque, so serialization is a verbatim round trip.
+        w_bytes(w, self.data)
+        return 0
+
+
+@cython.final
 cdef class HTTP(PKT):
-    """Request/response dispatcher intended for ``l7_ports={80: HTTP}``."""
+    """Request/response dispatcher intended for ``l7_ports={80: HTTP}``.
+
+    A buffer that begins a valid response or request becomes an ``HTTPResponse``
+    or ``HTTPRequest``.  A buffer with no parseable start line -- a packet that
+    carries only the middle or the end of a body split by the path MTU --
+    becomes an ``HTTPBodyFragment`` instead of raising, so a caller scanning a
+    capture can collect the pieces and reassemble the stream itself.
+    """
 
     def __init__(self, *args, **kwargs):
         cdef:
@@ -794,19 +992,26 @@ cdef class HTTP(PKT):
             # ranges without first allocating a second payload bytes object.
             owner = _owned_bytes(args[0])
             mv = owner
-            if _looks_like_response(mv, 0, len(owner)):
+            if _looks_like_response_line(mv, 0, len(owner)):
                 self.message = HTTPResponse._from_owner(
                     owner, 0, len(owner), self.l7_ports)
-            else:
+            elif _looks_like_request_line(mv, 0, len(owner)):
                 self.message = HTTPRequest._from_owner(
+                    owner, 0, len(owner), self.l7_ports)
+            else:
+                # No parseable start line: keep the bytes for reassembly.
+                self.message = HTTPBodyFragment._from_owner(
                     owner, 0, len(owner), self.l7_ports)
             return
         elif len(args) != 0:
             raise TypeError('HTTP accepts one raw buffer or message=')
 
         self.message = kwargs.get('message', None)
-        if not isinstance(self.message, (HTTPRequest, HTTPResponse)):
-            raise TypeError('HTTP message must be HTTPRequest or HTTPResponse')
+        if not isinstance(
+                self.message,
+                (HTTPRequest, HTTPResponse, HTTPBodyFragment)):
+            raise TypeError('HTTP message must be HTTPRequest, HTTPResponse, '
+                            'or HTTPBodyFragment')
 
     @classmethod
     def _from_owner(cls, bytes owner, Py_ssize_t start, Py_ssize_t end,
@@ -818,19 +1023,23 @@ cdef class HTTP(PKT):
         if start < 0 or end < start or end > len(owner):
             raise ValueError('HTTP: invalid owner range')
 
-        # The dispatcher examines five bytes in the outer immutable owner and
-        # passes the original range onward.  No owner[start:end] Python bytes
-        # allocation occurs on the Layer-7 path.
+        # The dispatcher inspects the start line in the outer immutable owner
+        # and passes the original range onward.  No owner[start:end] Python
+        # bytes allocation occurs on the Layer-7 path.
         pkt = cls.__new__(cls)
         pkt.l7_ports = l7_ports
         pkt.pkt_name = 'HTTP'
         pkt.pq_type, pkt.query_fields = HTTP.query_info()
         mv = owner
-        if _looks_like_response(mv, start, end):
+        if _looks_like_response_line(mv, start, end):
             pkt.message = HTTPResponse._from_owner(
                 owner, start, end, l7_ports)
-        else:
+        elif _looks_like_request_line(mv, start, end):
             pkt.message = HTTPRequest._from_owner(
+                owner, start, end, l7_ports)
+        else:
+            # No parseable start line: keep the bytes for reassembly.
+            pkt.message = HTTPBodyFragment._from_owner(
                 owner, start, end, l7_ports)
         return pkt
 
@@ -867,10 +1076,260 @@ cdef class HTTP(PKT):
         cdef:
             HTTPRequest request
             HTTPResponse response
+            HTTPBodyFragment fragment
         if isinstance(self.message, HTTPRequest):
             request = self.message
             return request._write(w, kwargs)
         elif isinstance(self.message, HTTPResponse):
             response = self.message
             return response._write(w, kwargs)
-        raise TypeError('HTTP message must be HTTPRequest or HTTPResponse')
+        elif isinstance(self.message, HTTPBodyFragment):
+            fragment = self.message
+            return fragment._write(w, kwargs)
+        raise TypeError('HTTP message must be HTTPRequest, HTTPResponse, '
+                        'or HTTPBodyFragment')
+
+
+# --- TCP stream reassembly helper -------------------------------------------
+# The classes above are per-message/per-packet: each looks only at the one
+# buffer it is handed and never carries state between packets.  A body split
+# across TCP segments by the path MTU therefore arrives as a first message
+# (partial ``body``, ``body_complete`` false) followed by ``HTTPBodyFragment``
+# continuation packets.  ``get_http_streams`` is the caller-side layer that was
+# deliberately left out of the decoder: it groups packets into TCP connections,
+# orders each direction's segments by sequence number, concatenates their bytes
+# back into a continuous stream, and re-parses that stream into whole HTTP
+# messages.  The decoder itself still performs no reassembly on its own.
+
+# 32-bit wrap mask for TCP sequence-number arithmetic.
+DEF _SEQ_MASK = 0xffffffff
+
+
+def _stream_ip_addresses(pkt):
+    """Return ``(src, dst)`` address strings for a decoded packet, or Nones.
+
+    IPv4 and IPv6 are both supported; a packet with neither layer (for example
+    ARP) yields ``(None, None)`` and is skipped by the caller.
+    """
+    ip = pkt.get_layer('IP')
+    if ip is not None and ip.pkt_name == 'IP':
+        return (ip.get_field_val('ip.src'), ip.get_field_val('ip.dst'))
+    ip6 = pkt.get_layer('IP6')
+    if ip6 is not None and ip6.pkt_name == 'IP6':
+        return (ip6.get_field_val('ipv6.src'), ip6.get_field_val('ipv6.dst'))
+    return (None, None)
+
+
+def _reassemble_direction(direction):
+    """Rebuild one direction's byte stream from its captured segments.
+
+    ``direction`` is the accumulator built in ``get_http_streams`` -- a dict
+    with a ``segments`` list of ``(sequence, bytes)`` pairs and an ``isn``.
+    Segments are ordered by sequence number and concatenated into the longest
+    gap-free run that starts at the lowest sequence seen; retransmissions and
+    overlaps are dropped.  A missing segment (a hole in the sequence space)
+    stops assembly at the contiguous prefix, which is the best-effort partial
+    the caller asked to keep rather than discard.
+
+    :return: ``(assembled_bytes, isn)`` where ``isn`` identifies the stream.
+    """
+    if direction is None or not direction['segments']:
+        return (b'', None if direction is None else direction['isn'])
+
+    segments = direction['segments']
+    # The lowest sequence number is the first byte of the stream we hold.  A
+    # capture that spans the 4 GiB sequence space in one direction would need
+    # to wrap, which an HTTP capture never does, so a plain minimum is safe.
+    base = min(seq for seq, _ in segments)
+    ordered = sorted(segments, key=lambda item: (item[0] - base) & _SEQ_MASK)
+
+    assembled = bytearray()
+    next_off = 0
+    for seq, data in ordered:
+        off = (seq - base) & _SEQ_MASK
+        end = off + len(data)
+        if off > next_off:
+            # A segment is missing: keep the contiguous prefix and stop.
+            break
+        if end <= next_off:
+            # Wholly duplicate bytes (a retransmission); nothing new to add.
+            continue
+        assembled += data[next_off - off:]
+        next_off = end
+
+    isn = direction['isn'] if direction['isn'] is not None else base
+    return (bytes(assembled), isn)
+
+
+def _split_http_messages(stream):
+    """Split a reassembled direction into successive whole ``HTTP`` messages.
+
+    A keep-alive or pipelined direction carries several messages back to back;
+    a parsed request/response exposes any following bytes as ``data``, so each
+    message's own wire is the buffer up to that leftover.  Every element is a
+    fresh ``HTTP`` object built from just its own bytes, so serializing it
+    reproduces that one message and its ``body_complete`` flag reflects whether
+    the body was fully reassembled.  A trailing run with no parseable start
+    line (a stream whose head was not captured, or a body cut short) is kept as
+    a single ``HTTPBodyFragment`` so nothing is silently dropped.
+    """
+    messages = list()
+    buf = stream
+    while buf:
+        try:
+            message = HTTP(buf)
+        except ValueError:
+            # Malformed or incomplete framing (for example a chunked body cut
+            # short by the capture): keep the remainder verbatim and stop.
+            messages.append(HTTP(message=HTTPBodyFragment(buf)))
+            break
+        leftover = getattr(message.message, 'data', b'') or b''
+        consumed = len(buf) - len(leftover)
+        if consumed <= 0:
+            # No forward progress -- a body fragment with no start line owns the
+            # whole remainder.  Keep it as one partial message and stop.
+            messages.append(HTTP(buf))
+            break
+        own = buf[:consumed]
+        messages.append(HTTP(own))
+        buf = leftover
+    return messages
+
+
+def _direction_role(messages):
+    """Classify a direction as 'request' or 'response' by its first message."""
+    for message in messages:
+        inner = message.message
+        if isinstance(inner, HTTPRequest):
+            return 'request'
+        if isinstance(inner, HTTPResponse):
+            return 'response'
+    return None
+
+
+def get_http_streams(packets):
+    """Trace the TCP streams in decoded packets and reassemble HTTP exchanges.
+
+    This is the caller-side reassembly layer the decoder deliberately omits.
+    Hand it an iterable of already-decoded packets -- top-level ``PKT`` objects
+    such as ``Ethernet`` or ``IP`` parsed with ``l7_ports={80: HTTP}`` so their
+    TCP payloads decode to ``HTTP`` -- and it groups them into bidirectional TCP
+    connections, orders each direction by TCP sequence number, concatenates the
+    ``HTTPRequest`` / ``HTTPResponse`` / ``HTTPBodyFragment`` payloads back into
+    a continuous stream, and re-parses that stream into whole HTTP messages.
+
+    The result is a dict keyed by a string built from the connection's 5-tuple
+    plus a unique id derived from the two directions' initial sequence numbers,
+    so a later reuse of the same 5-tuple does not collide::
+
+        'TCP 10.0.0.1:54321<->10.0.0.2:80 isn=1000,2000'
+
+    Each value is a list of ``(request, response)`` pairs, in order, covering
+    keep-alive and pipelined connections; each element is an ``HTTP`` object (or
+    ``None`` when only one side of an exchange was captured).  A message that
+    could not be fully reassembled -- a hole in the capture, or a body cut short
+    -- is still returned, with ``body_complete`` false, rather than dropped.
+
+    Packets without a TCP layer, and TCP segments whose payload did not decode
+    to HTTP (a different port, or a pure ACK), are ignored.
+
+    :param packets: an iterable of decoded ``PKT`` packets.
+    :return: dict mapping a stream key string to a list of ``(request,
+        response)`` ``HTTP`` pairs.
+    """
+    active = dict()      # canonical 5-tuple -> the currently open connection
+    instances = list()   # every connection instance, in first-seen order
+
+    for pkt in packets:
+        if pkt is None:
+            continue
+        tcp = pkt.get_layer('TCP')
+        if tcp is None or tcp.pkt_name != 'TCP':
+            continue
+
+        src_ip, dst_ip = _stream_ip_addresses(pkt)
+        if src_ip is None or dst_ip is None:
+            continue
+
+        sport = tcp.get_field_val('tcp.srcport')
+        dport = tcp.get_field_val('tcp.dstport')
+        seq = tcp.get_field_val('tcp.seq')
+        is_syn = bool(tcp.get_field_val('tcp.flags.syn'))
+        is_ack = bool(tcp.get_field_val('tcp.flags.ack'))
+
+        src_ep = (src_ip, sport)
+        dst_ep = (dst_ip, dport)
+        # Canonical (order-independent) key groups both directions together.
+        conn_key = (src_ep, dst_ep) if src_ep <= dst_ep else (dst_ep, src_ep)
+
+        instance = active.get(conn_key)
+        # A bare SYN (SYN without ACK) opens a new connection.  A reused
+        # 5-tuple therefore starts a fresh instance instead of merging with the
+        # earlier one, which is what makes the sequence-based id below unique;
+        # the server's SYN-ACK and ordinary segments stay with the open one.
+        if instance is None or (is_syn and not is_ack):
+            instance = {'endpoints': conn_key, 'dirs': dict()}
+            active[conn_key] = instance
+            instances.append(instance)
+
+        flow = (src_ep, dst_ep)
+        direction = instance['dirs'].get(flow)
+        if direction is None:
+            direction = {'segments': list(), 'isn': None}
+            instance['dirs'][flow] = direction
+
+        if is_syn:
+            # The SYN (or SYN-ACK) carries the true initial sequence number;
+            # data begins at the following byte.  It is the most stable id.
+            direction['isn'] = seq
+
+        http = pkt.get_layer('HTTP')
+        if http is None or http.pkt_name != 'HTTP':
+            continue
+        payload = http.pkt2net({})
+        if payload:
+            direction['segments'].append((seq, payload))
+
+    streams = dict()
+    for instance in instances:
+        ep_a, ep_b = instance['endpoints']
+        directions = instance['dirs']
+        flow_ab = (ep_a, ep_b)
+        flow_ba = (ep_b, ep_a)
+
+        stream_ab, isn_ab = _reassemble_direction(directions.get(flow_ab))
+        stream_ba, isn_ba = _reassemble_direction(directions.get(flow_ba))
+
+        messages_ab = _split_http_messages(stream_ab)
+        messages_ba = _split_http_messages(stream_ba)
+        if not messages_ab and not messages_ba:
+            # A TCP connection that carried no HTTP payload (a different port,
+            # or only SYN/ACK control segments) is not an HTTP stream.
+            continue
+
+        role_ab = _direction_role(messages_ab)
+        role_ba = _direction_role(messages_ba)
+        if role_ab == 'request' or role_ba == 'response':
+            requests, responses = messages_ab, messages_ba
+        elif role_ba == 'request' or role_ab == 'response':
+            requests, responses = messages_ba, messages_ab
+        else:
+            # Neither side had a parseable start line (only body fragments).
+            # The lower port is conventionally the server, so requests flow
+            # toward it; this is only a tie-breaker for otherwise opaque data.
+            if ep_a[1] <= ep_b[1]:
+                requests, responses = messages_ba, messages_ab
+            else:
+                requests, responses = messages_ab, messages_ba
+
+        pairs = list()
+        for i in range(max(len(requests), len(responses))):
+            request = requests[i] if i < len(requests) else None
+            response = responses[i] if i < len(responses) else None
+            pairs.append((request, response))
+
+        key = 'TCP {0}:{1}<->{2}:{3} isn={4},{5}'.format(
+            ep_a[0], ep_a[1], ep_b[0], ep_b[1], isn_ab, isn_ba)
+        streams[key] = pairs
+
+    return streams

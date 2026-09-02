@@ -18,6 +18,7 @@ cdef class HTTPRequest(PKT):
     cdef:
         public bytes method, target, version, body, data
         public list headers, trailers
+        public bint body_complete
         bint _chunked
         bytes _chunk_wire, _chunk_body
         tuple _chunk_trailers
@@ -34,6 +35,7 @@ cdef class HTTPResponse(PKT):
     cdef:
         public bytes version, status, reason, body, data
         public list headers, trailers
+        public bint body_complete
         bint _chunked
         bytes _chunk_wire, _chunk_body
         tuple _chunk_trailers
@@ -43,6 +45,18 @@ cdef class HTTPResponse(PKT):
     cpdef object get_field_val(self, str field)
     cpdef bytes pkt2net(self, dict kwargs)
     cdef int _parse_message(self, const unsigned char[:] mv) except -1
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+
+cdef class HTTPBodyFragment(PKT):
+    cdef:
+        public bytes data
+        public bint body_complete
+
+    cpdef object get_header(self, object name, object default=*)
+    cpdef list get_headers(self, object name)
+    cpdef object get_field_val(self, str field)
+    cpdef bytes pkt2net(self, dict kwargs)
     cdef int _write(self, PktWriter w, dict kwargs) except -1
 
 

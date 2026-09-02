@@ -1,6 +1,52 @@
 CHANGELOG
 ---------
 
+[2.1.4]
+ * **HTTP fixed-length bodies split by the path MTU are decoded, not
+   rejected.** A `Content-Length` body can be spread over several TCP
+   segments, so a single captured packet often carries only its leading
+   part. `HTTPRequest` and `HTTPResponse` used to raise `ValueError('HTTP
+   ...: incomplete fixed body')` in that case; they now keep the bytes that
+   are present as a partial `body`, leave `data` empty, and set the new
+   public `body_complete` flag to false so a caller can tell that stream
+   reassembly is needed to see the rest. A fully present body still reports
+   `body_complete` true, and the partial fragment still serializes back to
+   the exact captured wire. Conflicting or non-numeric `Content-Length`
+   headers are still rejected.
+ * **HTTP body continuation packets are kept for reassembly, not
+   rejected.** When a body is split across TCP segments by the path MTU,
+   only the first segment carries the request or response start line; the
+   segments holding the body's middle and end have no framing of their own,
+   so `Ethernet(pkt_data, l7_ports={80: HTTP})` used to raise
+   `ValueError('HTTP ...: missing or incomplete start line')` on them. The
+   `HTTP` dispatcher now recognizes a buffer with no parseable start line
+   and returns the new `HTTPBodyFragment` message, whose opaque bytes are
+   kept verbatim in `data` with `body_complete` false, instead of raising.
+   A caller can therefore collect the first (partial) message plus its
+   follow-on fragments in capture order and reassemble the whole body
+   itself; the library still performs no TCP stream reassembly on its own.
+   Every fragment serializes back to its exact captured wire, and the start
+   line detection is strict enough that a body line which merely resembles a
+   request or `HTTP/` response line is still kept as a fragment.
+ * **A `get_http_streams` helper reassembles whole HTTP exchanges from a
+   capture.** The decoder is deliberately per-packet and still performs no
+   TCP reassembly itself, but the new module-level
+   `packets.protos.http.get_http_streams(<packet iterator>)` is the
+   caller-side layer that does. Given an iterable of decoded packets (for
+   example `Ethernet` frames parsed with `l7_ports={80: HTTP}`), it groups
+   them into bidirectional TCP connections, orders each direction by
+   sequence number (dropping retransmissions and stopping a contiguous run
+   at a missing segment), concatenates the `HTTPRequest`, `HTTPResponse`,
+   and `HTTPBodyFragment` payloads back into a continuous stream, and
+   re-parses whole request/response messages from it. It returns a dict
+   keyed by a string built from the connection's 5-tuple plus a unique id
+   derived from both directions' initial sequence numbers -- so a reused
+   5-tuple (a fresh connection, delimited by its SYN) does not collide --
+   whose value is a list of ordered `(request, response)` `HTTP` pairs
+   covering keep-alive and pipelining. A message that could not be fully
+   reassembled is still returned with `body_complete` false rather than
+   dropped, and packets without TCP or without an HTTP payload are ignored.
+
 [2.1.3]
  * **Addresses are formatted in C rather than through Python.** Reading a
    MAC ran `struct.unpack` and a six conversion `%`-format, reading `IP.src`
