@@ -414,6 +414,10 @@ cdef class PCAPWriter(PCAPBase):
 
 cpdef pcap_pkthdr_t get_pkts_header(double ts, bytes data)
 
+cpdef tuple validate_bpf_filter(str bpf_filter,
+                                int linktype=*,
+                                int snaplen=*)
+
 cpdef dict pcap_info(str filename)
 
 cpdef int netflow_replay_raw_sock(str device,

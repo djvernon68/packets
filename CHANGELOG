@@ -1,6 +1,25 @@
 CHANGELOG
 ---------
 
+[2.1.5]
+ * **A `validate_bpf_filter` helper checks a BPF filter without installing
+   it.** `add_bpf_filter()` compiles *and installs* a filter on an open
+   capture and raises an exception when it cannot. So there was no way to
+   test an expression - for example one provided by an end user - without
+   a live handle and the (Exception) side effect of applying it. The new
+   module-level `packets.core.pcap.validate_bpf_filter(bpf_filter,
+   linktype=ETH_EN10MB, snaplen=MAX_SNAPLEN)` compiles the expression
+   against a throwaway "dead" handle (`pcap_open_dead`) that opens no
+   device or file and captures nothing, then frees the compiled program
+   and closes the handle. It returns `(True, None)` when the filter
+   compiles and `(False, reason)` otherwise, where `reason` is libpcap's
+   own `pcap_geterr` description (for example `"syntax error"`) rather
+   than a bare error code. The check is optional: a caller that skips
+   it and hands an unchecked filter to `add_bpf_filter()` still gets the
+   exception that raises. `linktype` defaults to Ethernet and takes any
+   of the module's `ETH_*` constants so the filter is validated against
+   the link layer it will really run on.
+
 [2.1.4]
  * **HTTP fixed-length bodies split by the path MTU are decoded, not
    rejected.** A `Content-Length` body can be spread over several TCP

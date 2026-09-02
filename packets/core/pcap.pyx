@@ -342,6 +342,86 @@ cpdef pcap_pkthdr_t get_pkts_header(double ts, bytes data):
     return hdr
 
 
+cpdef tuple validate_bpf_filter(str bpf_filter,
+                                int linktype=ETH_EN10MB,
+                                int snaplen=MAX_SNAPLEN):
+    """Compile a BPF filter on a throwaway handle to check that it is valid.
+
+    This is a side-effect-free companion to ``add_bpf_filter()``. Where
+    ``add_bpf_filter()`` compiles *and installs* a filter on a live or
+    offline capture - and raises when it cannot - this only asks libpcap
+    whether the expression compiles, using a "dead" handle created with
+    pcap_open_dead(). Nothing is captured, nothing is installed, and no real
+    device or capture file is opened, so a caller can safely test an
+    expression that came from an end user before committing to it. Using the
+    helper is optional: a caller that skips it and passes an unchecked filter
+    straight to ``add_bpf_filter()`` simply gets the exception that raises.
+
+    The check has to match the link layer the filter will really run
+    against. BPF compiles differently for different link types - for example
+    ``vlan`` or ``ether`` primitives - so an expression that is valid for
+    Ethernet may not be for another medium. ``linktype`` therefore defaults
+    to Ethernet (ETH_EN10MB), the same link type PCAPWriter uses; pass one of
+    the module's ETH_* constants to validate against a different medium.
+
+    Args:
+        :bpf_filter (str): the filter expression to test. An empty string is
+            a valid filter (it matches every packet) and reports success.
+        :linktype (int): the link type to compile against, one of the ETH_*
+            constants. Defaults to ETH_EN10MB.
+        :snaplen (int): the snapshot length the dead handle is created with.
+            Defaults to MAX_SNAPLEN. It does not affect compilation of
+            ordinary filters and rarely needs changing.
+
+    Returns:
+        :tuple: ``(ok, error)``. ``ok`` is ``True`` and ``error`` is ``None``
+            when the filter compiles. ``ok`` is ``False`` and ``error`` is
+            libpcap's own description of the problem (the pcap_geterr() text,
+            for example ``"syntax error"``) when it does not.
+
+    Raises:
+        :MemoryError: if libpcap could not allocate the throwaway handle.
+            That is an environment failure rather than a problem with the
+            filter, so it is reported separately from an invalid expression.
+    """
+    cdef:
+        pcap_t * dead
+        bpf_program bpfprog
+        int rval
+        bytes encoded
+        char * fltr = b''
+        str err_txt
+
+    # A dead handle: pcap_open_dead() allocates a pcap_t for the given link
+    # type with an error buffer but no capture source. That is exactly what
+    # pcap_compile() needs to parse and optimize an expression, and it keeps
+    # the error string alive so pcap_geterr() can be read afterwards.
+    # pcap_compile_nopcap() looks like the obvious fit but closes its own
+    # handle before returning and so destroys that string, leaving only a
+    # bare -1 with no retrievable reason - which is why it is not used here.
+    dead = open_dead(linktype, snaplen)
+    if dead is NULL:
+        raise MemoryError("Could not allocate a pcap_t * to validate the "
+                          "BPF filter")
+
+    encoded = bpf_filter.encode()
+    fltr = encoded
+    try:
+        # optimize=1 and NETMASK_UNKNOWN mirror _add_bpf_filter(). The mask
+        # only affects a few broadcast-related primitives and is genuinely
+        # unknown for a handle with no real network attached.
+        rval = pcap_compile(dead, &bpfprog, fltr, 1, NETMASK_UNKNOWN)
+        if rval == ERROR:
+            err_txt = pcap_geterr(dead).decode('utf-8', 'replace')
+            return (False, err_txt)
+        # pcap_compile mallocs the bpf_insn program even though we never
+        # install it; free it so a validating loop does not leak one per call.
+        pcap_freecode(&bpfprog)
+        return (True, None)
+    finally:
+        pcap_close(dead)
+
+
 cdef class PCAPBase:
     def __cinit__(self, *args, **kwargs):
         self.dumper = NULL
