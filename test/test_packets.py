@@ -234,11 +234,18 @@ class TestPackets(unittest.TestCase):
         self.assertEqual(a.target_hw_addr, b.target_hw_addr)
         self.assertEqual(a.target_proto_addr, b.target_proto_addr)
 
-        def try_bad_opcode(obj):
-            arp = obj.get_layer('ARP')
-            arp.operation = 14
+        # ARP operation code allows any valid 16-bit unsigned int (including opcode 10 / NAK)
+        arp = pkt_copy.get_layer('ARP')
+        arp.operation = C.ARP_OP_NAK
+        self.assertEqual(arp.operation, 10)
+        arp.operation = 14
+        self.assertEqual(arp.operation, 14)
 
-        self.assertRaises(ValueError, try_bad_opcode, pkt_copy)
+        def try_bad_opcode(obj):
+            a = obj.get_layer('ARP')
+            a.operation = -1
+
+        self.assertRaises((OverflowError, TypeError), try_bad_opcode, pkt_copy)
 
     def test_DNS_roundtrip(self):
         # DNS build -> pkt2net -> parse round-trip with label compression.
@@ -1632,6 +1639,48 @@ class TestPackets(unittest.TestCase):
         self.assertEqual(arp.sender_proto_addr, '0a0b0c0d0e')
         self.assertEqual(arp.target_proto_addr, '0f10111213')
         self.assertEqual(arp.pkt2net({}), raw)
+
+    def test_ARP_nak_and_extended_opcodes_roundtrip(self):
+        """Opcode 10 (ATMARP NAK) and extended opcodes parse and roundtrip."""
+        # ATMARP NAK (opcode 10)
+        raw_nak = _struct.pack('!HHBBH', 1, 0x0800, 6, 4, 10) + \
+                  b'\x01\x02\x03\x04\x05\x06' + _socket.inet_aton('10.0.0.1') + \
+                  b'\x0a\x0b\x0c\x0d\x0e\x0f' + _socket.inet_aton('10.0.0.2')
+        arp_nak = ARP(raw_nak)
+        self.assertEqual(arp_nak.operation, 10)
+        self.assertEqual(arp_nak.operation, C.ARP_OP_NAK)
+        self.assertEqual(arp_nak.sender_hw_addr, '01:02:03:04:05:06')
+        self.assertEqual(arp_nak.sender_proto_addr, '10.0.0.1')
+        self.assertEqual(arp_nak.target_hw_addr, '0a:0b:0c:0d:0e:0f')
+        self.assertEqual(arp_nak.target_proto_addr, '10.0.0.2')
+        self.assertEqual(arp_nak.pkt2net({}), raw_nak)
+
+        # Keyword construction for opcode 10
+        arp_kw = ARP(operation=C.ARP_OP_NAK,
+                     sender_hw_addr='01:02:03:04:05:06',
+                     sender_proto_addr='10.0.0.1',
+                     target_hw_addr='0a:0b:0c:0d:0e:0f',
+                     target_proto_addr='10.0.0.2')
+        self.assertEqual(arp_kw.pkt2net({}), raw_nak)
+
+        # Enclosed in Ethernet frame
+        eth_frame = _struct.pack('!6s6sH',
+                                 b'\x0a\x0b\x0c\x0d\x0e\x0f',
+                                 b'\x01\x02\x03\x04\x05\x06',
+                                 0x0806) + raw_nak
+        eth = Ethernet(eth_frame)
+        self.assertIsInstance(eth.payload, ARP)
+        self.assertEqual(eth.payload.operation, 10)
+        # Ethernet.pkt2net pads frames up to the 60-byte Ethernet minimum
+        self.assertEqual(eth.pkt2net({}), eth_frame + b'\x00' * (60 - len(eth_frame)))
+
+        # Extended opcode (e.g. 250)
+        raw_ext = _struct.pack('!HHBBH', 1, 0x0800, 6, 4, 250) + \
+                  b'\x01\x02\x03\x04\x05\x06' + _socket.inet_aton('10.0.0.1') + \
+                  b'\x0a\x0b\x0c\x0d\x0e\x0f' + _socket.inet_aton('10.0.0.2')
+        arp_ext = ARP(raw_ext)
+        self.assertEqual(arp_ext.operation, 250)
+        self.assertEqual(arp_ext.pkt2net({}), raw_ext)
 
     def test_ICMP_extended_types_roundtrip(self):
         """ICMP echo, unreachable, time-exceeded, redirect, and param-problem."""

@@ -1,6 +1,15 @@
 CHANGELOG
 ---------
 
+[2.1.6]
+ * **ARP decodes extended and non-standard opcodes instead of rejecting
+   them.** `ARP.operation` used to enforce values 1-9 at decode and assignment
+   time, raising `ValueError` on frames with other opcodes (such as RFC 1577
+   ATMARP NAK opcode 10). `ARP.operation` now accepts any valid 16-bit
+   operation code (`uint16_t`), allowing frames with opcode 10 or other
+   unassigned/extended opcodes to decode, round-trip, and serialize properly
+   without parse failures. Added `ARP_OP_NAK = 10` to `IP_CONST`.
+
 [2.1.5]
  * **A `validate_bpf_filter` helper checks a BPF filter without installing
    it.** `add_bpf_filter()` compiles *and installs* a filter on an open

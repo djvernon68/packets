@@ -51,6 +51,7 @@ ARP_OP_DYN_RARP_REPLY = 6
 ARP_OP_DYN_RARP_ERR = 7
 ARP_OP_INV_REQUEST = 8
 ARP_OP_INV_REPLY = 9
+ARP_OP_NAK = 10
 ETH_TYPE_IPV4 = 0x0800
 ETH_TYPE_ARP = 0x0806
 ETH_TYPE_RARP = 0x8035
@@ -218,6 +219,7 @@ cdef class IP_CONST:
         self.ARP_OP_DYN_RARP_ERR = ARP_OP_DYN_RARP_ERR
         self.ARP_OP_INV_REQUEST = ARP_OP_INV_REQUEST
         self.ARP_OP_INV_REPLY = ARP_OP_INV_REPLY
+        self.ARP_OP_NAK = ARP_OP_NAK
         self.ETH_TYPE_IPV4 = ETH_TYPE_IPV4
         self.ETH_TYPE_ARP = ETH_TYPE_ARP
         self.ETH_TYPE_RARP = ETH_TYPE_RARP
@@ -1299,7 +1301,7 @@ cdef class ARP(PKT):
 
     property operation:
         """
-        Get and Set the ARP operation value. Enforces values 1-9
+        Get and Set the ARP operation value.
         """
         def __get__(self):
             """
@@ -1314,15 +1316,9 @@ cdef class ARP(PKT):
             Set ARP.operation
 
             Args:
-            :val (uint16_t): unsigned char value to set operation to. Supported
-                values are 1 - 9.
-
+            :val (uint16_t): 16-bit unsigned operation code.
             """
-            if 1 <= val <= 9:
-                self._operation = val
-            else:
-                raise ValueError("Valid operation codes are 1 - 9. Common "
-                                 "values are 1 for request and 2 for reply.")
+            self._operation = val
 
     cpdef bytes pkt2net(self, dict kwargs):
         """Used to export a ARP packet class instance in network order for

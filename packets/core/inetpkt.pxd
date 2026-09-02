@@ -258,6 +258,7 @@ cdef:
     unsigned char ARP_OP_DYN_RARP_ERR
     unsigned char ARP_OP_INV_REQUEST
     unsigned char ARP_OP_INV_REPLY
+    unsigned char ARP_OP_NAK
     # ETHERTYPES
     uint16_t ETH_TYPE_IPV4
     uint16_t ETH_TYPE_ARP
@@ -416,6 +417,7 @@ cdef class IP_CONST:
         readonly unsigned char ARP_OP_DYN_RARP_ERR
         readonly unsigned char ARP_OP_INV_REQUEST
         readonly unsigned char ARP_OP_INV_REPLY
+        readonly unsigned char ARP_OP_NAK
         readonly uint16_t ETH_TYPE_IPV4
         readonly uint16_t ETH_TYPE_ARP
         readonly uint16_t ETH_TYPE_RARP
