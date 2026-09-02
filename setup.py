@@ -26,7 +26,8 @@ except ImportError:
 
 # Build scripts automatically
 scripts = {'console_scripts': [
-    'netflow-player = packets.commands.netflow_player:main'
+    'netflow-player = packets.commands.netflow_player:main',
+    'netflow-generator = packets.commands.netflow_generator:main',
 ]}
 
 setup_args = {

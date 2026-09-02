@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 
+from packets.core.inetpkt import Ethernet
 from packets.core.pcap import PCAPReader
 from packets.query.pcap_query import PcapQuery
 from packets.protos.netflow import (
@@ -17,7 +18,7 @@ from packets.protos.netflow import (
     NetflowTemplateField,
     NetflowV9Header,
 )
-from packets.protos.netflow_generator import (
+from packets.commands.netflow_generator import (
     CISCO_NETFLOW_V9_FIELD_SPECS,
     NetflowV9Generator,
     create_cisco_netflow_v9_template,
@@ -145,15 +146,15 @@ class TestNetflowGenerator(unittest.TestCase):
         self.assertEqual(len(rec.fields[(0, 999)]), 4)
 
     def test_packet_sequence_and_uptime_progression(self):
-        gen = NetflowV9Generator(seed=42, base_uptime=1000, base_unix_secs=1700000000)
+        gen = NetflowV9Generator(seed=42, base_uptime=1000, base_unix_secs=1700000000, base_sequence=1)
         packets = list(gen.generate_packets(total_records=100, records_per_packet=25, template_interval=2))
         self.assertEqual(len(packets), 4)
 
-        # Check sequence numbers progression (cumulative records)
-        self.assertEqual(packets[0].header.sequence, 0)
-        self.assertEqual(packets[1].header.sequence, 25)
-        self.assertEqual(packets[2].header.sequence, 50)
-        self.assertEqual(packets[3].header.sequence, 75)
+        # Check sequence numbers progression across packets
+        self.assertEqual(packets[0].header.sequence, 1)
+        self.assertEqual(packets[1].header.sequence, 2)
+        self.assertEqual(packets[2].header.sequence, 3)
+        self.assertEqual(packets[3].header.sequence, 4)
 
         # Check template flowset frequency (interval=2 means packets 0 and 2 have templates)
         self.assertEqual(len(packets[0].flowsets), 2)  # Template set + Data set
@@ -213,7 +214,8 @@ class TestNetflowGenerator(unittest.TestCase):
 
             decoded_packets = 0
             total_decoded_records = 0
-            for frame in reader:
+            for ts, hdr, wire_data in reader:
+                frame = Ethernet(wire_data, l7_ports={2055: Netflow}, decode_context=ctx)
                 netflow_layer = frame.get_layer('Netflow')
                 self.assertIsNotNone(netflow_layer)
                 self.assertEqual(netflow_layer.version, 9)
@@ -234,9 +236,9 @@ class TestNetflowGenerator(unittest.TestCase):
             )
             results = query.query()
             self.assertEqual(len(results), 20)
-            self.assertEqual(results[0], (9, 0))
-            self.assertEqual(results[1], (9, 25))
-            self.assertEqual(results[19], (9, 475))
+            self.assertEqual(results[0], (9, 2))
+            self.assertEqual(results[1], (9, 3))
+            self.assertEqual(results[19], (9, 21))
 
         finally:
             if os.path.exists(filename):

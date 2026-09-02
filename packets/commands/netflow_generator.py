@@ -115,6 +115,7 @@ class NetflowV9Generator:
         seed: Optional[int] = None,
         base_uptime: int = 100000,
         base_unix_secs: Optional[int] = None,
+        base_sequence: int = 1,
         ip_network_pool: Optional[Sequence[str]] = None,
     ):
         """Initialize the NetFlow v9 generator.
@@ -126,6 +127,7 @@ class NetflowV9Generator:
         :param seed: Optional random seed for reproducible packet generation.
         :param base_uptime: Starting sys_uptime in milliseconds.
         :param base_unix_secs: Starting unix timestamp in seconds. Defaults to current time.
+        :param base_sequence: Starting sequence number (default 1).
         :param ip_network_pool: Optional list of IP prefix strings (e.g. ['10.0', '192.168.1']).
         """
         self.template = normalize_template(template, template_id=template_id)
@@ -134,7 +136,7 @@ class NetflowV9Generator:
         self.rng = random.Random(seed)
         self.uptime = base_uptime
         self.unix_secs = base_unix_secs if base_unix_secs is not None else int(time.time())
-        self.sequence = 0
+        self.sequence = base_sequence
         self.ip_network_pool = ip_network_pool
 
     def _random_ipv4(self) -> str:
@@ -290,7 +292,7 @@ class NetflowV9Generator:
         )
 
         # Advance state
-        self.sequence += len(record_list)
+        self.sequence += 1
         self.uptime += uptime_increment
         self.unix_secs += time_increment
 
@@ -407,3 +409,113 @@ class NetflowV9Generator:
             writer.close()
 
         return packet_count
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point for NetFlow v9 generator."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic NetFlow v9 packets conforming to standard Cisco or custom templates."
+    )
+    parser.add_argument(
+        "-c", "--count", type=int, default=1000,
+        help="Total number of NetFlow records to generate (default: 1000)"
+    )
+    parser.add_argument(
+        "-r", "--records-per-packet", type=int, default=20,
+        help="Number of records per NetFlow packet (default: 20)"
+    )
+    parser.add_argument(
+        "-o", "--out", type=str, default=None,
+        help="Output PCAP file path"
+    )
+    parser.add_argument(
+        "--template-id", type=int, default=256,
+        help="NetFlow v9 template ID (default: 256)"
+    )
+    parser.add_argument(
+        "--template-interval", type=int, default=10,
+        help="Interval of packets between template flowsets (default: 10)"
+    )
+    parser.add_argument(
+        "--source-id", type=int, default=1,
+        help="Source ID / Observation Domain ID (default: 1)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for deterministic output"
+    )
+    parser.add_argument(
+        "--src-ip", type=str, default="192.0.2.1",
+        help="Exporter source IPv4 address (default: 192.0.2.1)"
+    )
+    parser.add_argument(
+        "--dst-ip", type=str, default="198.51.100.20",
+        help="Collector destination IPv4 address (default: 198.51.100.20)"
+    )
+    parser.add_argument(
+        "--sport", type=int, default=50000,
+        help="Exporter source UDP port (default: 50000)"
+    )
+    parser.add_argument(
+        "--dport", type=int, default=2055,
+        help="Collector destination UDP port (default: 2055)"
+    )
+    parser.add_argument(
+        "--send", type=str, default=None,
+        help="Send UDP datagrams to IP:PORT (e.g. 127.0.0.1:2055)"
+    )
+
+    args = parser.parse_args(argv)
+
+    gen = NetflowV9Generator(
+        template_id=args.template_id,
+        source_id=args.source_id,
+        seed=args.seed,
+    )
+
+    if args.send:
+        host, port_str = args.send.split(":")
+        target_port = int(port_str)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sent = 0
+        for pkt in gen.generate_packets(
+            total_records=args.count,
+            records_per_packet=args.records_per_packet,
+            template_interval=args.template_interval,
+        ):
+            wire = pkt.pkt2net({"update": 1})
+            sock.sendto(wire, (host, target_port))
+            sent += 1
+        sock.close()
+        print(f"Sent {sent} NetFlow v9 packets ({args.count} records) to {args.send}")
+        return 0
+
+    if args.out:
+        total_packets = gen.generate_pcap(
+            filename=args.out,
+            total_records=args.count,
+            records_per_packet=args.records_per_packet,
+            template_interval=args.template_interval,
+            src_ip=args.src_ip,
+            dst_ip=args.dst_ip,
+            sport=args.sport,
+            dport=args.dport,
+        )
+        print(f"Generated {total_packets} NetFlow v9 packets ({args.count} records) to {args.out}")
+        return 0
+
+    # If neither --out nor --send, count packets generated in memory
+    total_pkts = sum(1 for _ in gen.generate_packets(
+        total_records=args.count,
+        records_per_packet=args.records_per_packet,
+        template_interval=args.template_interval,
+    ))
+    print(f"Successfully generated {total_pkts} NetFlow v9 packets ({args.count} records)")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
