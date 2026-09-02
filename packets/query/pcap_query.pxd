@@ -26,6 +26,12 @@ cdef class Frame:
 
     cpdef object get_field_val(self, str field)
 
+cdef class _FieldDescriptor:
+    cdef:
+        int layer_index
+        unsigned char field_id
+        str field_name
+
 cdef class PcapQuery:
     cdef:
         str srcname
@@ -35,7 +41,10 @@ cdef class PcapQuery:
         public dict fields
         dict l7_ports
         public list field_functions, layer_order, wshark_fields
+        list field_descriptors
         public object stop_event
+
+    cdef tuple _extract_row(self, list layers)
 
     cpdef bint fields_supported(self, list field_names)
 

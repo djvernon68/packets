@@ -34,26 +34,26 @@ dnstypes = {
     51: "NSEC3PARAM", 251: "IXFR", 252: "AXFR", 255: "ALL", 65535: "RESERVED"
 }
 tkv = dict()
-for k, v in dnstypes.iteritems():
+for k, v in dnstypes.items():
     tkv[v] = k
 DNSTYPES = dict_to_namedtuple(tkv, 'DNSTYPES')
 
 dnsrclass = {1: 'IN', 254: 'NONE', 255: 'ANY'}
 tkv = dict()
-for k, v in dnsrclass.iteritems():
+for k, v in dnsrclass.items():
     tkv[v] = k
 DNSRCLASS = dict_to_namedtuple(tkv, 'DNSRCLASS')
 
 # Regex to see if data is a valid fqdn
 hostname_re = re.compile(r"^(?:(?!-|[^.]+_)[A-Za-z0-9-_]{1,63}(?<!-)"
-                          "(?:\.|$))$")
+                          r"(?:\.|$))$")
 domainname_re = re.compile(r"^(?=.{1,253}\.?$)(?:(?!-|[^.]+_)[A-Za-z0-9-_]"
-                            "{1,63}(?<!-)(?:\.|$)){2,}$")
+                            r"{1,63}(?<!-)(?:\.|$)){2,}$")
 
 
-# Some helper functions to get and set nibbles and bits. Steelscript.packets
-# has some of these as well but they are written as strongly typed and only
-# available in the c world.
+# Some helper functions to get and set nibbles and bits. inetpkt has some of
+# these as well but they are written as strongly typed and only available in
+# the c world.
 def set_nibble(word, nibble, which=None, offset=None):
     if which is not None:
         shift = 4 * which
@@ -74,15 +74,11 @@ def get_nibble(word, which=None, offset=None):
 
 
 def set_bit(flags, offset):
-    mask = 1 << offset
-    if not flags & mask:
-        return flags | mask
+    return flags | (1 << offset)
 
 
 def unset_bit(flags, offset):
-    mask = ~(1 << offset)
-    if not flags & mask:
-        return flags & mask
+    return flags & ~(1 << offset)
 
 
 def hostname_to_label_array(hostname):
@@ -130,7 +126,7 @@ def read_dns_name_bytes(byte_array, start, label_store):
         if 1 <= b1 <= 63:
             # This is the first time we have seen this label OR this packet
             # is not using compression.
-            c_label = byte_array[buff_indx + 1: buff_indx + 1 + b1].tostring()
+            c_label = byte_array[buff_indx + 1: buff_indx + 1 + b1].tobytes().decode()
             labels.append((buff_indx, c_label, ))
             return_parts.append(c_label)
             buff_indx = buff_indx + b1 + 1
@@ -144,6 +140,10 @@ def read_dns_name_bytes(byte_array, start, label_store):
             buff_indx += 2
             # Strip off the top two bits
             location = location & 0x3fff
+            if location >= start:
+                raise ValueError("DNS compression pointer points forward or "
+                                 "at itself")
+
             if location in label_store:
                 return_parts.append(label_store[location])
                 labels.append((location, label_store[location], ))
@@ -195,7 +195,9 @@ def parse_resource(byte_array, start, label_store):
                                   byte_array[buff_indx:buff_indx + 16])
         buff_indx += 16
     else:
-        r_data = byte_array[buff_indx:buff_indx + r_d_len].tostring()
+        r_data = byte_array[buff_indx:buff_indx + r_d_len].tobytes()
+        if r_type == DNSTYPES.TXT:
+            r_data = r_data.decode()
         buff_indx += r_d_len
     return buff_indx, (d_name, r_type, r_class, r_ttl, r_d_len, r_data)
 
@@ -373,13 +375,13 @@ class DNSResource(object):
 class DNS(PKT):
     def __init__(self, *args, **kwargs):
         super(DNS, self).__init__(*args, **kwargs)
-        self.pkt_name = b'DNS'
+        self.pkt_name = 'DNS'
         # get the class numeric type ID and our list of supported packet query
         # fields.
         self.pq_type, self.query_fields = DNS.query_info()
         # Call the base class from_buffer() to see if we are initializing from
         # data or kwargs
-        use_buffer, self._buffer = self.from_buffer(args, kwargs)
+        use_buffer, buf = self.from_buffer(args, kwargs)
 
         # Set up some internal variables and data containers.
         # initialize the flags and codes field to 0
@@ -391,7 +393,6 @@ class DNS(PKT):
         self.ad = list()
         # our label container to support label compression of names.
         self.labels = dict()
-        # our current location in the buffer when parsing data.
 
         if use_buffer:
             # read the first 12 bytes into six unsigned shorts.
@@ -400,7 +401,7 @@ class DNS(PKT):
              self.query_count,
              self.answer_count,
              self.auth_count,
-             self.ad_count) = struct.unpack('!6H', self._buffer[:12])
+             self.ad_count) = struct.unpack('!6H', buf[:12])
             # add those 12 bytes to the buffer index.
             offset = 12
             # for each query and or resource record we have parse the data.
@@ -408,14 +409,14 @@ class DNS(PKT):
                 for _ in range(self.query_count):
                     # read and or update our labels
                     offset, query_name = read_dns_name_bytes(
-                        self._buffer,
+                        buf,
                         offset,
                         self.labels
                     )
                     # unpack the remainder of the query.
                     query_type, query_class = struct.unpack(
                         '!HH',
-                        self._buffer[offset:offset + 4]
+                        buf[offset:offset + 4]
                     )
                     self.queries.append(DNSQuery(query_name,
                                                    query_type,
@@ -425,7 +426,7 @@ class DNS(PKT):
             if self.answer_count:
                 for _ in range(self.answer_count):
                     offset, resource_args = parse_resource(
-                        self._buffer,
+                        buf,
                         offset,
                         self.labels
                     )
@@ -433,7 +434,7 @@ class DNS(PKT):
             if self.auth_count:
                 for _ in range(self.auth_count):
                     offset, resource_args = parse_resource(
-                        self._buffer,
+                        buf,
                         offset,
                         self.labels
                     )
@@ -441,7 +442,7 @@ class DNS(PKT):
             if self.ad_count:
                 for _ in range(self.ad_count):
                     offset, resource_args = parse_resource(
-                        self._buffer,
+                        buf,
                         offset,
                         self.labels
                     )
@@ -468,19 +469,19 @@ class DNS(PKT):
         """
         Used by pcap_query to derive what PKT class ID this class has AND
         what query fields it supports. ANY PKT based class that wants to be
-        supported by steelscript.packets.query.pcap_query's PcapQuery must
+        supported by packets.query.pcap_query's PcapQuery must
         implment this class method and optimaly provide a
         get_field_val(<field_name>) function as well.
         return: uint16_t pq_type, tuple_of_string query_fields"""
         return (DNS_PACKET_TYPE,
-                (b'dns.ident', b'dns.query_resp', b'dns.op_code',
-                 b'dns.authoritative',
-                 b'dns.truncated', b'dns.recursion_requested',
-                 b'dns.recursion_available',
-                 b'dns.authentic_data', b'dns.check_disabled',
-                 b'dns.resp_code',
-                 b'dns.query_count', b'dns.answer_count', b'dns.auth_count',
-                 b'dns.ad_count'))
+                ('dns.ident', 'dns.query_resp', 'dns.op_code',
+                 'dns.authoritative',
+                 'dns.truncated', 'dns.recursion_requested',
+                 'dns.recursion_available',
+                 'dns.authentic_data', 'dns.check_disabled',
+                 'dns.resp_code',
+                 'dns.query_count', 'dns.answer_count', 'dns.auth_count',
+                 'dns.ad_count'))
 
 
     @classmethod
@@ -605,12 +606,107 @@ class DNS(PKT):
             raise ValueError("DNS check_disabled bit must be 0 or 1.")
 
     @property
-    def error_code(self):
+    def resp_code(self):
         return get_nibble(self._flags, offset=0)
 
-    @error_code.setter
-    def error_code(self, val):
+    @resp_code.setter
+    def resp_code(self, val):
         if 0 <= val <= 15:
             self._flags = set_nibble(self._flags, val, offset=0)
         else:
-            raise ValueError("DNS error_code must be between 0 and 15.")
+            raise ValueError("DNS resp_code must be between 0 and 15.")
+
+    def pkt2net(self, kwargs):
+        """Used to export a DNS packet class instance in network order for
+        writing to a socket or into a pcap file.
+        """
+        update = kwargs.get('update', 0)
+        compress = kwargs.get('compress', 1)
+        if update:
+            self.query_count = len(self.queries)
+            self.answer_count = len(self.answers)
+            self.auth_count = len(self.authority)
+            self.ad_count = len(self.ad)
+
+        # Build header
+        res = struct.pack('!6H', self.ident, self._flags, self.query_count,
+                          self.answer_count, self.auth_count, self.ad_count)
+
+        labels = {}
+
+        def write_name(name, current_res):
+            if not name:
+                return b'\x00'
+
+            if not compress:
+                # write without compression
+                out = b''
+                for part in name.split('.'):
+                    if not part:
+                        continue
+                    b_part = part.encode()
+                    out += struct.pack('B', len(b_part)) + b_part
+                out += b'\x00'
+                return out
+
+            # with compression
+            parts = name.split('.')
+            if parts and parts[-1] == '':
+                parts.pop()
+
+            out = b''
+            for i in range(len(parts)):
+                suffix = '.'.join(parts[i:])
+                if suffix in labels:
+                    pointer = 0xc000 | labels[suffix]
+                    out += struct.pack('!H', pointer)
+                    return out
+
+                # Record offset of this suffix
+                offset = len(current_res) + len(out)
+                if offset < 0x4000:
+                    labels[suffix] = offset
+
+                b_part = parts[i].encode()
+                out += struct.pack('B', len(b_part)) + b_part
+
+            out += b'\x00'
+            return out
+
+        def write_resource(r, current_res):
+            out = write_name(r.domain_name, current_res)
+            out += struct.pack('!HHI', r.res_type, r.res_class, r.res_ttl)
+
+            rdata = b''
+            if r.res_type in (DNSTYPES.NS, DNSTYPES.CNAME, DNSTYPES.PTR):
+                rdata = write_name(r.res_data,
+                                   current_res + out + b'\x00\x00')
+            elif r.res_type == DNSTYPES.A:
+                rdata = socket.inet_pton(socket.AF_INET, r.res_data)
+            elif r.res_type == DNSTYPES.AAAA:
+                rdata = socket.inet_pton(socket.AF_INET6, r.res_data)
+            else:
+                if isinstance(r.res_data, str):
+                    rdata = r.res_data.encode()
+                else:
+                    rdata = r.res_data
+
+            if update:
+                r.res_len = len(rdata)
+
+            out += struct.pack('!H', r.res_len)
+            out += rdata
+            return out
+
+        for q in self.queries:
+            res += write_name(q.query_name, res)
+            res += struct.pack('!HH', q.query_type, q.query_class)
+
+        for r in self.answers:
+            res += write_resource(r, res)
+        for r in self.authority:
+            res += write_resource(r, res)
+        for r in self.ad:
+            res += write_resource(r, res)
+
+        return res

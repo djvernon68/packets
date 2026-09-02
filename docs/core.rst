@@ -1,14 +1,14 @@
-steelscript.packets.core.inetpkt API
-====================================
+packets.core.inetpkt API
+========================
 
-The inetpkt defines the basic set of steelscript.packets packet classes
+The inetpkt module defines the basic set of packets packet classes
 
-.. currentmodule:: steelscript.packets.core.inetpkt
+.. currentmodule:: packets.core.inetpkt
 
 
 :py:class:`PKT` Class
 ---------------------
-PKT serves as the base class for all steelscript packet classes. In addition
+PKT serves as the base class for all packet classes. In addition
 to the functions detailed below it also provides stub implementations of two
 class methods and an instance function required to support PcapQuery:
 
@@ -23,9 +23,19 @@ class methods and an instance function required to support PcapQuery:
 - Instance.get_field_val(field): Returns this packet's value for the field name
   passed in. Returned as an object. PKT class instances return None.
 
-In addition PKT supports pkt2net(**kwargs). Each PKT class subclass must
+In addition PKT supports pkt2net(kwargs). Each PKT class subclass must
 implement this method. It provides a way for PKT classes to write themselves in
 network order either to sockets or PCAP files.
+
+Note the calling convention: pkt2net takes one positional argument, a dict,
+not Python keyword arguments. Its keys are ``str``, and a layer passes the same
+dict down to the layers below it, so ``pkt.pkt2net({'csum': 1, 'update': 1})``
+recalculates checksums and lengths for the whole stack. It returns ``bytes``.
+The option names documented per class below are the keys of that dict.
+
+Query field names are also ``str``, both in the tuple returned by query_info()
+and in the argument to get_field_val(). They are registered and matched in
+full, so there is no limit on the length of a field name.
 
 .. autoclass:: PKT
    :members: __init__ get_layer get_layer_by_type from_buffer
@@ -33,7 +43,14 @@ network order either to sockets or PCAP files.
    .. automethod:: __init__(*args, dict l7_ports={}, **kwargs)
    .. automethod:: get_layer(name, instance=1, found=0)
    .. automethod:: get_layer_by_type(pq_type, instance=1, found=0)
-   .. automethod:: from_buffer(*args, **kwargs)
+   .. automethod:: from_buffer(args, kwargs)
+
+from_buffer(args, kwargs) takes the subclass's own ``args`` tuple and
+``kwargs`` dict and returns a two element tuple: a flag saying whether this
+instance is being built from packet data rather than from keyword arguments,
+and that data as an ``array('B')``. A subclass may be given either ``bytes`` or
+an ``array('B')``; from_buffer normalizes both to the array. Packet instances
+do not retain the buffer after ``__init__`` returns.
 
 
 :py:class:`Ethernet` Class
@@ -97,6 +114,51 @@ IP PcapQuery supported fields:
    - ip.src: returns IP.src
    - ip.dst: returns IP.dst
    - ip.checksum: returns IP.checksum
+
+
+:py:class:`IP6` Class
+---------------------
+RFC 8200 Internet Protocol version 6. The 40 byte fixed header::
+
+   +0                   1                   2                   3  +
+   +0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1+
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |Version| Traffic Class |               Flow Label              |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |         Payload Length        |  Next Header  |   Hop Limit   |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   |                        Source Address                         |
+   |                          (128 bits)                           |
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |                                                               |
+   |                     Destination Address                       |
+   |                          (128 bits)                           |
+   |                                                               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+IP6 is reachable everywhere IP is: directly under Ethernet, behind an 802.1Q
+VLAN tag, and at the bottom of an MPLS label stack.
+
+.. autoclass:: IP6
+   :members: __init__ query_info get_field_val pkt2net
+   :show-inheritance:
+
+   .. automethod:: __init__(*args, **kwargs)
+   .. automethod:: query_info
+   .. automethod:: get_field_val(field)
+   .. automethod:: pkt2net(csum=0, update=0)
+
+IP6 PcapQuery supported fields:
+   - ipv6.version: returns IP6.version
+   - ipv6.tclass: returns IP6.tclass
+   - ipv6.flow: returns IP6.flow
+   - ipv6.plen: returns IP6.plen
+   - ipv6.nxt: returns IP6.nxt
+   - ipv6.hlim: returns IP6.hlim
+   - ipv6.src: returns IP6.src
+   - ipv6.dst: returns IP6.dst
 
 
 :py:class:`ARP` Class
@@ -228,6 +290,200 @@ TCP PcapQuery supported fields:
    - tcp.payload.offset[x:y: returns TCP.payload bytes x to y as bytes
 
 
+:py:class:`ICMP` Class
+----------------------
+Implements RFC 792 Internet Control Message Protocol. Which fields carry
+meaning depends on the message type.
+
+.. autoclass:: ICMP
+   :members: __init__ query_info get_field_val pkt2net
+   :show-inheritance:
+
+   .. automethod:: __init__(*args, **kwargs)
+   .. automethod:: query_info
+   .. automethod:: get_field_val(field)
+   .. automethod:: pkt2net(**kwargs)
+
+ICMP PcapQuery supported fields:
+   - icmp.type
+   - icmp.code
+   - icmp.checksum
+   - icmp.ident
+   - icmp.seq
+   - icmp.mtu
+   - icmp.pointer
+   - icmp.redir_gw
+   - icmp.originate_timestamp
+   - icmp.receive_timestamp
+   - icmp.transmit_timestamp
+
+
+:py:class:`ICMP6` Class
+-----------------------
+Implements RFC 4443 ICMPv6, with the Neighbor Discovery messages of RFC 4861
+and the Multicast Listener Discovery messages of RFC 2710 and RFC 3810 parsed
+into named fields rather than kept as an opaque body.
+
+Which fields are populated depends on the message type:
+
+   - types 1-4 (Destination Unreachable, Packet Too Big, Time Exceeded,
+     Parameter Problem) carry the quoted packet, parsed and reachable as
+     ``hdr_pkt``. The quoted packet is never rewritten when the outer packet
+     is serialized with checksum or length updates.
+   - types 128 and 129 (Echo Request and Reply) carry identifier and
+     sequence number.
+   - types 130-132 and 143 (MLD Query, Report, Done, and MLDv2 Report) carry
+     the MLD fields; an MLDv2 Report carries a list of
+     :py:class:`MLDv2AddressRecord <MLDv2AddressRecord>`.
+   - types 133-137 (Router Solicitation and Advertisement, Neighbor
+     Solicitation and Advertisement, Redirect) carry the Neighbor Discovery
+     fields plus a list of :py:class:`ICMP6Opt <ICMP6Opt>` options.
+
+.. autoclass:: ICMP6
+   :members: __init__ query_info get_field_val pkt2net
+   :show-inheritance:
+
+   .. automethod:: __init__(*args, **kwargs)
+   .. automethod:: query_info
+   .. automethod:: get_field_val(field)
+   .. automethod:: pkt2net(**kwargs)
+
+ICMP6 PcapQuery supported fields:
+   - icmpv6.type
+   - icmpv6.code
+   - icmpv6.checksum
+   - icmpv6.echo.identifier
+   - icmpv6.echo.sequence_number
+   - icmpv6.mtu
+   - icmpv6.pointer
+   - icmpv6.nd.ra.cur_hop_limit
+   - icmpv6.nd.ra.flag.m
+   - icmpv6.nd.ra.flag.o
+   - icmpv6.nd.ra.router_lifetime
+   - icmpv6.nd.ra.reachable_time
+   - icmpv6.nd.ra.retrans_timer
+   - icmpv6.nd.ns.target_address
+   - icmpv6.nd.na.target_address
+   - icmpv6.nd.na.flag.r
+   - icmpv6.nd.na.flag.s
+   - icmpv6.nd.na.flag.o
+   - icmpv6.nd.rd.target_address
+   - icmpv6.nd.rd.destination_address
+   - icmpv6.mld.maximum_response_delay
+   - icmpv6.mld.multicast_address
+   - icmpv6.mld.flag.s
+   - icmpv6.mld.qrv
+   - icmpv6.mld.qqic
+   - icmpv6.mld.nb_sources
+   - icmpv6.mld.source_address
+   - icmpv6.mldr.nb_mcast_records
+
+
+:py:class:`ICMP6Opt` Class
+--------------------------
+A single Neighbor Discovery option, in the type/length/value form of RFC 4861
+section 4.6. The option value is kept verbatim, so an option this library does
+not interpret still round trips byte for byte. Accessors are provided for the
+link layer address, MTU and Prefix Information options.
+
+.. autoclass:: ICMP6Opt
+   :members: __init__ query_info get_field_val pkt2net
+   :show-inheritance:
+
+   .. automethod:: __init__(*args, **kwargs)
+   .. automethod:: query_info
+   .. automethod:: get_field_val(field)
+   .. automethod:: pkt2net(**kwargs)
+
+ICMP6Opt PcapQuery supported fields:
+   - icmpv6.opt.type
+   - icmpv6.opt.length
+   - icmpv6.opt.linkaddr
+   - icmpv6.opt.mtu
+   - icmpv6.opt.prefix.length
+   - icmpv6.opt.prefix.flag.l
+   - icmpv6.opt.prefix.flag.a
+   - icmpv6.opt.prefix.valid_lifetime
+   - icmpv6.opt.prefix.preferred_lifetime
+   - icmpv6.opt.prefix.prefix
+
+
+:py:class:`MLDv2AddressRecord` Class
+------------------------------------
+A single Multicast Address Record from an MLDv2 Report, RFC 3810 section 5.2.
+This is the IPv6 counterpart of :py:class:`IGMPGroupRecord <IGMPGroupRecord>`.
+
+NOTE: per RFC 3810 this class counts Aux Data Len in 32 bit words. The older
+IGMPGroupRecord treats the same field as a byte count.
+
+.. autoclass:: MLDv2AddressRecord
+   :members: __init__ query_info get_field_val pkt2net
+   :show-inheritance:
+
+   .. automethod:: __init__(*args, **kwargs)
+   .. automethod:: query_info
+   .. automethod:: get_field_val(field)
+   .. automethod:: pkt2net(**kwargs)
+
+MLDv2AddressRecord PcapQuery supported fields:
+   - icmpv6.mldr.mar.record_type
+   - icmpv6.mldr.mar.aux_data_len
+   - icmpv6.mldr.mar.nb_sources
+   - icmpv6.mldr.mar.multicast_address
+   - icmpv6.mldr.mar.source_address
+   - icmpv6.mldr.mar.auxiliary_data
+
+
+:py:class:`IGMP` Class
+----------------------
+Implements the Internet Group Management Protocol, versions 1 through 3.
+
+.. autoclass:: IGMP
+   :members: __init__ query_info get_field_val pkt2net
+   :show-inheritance:
+
+   .. automethod:: __init__(*args, **kwargs)
+   .. automethod:: query_info
+   .. automethod:: get_field_val(field)
+   .. automethod:: pkt2net(**kwargs)
+
+IGMP PcapQuery supported fields:
+   - igmp.version
+   - igmp.type
+   - igmp.max_resp
+   - igmp.checksum
+   - igmp.maddr
+   - igmp.saddr
+   - igmp.s
+   - igmp.qrv
+   - igmp.num_src
+   - igmp.num_grp_recs
+   - igmp.obj.saddr
+   - igmp.obj.grecs
+
+
+:py:class:`IGMPGroupRecord` Class
+---------------------------------
+A single Group Record from an IGMPv3 Membership Report.
+
+.. autoclass:: IGMPGroupRecord
+   :members: __init__ query_info get_field_val pkt2net
+   :show-inheritance:
+
+   .. automethod:: __init__(*args, **kwargs)
+   .. automethod:: query_info
+   .. automethod:: get_field_val(field)
+   .. automethod:: pkt2net(**kwargs)
+
+IGMPGroupRecord PcapQuery supported fields:
+   - igmpv3grouprecord.type
+   - igmpv3grouprecord.aux_data_len
+   - igmpv3grouprecord.num_src
+   - igmpv3grouprecord.group_address
+   - igmpv3grouprecord.source_addresses
+   - igmpv3grouprecord.aux_data
+
+
 :py:class:`MPLS` Class
 ----------------------
 .. autoclass:: MPLS
@@ -273,6 +529,15 @@ set to 1. There can be a number with bottom of stack bit set to 0
    :members:
 
    .. automethod:: __init__(src, dst, reserved, proto, payload_len)
+
+
+:py:class:`Ip6Ph` Class
+-----------------------
+The IPv6 pseudo header of RFC 8200, used when checksumming a layer 4 payload
+carried over IP6.
+
+.. autoclass:: Ip6Ph
+   :members:
 
 
 :py:class:`NetflowSimple` Class

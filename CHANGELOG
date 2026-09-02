@@ -1,6 +1,57 @@
 CHANGELOG
 ---------
 
+[2.1]
+ * **Expanded network protocol support and correctness.** Added IPv6 packets,
+   extension headers, MPLS dispatch, and query integration. ICMPv6 now covers
+   echo, errors, Neighbor Discovery, MLDv1/v2, option TLVs, and quoted packets,
+   preserving unknown or truncated data for round trips. Fixed malformed,
+   construction, serialization, and query behavior across ARP, Ethernet, IP,
+   ICMP, IGMPv2/v3, MPLS, TCP, UDP, address helpers, and packet headers.
+ * **Added and modernized Layer-7 protocols.** Added lossless DHCPv4/DHCPv6
+   packets and generic option TLVs, including relay messages, unknown values,
+   trailing bytes, transport dispatch, and query fields. Added HTTP/0.9 and
+   HTTP/1.x requests and responses with byte-oriented fields, ordered duplicate
+   headers, fixed/chunked/close-delimited bodies, trailers, and pipelined
+   remainder bytes. DNS parsing and writing were corrected, and the pure-Python
+   tutorial implementation works on Python 3 and rejects invalid compression
+   pointers instead of looping.
+ * **Reworked parsing, construction, and ownership.** Layers now parse bounded
+   ranges directly from immutable owner buffers, isolate mutable caller input,
+   keep detached children alive, and raise descriptive `ValueError` exceptions
+   for truncation instead of reading unchecked data. Parsed layers no longer
+   retain redundant raw-packet copies; common keyword constructors use typed
+   initializers; and default Layer-7 maps are lazy without shared mutable state.
+   Current decoded operations measure 2.23x to 3.26x faster than the pre-2.1
+   baseline, with further construction and Layer-7 gains from specialization.
+ * **Rebuilt serialization around a shared writer.** `pkt2net()` now streams
+   nested layers into one growable buffer and patches lengths, record sizes, and
+   checksums in place, preserving unchanged wire output while avoiding layer-by-
+   layer temporary objects. Representative packet serialization is about 2x to
+   5.5x faster, and DNS writing is about 2.2x to 3.3x faster. Update flags no
+   longer rewrite checksums or lengths inside quoted ICMPv6 packets.
+ * **Hardened and accelerated libpcap integration.** Capture handles and dumpers
+   are released on collection, stored names own their bytes, and `pcap_t` is
+   declared opaque. Open, read, filter, and send failures now reach callers;
+   `pcap_info()` handles empty files; blocking libpcap calls release the GIL;
+   and bounded dispatch/direct-decode paths reduce callbacks, copies, and
+   intermediate packet objects without exposing borrowed libpcap storage.
+ * **Corrected and specialized `PcapQuery`.** Fields are registered and matched
+   by complete name, TCP/UDP payload-offset slices work again, unsupported
+   fields are reported consistently, and live captures wait through timeouts
+   until an explicit stop condition. Common fields use compiled descriptors
+   while uncommon and custom fields retain dynamic fallback, improving repeated
+   representative queries by about 12% to 24%.
+ * **Made NetFlow tools and project documentation release-ready.** Replay now
+   rewrites the first packet consistently, validates short payloads, reports
+   send failures and empty selections, and avoids repeated per-packet setup.
+   `netflow-player` validates required files, devices, addresses, MACs, and
+   numeric ranges, honors supplied `argv`, and returns usage errors instead of
+   tracebacks. README, API references, and the tutorial now describe the
+   shipping `packets` namespace, libpcap build, constructors, constants,
+   readers/writers, queries, and supported protocols; the package version is
+   2.1 and the new compiled protocol modules are included in the build.
+
 [1.1.1]
  * Minor fixes for doc updates
 
@@ -14,4 +65,3 @@ CHANGELOG
 [1.0]
 
  * Initial commit
-

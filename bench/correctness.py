@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Correctness / golden harness for the packets library.
+
+Emits a deterministic JSON blob of parsed field values, checksums, and full
+serialized-hex round-trips for a corpus of packets. Run it against a known-good
+build to capture a baseline, then re-run after a change and diff the JSON. Any
+difference is a behavior change.
+
+Deliberately exercises checksum(): the corpus varies payload length across
+even/odd sizes so the odd-byte padding path is covered, for IP/UDP/TCP/ICMP.
+
+Usage:
+    python3 bench/correctness.py            # print JSON to stdout
+    python3 bench/correctness.py > base.json
+    python3 bench/correctness.py | diff base.json -
+"""
+import json
+import hashlib
+from array import array
+
+from packets.core.inetpkt import IP_CONST, Ethernet, ARP, IP, UDP, TCP, NullPkt
+from packets.protos.dns import DNS, DNSQuery, DNSResource, \
+    DNSTYPE_A, DNSTYPE_AAAA, DNSTYPE_CNAME, DNSTYPE_NS, DNSTYPE_PTR, \
+    DNSTYPE_SOA, DNSTYPE_TXT, RCLASS_IN
+
+C = IP_CONST()
+
+
+def build_udp(plen, sport, dport, src, dst):
+    payload = bytes((i & 0xff) for i in range(plen))
+    eth = Ethernet(dst_mac='03:02:03:04:05:06', src_mac='06:05:04:03:02:03')
+    eth.payload = IP(proto=C.PROTO_UDP, src=src, dst=dst,
+                     payload=UDP(sport=sport, dport=dport,
+                                 payload=NullPkt(payload)))
+    return eth
+
+
+def build_tcp(plen, sport, dport, src, dst):
+    payload = bytes((i & 0xff) for i in range(plen))
+    eth = Ethernet(dst_mac='05:02:03:04:05:06', src_mac='06:05:04:03:02:05')
+    eth.payload = IP(proto=C.PROTO_TCP, src=src, dst=dst,
+                     payload=TCP(sport=sport, dport=dport, sequence=200,
+                                 flag_syn=1, payload=NullPkt(payload)))
+    return eth
+
+
+def record_l3l4(name, eth):
+    """Serialize with checksum+update, reparse, and capture key values."""
+    wire = eth.pkt2net({'csum': 1, 'update': 1})
+    copy = Ethernet(wire)
+    ip = copy.get_layer('IP')
+    l4 = None
+    for cand in ('UDP', 'TCP'):
+        layer = copy.get_layer(cand)
+        if layer.pkt_name == cand:
+            l4 = layer
+            break
+    rec = {
+        'wire_len': len(wire),
+        'wire_sha1': hashlib.sha1(wire).hexdigest(),
+        'ip.src': ip.src,
+        'ip.dst': ip.dst,
+        'ip.proto': ip.proto,
+        'ip.total_len': ip.total_len,
+        'ip.checksum': ip.checksum,
+    }
+    if l4 is not None:
+        rec['l4.name'] = l4.pkt_name
+        rec['l4.sport'] = l4.sport
+        rec['l4.dport'] = l4.dport
+        rec['l4.checksum'] = l4.checksum
+    return name, rec
+
+
+def corpus():
+    out = {}
+    # Vary payload length across even/odd (odd-byte checksum padding path).
+    for plen in list(range(0, 34)) + [63, 64, 100, 511, 1400]:
+        n, r = record_l3l4('udp_%04d' % plen,
+                           build_udp(plen, 34567, 53, '10.1.2.3', '10.3.2.1'))
+        out[n] = r
+        n, r = record_l3l4('tcp_%04d' % plen,
+                           build_tcp(plen, 34567, 80, '10.1.2.5', '10.5.2.1'))
+        out[n] = r
+
+    # ICMP echo (fixed vector from the test suite).
+    icmp_echo = array('B', [0, 11, 134, 99, 252, 32, 8, 0, 39, 64, 45, 200, 8,
+                            0, 69, 0, 0, 28, 0, 0, 0, 0, 64, 1, 202, 227, 10,
+                            38, 25, 153, 10, 38, 130, 25, 8, 0, 61, 86, 15,
+                            255, 170, 170])
+    e = Ethernet(icmp_echo)
+    icmp = e.get_layer_by_type(C.PQ_ICMP)
+    out['icmp_echo'] = {
+        'type': icmp.type, 'identifier': icmp.identifier,
+        'sequence': icmp.sequence, 'checksum': icmp.checksum,
+        'reserialize_sha1': hashlib.sha1(e.pkt2net({})).hexdigest(),
+    }
+
+    # ARP round-trip.
+    arp_eth = Ethernet(dst_mac='ff:ff:ff:ff:ff:ff', src_mac='06:05:04:03:02:02')
+    arp_eth.type = C.ETH_TYPE_ARP
+    arp_eth.payload = ARP(sender_hw_addr='06:05:04:03:02:02',
+                          sender_proto_addr='1.2.3.4',
+                          target_hw_addr='00:00:00:00:00:00',
+                          target_proto_addr='4.3.2.1')
+    arp_wire = arp_eth.pkt2net({})
+    a = Ethernet(arp_wire).get_layer('ARP')
+    out['arp'] = {
+        'wire_sha1': hashlib.sha1(arp_wire).hexdigest(),
+        'sender_hw': a.sender_hw_addr, 'sender_proto': a.sender_proto_addr,
+        'target_hw': a.target_hw_addr, 'target_proto': a.target_proto_addr,
+    }
+
+    out.update(dns_corpus())
+    return out
+
+
+def make_dns_answers():
+    """One DNS response per resource type the writer branches on.
+
+    Names are chosen so later ones are suffixes of earlier ones -- that is the
+    only thing that makes a compression pointer appear, and a pointer with the
+    wrong offset is the failure mode this whole section exists to catch.
+    """
+    dns = DNS()
+    dns.ident = 0x1234
+    dns.query_resp = 1
+    dns.recursion_available = 1
+    dns.queries.append(DNSQuery('www.example.com', DNSTYPE_A, RCLASS_IN))
+    dns.answers.append(DNSResource('www.example.com', DNSTYPE_CNAME,
+                                   RCLASS_IN, 300, 0, 'host.example.com'))
+    dns.answers.append(DNSResource('host.example.com', DNSTYPE_A,
+                                   RCLASS_IN, 300, 4, '10.1.2.3'))
+    dns.answers.append(DNSResource('host.example.com', DNSTYPE_AAAA,
+                                   RCLASS_IN, 300, 16, 'fc00::1'))
+    dns.answers.append(DNSResource('txt.example.com', DNSTYPE_TXT,
+                                   RCLASS_IN, 300, 0, 'v=spf1 -all'))
+    dns.authority.append(DNSResource('example.com', DNSTYPE_NS,
+                                     RCLASS_IN, 300, 0, 'ns1.example.com'))
+    dns.authority.append(DNSResource('3.2.1.10.in-addr.arpa', DNSTYPE_PTR,
+                                     RCLASS_IN, 300, 0, 'host.example.com'))
+    return dns
+
+
+def make_dns_soa():
+    """An SOA answer on its own: two names plus five 32 bit words, and the
+    only record whose resource data is reassembled from a printable string.
+    """
+    dns = DNS()
+    dns.ident = 0x4321
+    dns.query_resp = 1
+    dns.queries.append(DNSQuery('example.com', DNSTYPE_SOA, RCLASS_IN))
+    dns.answers.append(DNSResource(
+        'example.com', DNSTYPE_SOA, RCLASS_IN, 300, 0,
+        'SOA mname: ns1.example.com, rname: root@example.com, serial: 2018,'
+        ' refresh: 7200, retry: 600, expire: 86400, minimum: 300'))
+    return dns
+
+
+def record_dns(name, dns, kwargs, out, reparse=True):
+    """Serialize a DNS message, reparse it, and capture the bytes and the
+    fields the reader recovered from them.
+
+    reparse is off for the update=0 case: that writes the rdlength values the
+    caller set rather than the real ones, so the reader cannot be expected to
+    walk the result. The bytes are still worth locking down.
+    """
+    wire = dns.pkt2net(dict(kwargs))
+    if not reparse:
+        out[name] = {'wire_len': len(wire), 'wire_hex': wire.hex()}
+        return
+    back = DNS(wire)
+    out[name] = {
+        'wire_len': len(wire),
+        'wire_hex': wire.hex(),
+        'ident': back.ident,
+        'query_count': back.query_count,
+        'answer_count': back.answer_count,
+        'auth_count': back.auth_count,
+        'queries': [(q.query_name, q.query_type, q.query_class)
+                    for q in back.queries],
+        'answers': [(r.domain_name, r.res_type, r.res_class, r.res_ttl,
+                     r.res_len, r.res_data) for r in back.answers],
+        'authority': [(r.domain_name, r.res_type, r.res_class, r.res_ttl,
+                       r.res_len, r.res_data) for r in back.authority],
+    }
+
+
+def dns_corpus():
+    """DNS write path coverage.
+
+    The harness had none, which meant the golden diff -- the check the
+    serialize-writer work leans on -- could not see a DNS change at all.
+    Both compression settings are captured, and the last case carries the
+    message inside a full Ethernet/IP/UDP frame: nested in a frame the DNS
+    message no longer starts at offset zero of the output buffer, so a
+    compression pointer measured from the wrong origin shows up only there.
+    """
+    out = {}
+    record_dns('dns_answers_compressed', make_dns_answers(),
+               {'update': 1, 'compress': 1}, out)
+    record_dns('dns_answers_uncompressed', make_dns_answers(),
+               {'update': 1, 'compress': 0}, out)
+    record_dns('dns_answers_noupdate', make_dns_answers(),
+               {'compress': 1}, out, reparse=False)
+    record_dns('dns_soa_compressed', make_dns_soa(),
+               {'update': 1, 'compress': 1}, out)
+    record_dns('dns_soa_uncompressed', make_dns_soa(),
+               {'update': 1, 'compress': 0}, out)
+    record_dns('dns_root_name', root_name_dns(),
+               {'update': 1, 'compress': 1}, out)
+
+    for label, plen in (('dns_in_frame', 0), ('dns_in_frame_odd', 1)):
+        eth = Ethernet(dst_mac='03:02:03:04:05:06',
+                       src_mac='06:05:04:03:02:03')
+        eth.payload = IP(proto=C.PROTO_UDP, src='10.1.2.3', dst='10.3.2.1',
+                         payload=UDP(sport=34567 + plen, dport=53,
+                                     payload=make_dns_answers()))
+        wire = eth.pkt2net({'csum': 1, 'update': 1, 'compress': 1})
+        # DNS is not auto-registered on port 53; the caller supplies the
+        # layer 7 map, exactly as the test suite and pcap_query do.
+        copy = Ethernet(wire, l7_ports={53: DNS})
+        back = copy.get_layer('DNS')
+        out[label] = {
+            'wire_len': len(wire),
+            'wire_sha1': hashlib.sha1(wire).hexdigest(),
+            'udp.checksum': copy.get_layer('UDP').checksum,
+            'dns.ident': back.ident,
+            'dns.answers': [(r.domain_name, r.res_type, r.res_len, r.res_data)
+                            for r in back.answers],
+            'dns.authority': [(r.domain_name, r.res_type, r.res_len,
+                               r.res_data) for r in back.authority],
+        }
+    return out
+
+
+def root_name_dns():
+    """A record whose owner is the root zone: the empty name, written as a
+    lone zero length label. Its own branch in the name writer, and only
+    reachable through DNSResource -- DNSQuery rejects an empty query name.
+    """
+    dns = DNS()
+    dns.ident = 0x0001
+    dns.query_resp = 1
+    dns.answers.append(DNSResource('', DNSTYPE_NS, RCLASS_IN, 300, 0,
+                                   'ns1.example.com'))
+    return dns
+
+
+if __name__ == '__main__':
+    print(json.dumps(corpus(), indent=2, sort_keys=True))

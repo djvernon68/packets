@@ -6,33 +6,79 @@
 # accompanying the software ("License").  This software is distributed "AS IS"
 # as set forth in the License.
 
-from libc.stdlib cimport malloc, free
-from posix.time cimport clock_gettime, timespec, CLOCK_REALTIME
 from libc.stdint cimport uint16_t
 
 from threading import Event
 import re
 import os
+import time
 
 from packets.core.inetpkt cimport PKT, Ethernet, IP, TCP, ICMP, \
-    IGMP, UDP, ARP, MPLS, NullPkt, PQ_FRAME, PQ_TCP, PQ_UDP
+    IGMP, UDP, ARP, MPLS, NullPkt, IP6, ICMP6, PQ_FRAME, PQ_TCP, PQ_UDP
 from packets.core.pcap cimport PCAPSocket, PCAPReader, \
     pcap_pkthdr_t, findalldevs
 
 # Regex to determine if the field matches a payload offset pattern.
 offset_re = re.compile(r'^(udp|tcp)\.payload\.offset\[(\d*):(\d*)\]$')
 NOT_FOUND = -1
-
 ERRBUF_SIZE = 256
+
+cdef enum:
+    FIELD_DYNAMIC = 0
+    FIELD_FRAME_TIME = 1
+    FIELD_FRAME_LEN = 2
+    FIELD_FRAME_CAPLEN = 3
+    FIELD_ETH_SRC = 4
+    FIELD_ETH_DST = 5
+    FIELD_ETH_TYPE = 6
+    FIELD_IP_SRC = 7
+    FIELD_IP_DST = 8
+    FIELD_IP_VERSION = 9
+    FIELD_IP_HDR_LEN = 10
+    FIELD_IP_LEN = 11
+    FIELD_IP_TTL = 12
+    FIELD_UDP_SRCPORT = 13
+    FIELD_UDP_DSTPORT = 14
+    FIELD_UDP_LENGTH = 15
+    FIELD_UDP_CHECKSUM = 16
+
+known_fields = {
+    'frame.time_epoch': FIELD_FRAME_TIME,
+    'frame.len': FIELD_FRAME_LEN,
+    'frame.caplen': FIELD_FRAME_CAPLEN,
+    'eth.src': FIELD_ETH_SRC,
+    'eth.dst': FIELD_ETH_DST,
+    'eth.type': FIELD_ETH_TYPE,
+    'ip.src': FIELD_IP_SRC,
+    'ip.dst': FIELD_IP_DST,
+    'ip.version': FIELD_IP_VERSION,
+    'ip.hdr_len': FIELD_IP_HDR_LEN,
+    'ip.len': FIELD_IP_LEN,
+    'ip.ttl': FIELD_IP_TTL,
+    'udp.srcport': FIELD_UDP_SRCPORT,
+    'udp.dstport': FIELD_UDP_DSTPORT,
+    'udp.length': FIELD_UDP_LENGTH,
+    'udp.checksum': FIELD_UDP_CHECKSUM,
+}
+DEF ERRBUF_SZ = 256
+# Length of the two payload offset field prefixes below. Those are the only
+# field names whose full text is not known up front -- 'tcp.payload.offset'
+# is followed by an [x:y] slice -- so they are the only ones matched on a
+# prefix. Every other name is looked up whole: matching all of them on their
+# first 18 characters used to be enough only by luck, and silently mapped a
+# long name onto whichever layer had registered the same prefix first.
 PLOAD_F_LEN = 18
+PLOAD_FIELDS = ('tcp.payload.offset', 'udp.payload.offset')
+# TCP and UDP register the offset field under its advertised placeholder
+# name, which is what show_fields() lists and what the docs quote.
+PLOAD_SUFFIX = '[x:y]'
 
 cdef bint valid_dev(str dev):
     cdef:
         int fad_rval
         list devices = list()
-        char * errors = <char *> malloc(ERRBUF_SIZE * sizeof(char))
+        char errors[ERRBUF_SZ]
     fad_rval = findalldevs(devices, errors)
-    free(errors)
     if not fad_rval and dev.encode('utf-8') in devices:
         return 1
     return 0
@@ -47,7 +93,7 @@ cdef bint valid_file(str file):
             return 0
         else:
             return 1
-    except:
+    except (TypeError, ValueError, OSError):
         return 0
 
 
@@ -78,9 +124,74 @@ cdef class Frame:
 
 def get_field_val_f(int layer_index, str field_name):
     def f(list layers_list):
-        func = getattr(layers_list[layer_index], 'get_field_val')
-        return func(field_name)
+        return layers_list[layer_index].get_field_val(field_name)
     return f
+
+
+cdef class _FieldDescriptor:
+    def __cinit__(self, int layer_index, str field_name):
+        self.layer_index = layer_index
+        self.field_name = field_name
+        self.field_id = known_fields.get(field_name, FIELD_DYNAMIC)
+
+
+cdef inline object _descriptor_value(_FieldDescriptor descriptor,
+                                     list layers):
+    cdef:
+        object layer = layers[descriptor.layer_index]
+        unsigned char field_id = descriptor.field_id
+
+    if isinstance(layer, Frame):
+        if field_id == FIELD_FRAME_TIME:
+            return (<Frame>layer).ts
+        elif field_id == FIELD_FRAME_LEN:
+            return (<Frame>layer).hdr.len
+        elif field_id == FIELD_FRAME_CAPLEN:
+            return (<Frame>layer).hdr.caplen
+    elif isinstance(layer, Ethernet):
+        if field_id == FIELD_ETH_SRC or field_id == FIELD_ETH_DST:
+            return (<Ethernet>layer).get_field_val(descriptor.field_name)
+        elif field_id == FIELD_ETH_TYPE:
+            return (<Ethernet>layer).type
+    elif isinstance(layer, IP):
+        if field_id == FIELD_IP_SRC or field_id == FIELD_IP_DST:
+            return (<IP>layer).get_field_val(descriptor.field_name)
+        elif field_id == FIELD_IP_VERSION:
+            return (<IP>layer)._version_iphl >> 4
+        elif field_id == FIELD_IP_HDR_LEN:
+            return (<IP>layer)._version_iphl & 0x0f
+        elif field_id == FIELD_IP_LEN:
+            return (<IP>layer).total_len
+        elif field_id == FIELD_IP_TTL:
+            return (<IP>layer).ttl
+    elif isinstance(layer, UDP):
+        if field_id == FIELD_UDP_SRCPORT:
+            return (<UDP>layer).sport
+        elif field_id == FIELD_UDP_DSTPORT:
+            return (<UDP>layer).dport
+        elif field_id == FIELD_UDP_LENGTH:
+            return (<UDP>layer).ulen
+        elif field_id == FIELD_UDP_CHECKSUM:
+            return (<UDP>layer).checksum
+    if isinstance(layer, PKT):
+        return (<PKT>layer).get_field_val(descriptor.field_name)
+    return layer.get_field_val(descriptor.field_name)
+
+
+cdef str field_key(str field_name):
+    """Map a requested field name onto the key its layer registered under.
+
+    Only the payload offset fields need any mapping: a caller asks for
+    'tcp.payload.offset[0:4]', but TCP registers the field once, under the
+    placeholder name 'tcp.payload.offset[x:y]'. Everything else is its own
+    key.
+
+    :param field_name: the field name a caller asked for.
+    :return: the key to look up in PcapQuery.fields.
+    """
+    if field_name[:PLOAD_F_LEN] in PLOAD_FIELDS:
+        return field_name[:PLOAD_F_LEN] + PLOAD_SUFFIX
+    return field_name
 
 
 cdef class PcapQuery:
@@ -105,7 +216,7 @@ cdef class PcapQuery:
             :pkt_classes (list): A list of additional packet classes to be
                 used.  Each class must have a class function query_info() that
                 returns a tuple of packet type and a tuple of supported field
-                names. See the steelsript.packets tutorial for implementation
+                names. See the packets tutorial for implementation
                 details.
             :l7_ports (dict): A dictionary containing a map of port numbers
                 (the keys) and packet classes (the values) to be used by layer
@@ -176,13 +287,14 @@ cdef class PcapQuery:
 
         self.layer_order = list()
         self.field_functions = list()
+        self.field_descriptors = list()
         self.fields = dict()
         self.l7_ports = dict()
         self.wshark_fields = kwargs.get('wshark_fields', list())
 
 
-        default_classes = [Frame, Ethernet, IP, ICMP, IGMP, TCP, UDP, ARP,
-                           MPLS]
+        default_classes = [Frame, Ethernet, IP, IP6, ICMP, ICMP6, IGMP, TCP,
+                           UDP, ARP, MPLS]
         if ('pkt_classes' in kwargs and
                 isinstance(kwargs['pkt_classes'], list)):
             default_classes.extend(kwargs['pkt_classes'])
@@ -190,23 +302,36 @@ cdef class PcapQuery:
         for pkt_class in default_classes:
             ptype, pfields = pkt_class.query_info()
             for pfield in pfields:
-                self.fields[pfield[:PLOAD_F_LEN]] = ptype
+                self.fields[pfield] = ptype
             for port in pkt_class.default_ports():
                 self.l7_ports[port] = pkt_class
         self.l7_ports.update(kwargs.get('l7_ports', dict()))
 
         if not self.fields_supported(self.wshark_fields):
-            raise ValueError("2This PcapQuery object does not support the "
+            raise ValueError("This PcapQuery object does not support the "
                              "following wshark_fields list: {0} {1}"
                              "".format(self.wshark_fields, self.fields))
 
         for pfield in self.wshark_fields:
-            ptype = self.fields[pfield[:PLOAD_F_LEN]]
+            ptype = self.fields[field_key(pfield)]
             if ptype not in self.layer_order:
                 self.layer_order.append(ptype)
             self.field_functions.append(get_field_val_f(
                 self.layer_order.index(ptype), pfield))
+            self.field_descriptors.append(_FieldDescriptor(
+                self.layer_order.index(ptype), pfield))
         self.stop_event = kwargs.get('stop_event', Event())
+
+    cdef tuple _extract_row(self, list layers):
+        cdef:
+            Py_ssize_t i, count = len(self.field_descriptors)
+            _FieldDescriptor descriptor
+            list values = [None] * count
+
+        for i in range(count):
+            descriptor = self.field_descriptors[i]
+            values[i] = _descriptor_value(descriptor, layers)
+        return tuple(values)
 
     cpdef dict show_fields(self):
         return self.fields
@@ -214,11 +339,8 @@ cdef class PcapQuery:
     cpdef bint fields_supported(self, list field_names):
         """Helper function that checks a list of field names to see if THIS
         instance of PcapQuery can service all of the fields. Used, for example,
-        by steelscript.wireshark.pcap.PcapFile.query(). Determines if PcapQuery
-        instance will be able to perform a particular query. If 
-        fields_supported returns 0 then 
-        steelscript.wireshark.pcap.PcapFile.query() will fall back on using
-        tshark with its larger set of supported fields.
+        by a wrapper that falls back on tshark, with its larger set of
+        supported fields, when this returns 0.
 
         Args:
             :field_names (list): Field names to be used by a follow up query.
@@ -235,16 +357,17 @@ cdef class PcapQuery:
         field_failed = 0
         for this_field in field_names:
             found = 0
-            if this_field[:PLOAD_F_LEN] in ('tcp.payload.offset',
-                                            'udp.payload.offset'):
+            if (this_field not in self.fields and
+                    this_field[:PLOAD_F_LEN] in PLOAD_FIELDS):
                 groups = offset_re.match(this_field)
                 if groups:
                     if int(groups.groups()[1]) < int(groups.groups()[2]):
                         found = 1
                     else:
-                        print("tcp|udp.payload.offset[x:y] x >= y!!")
-                        print("{0}:{1}".format(int(groups.groups()[1]),
-                                               int(groups.groups()[2])))
+                        # An unsupported field, reported the same way as any
+                        # other. This used to print to stdout and then fall
+                        # through to the same result.
+                        found = 0
             elif this_field in self.fields:
                 found = 1
 
@@ -262,23 +385,34 @@ cdef class PcapQuery:
         cdef:
             PKT spkt
             bytes pkt
-            timespec ts1, ts2
-            double comp_ts1, comp_ts2
             uint16_t pq_type
-            pcap_pkthdr_t hdr
+            tuple row
+            object ts, hdr
             list layers
-        pkt = b''
-        layers = list()
-        if not self.stop_event.is_set():
-            ts, hdr, pkt = next(self.reader)
-            if pkt:
-                spkt = Ethernet(pkt, l7_ports=self.l7_ports)
-                for pq_type in self.layer_order:
-                    if pq_type == PQ_FRAME:
-                        layers.append(Frame(ts, hdr))
-                    else:
-                        layers.append(spkt.get_layer_by_type(pq_type))
-                return tuple(x(layers) for x in self.field_functions)
+
+        # The row is unpacked untyped. PCAPSocket reports a read timeout as
+        # (0, None, None), and binding that None to a pcap_pkthdr_t local
+        # raised a TypeError before the packet could even be tested for.
+        while not self.stop_event.is_set():
+            row = next(self.reader)
+            ts = row[0]
+            hdr = row[1]
+            pkt = row[2]
+            if not pkt:
+                if self.use_device:
+                    # A quiet interval on the wire is not the end of the
+                    # capture. Wait for the next read. A file reader raises
+                    # StopIteration at EOF and never arrives here.
+                    continue
+                break
+            layers = list()
+            spkt = Ethernet(pkt, l7_ports=self.l7_ports)
+            for pq_type in self.layer_order:
+                if pq_type == PQ_FRAME:
+                    layers.append(Frame(ts, hdr))
+                else:
+                    layers.append(spkt.get_layer_by_type(pq_type))
+            return self._extract_row(layers)
         raise StopIteration()
 
     def query(self,
@@ -317,8 +451,8 @@ cdef class PcapQuery:
             bytes pkt
             double ts
             uint16_t pq_type
-            pcap_pkthdr_t hdr
-            tuple row
+            tuple row, src_row
+            object hdr
             list layers, data
         if num_packets:
             count_packets = 1
@@ -337,8 +471,21 @@ cdef class PcapQuery:
         no_result = len(self.field_functions)
         layers = list()
         data = list()
-        for ts, hdr, pkt in self.reader:
+        # As in __next__, the row is unpacked untyped so that a live read
+        # timeout, (0, None, None), does not fail the unpack itself.
+        for src_row in self.reader:
+            ts = src_row[0]
+            hdr = src_row[1]
+            pkt = src_row[2]
             if not pkt:
+                if self.use_device and not self.stop_event.is_set():
+                    # Live read timeout. Keep waiting; the caller's endtime,
+                    # num_packets or stop_event ends the query.
+                    if et and time.time() > endtime:
+                        break
+                    elif count_packets and pkts > num_packets:
+                        break
+                    continue
                 break
             else:
                 if st and ts < starttime:
@@ -357,7 +504,7 @@ cdef class PcapQuery:
                             layers.append(Frame(ts, hdr))
                         else:
                             layers.append(spkt.get_layer_by_type(pq_type))
-                    row = tuple(x(layers) for x in self.field_functions)
+                    row = self._extract_row(layers)
                     if row.count(None) != no_result:
                         data.append(row)
                         pkts += 1

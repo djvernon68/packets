@@ -31,7 +31,7 @@ scripts = {'console_scripts': [
 
 setup_args = {
     'name':                'packets',
-    'version':             '2.0.4',
+    'version':             '2.1',
 
     # Update the following as needed
     'author':              'David Vernon',
@@ -76,6 +76,14 @@ setup_args = {
                                      "binding": True}),
         Extension("packets.protos.dns",
                   sources=["packets/protos/dns.pyx"],
+                  cython_directives={"embedsignature": True,
+                                     "binding": True}),
+        Extension("packets.protos.dhcp",
+                  sources=["packets/protos/dhcp.pyx"],
+                  cython_directives={"embedsignature": True,
+                                     "binding": True}),
+        Extension("packets.protos.http",
+                  sources=["packets/protos/http.pyx"],
                   cython_directives={"embedsignature": True,
                                      "binding": True}),
     ],

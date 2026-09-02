@@ -159,6 +159,15 @@ cdef extern from "<pcap.h>" nogil:
     ctypedef pcap_if pcap_if_t
     ctypedef pcap_addr pcap_addr_t
 
+    struct pcap_pkthdr:
+        timeval ts
+        bpf_u_int32 caplen
+        bpf_u_int32 len
+
+    ctypedef void (*pcap_handler)(u_char *,
+                                  const pcap_pkthdr *,
+                                  const u_char *)
+
     char *pcap_lookupdev(char *)
     int pcap_lookupnet(const char *, bpf_u_int32 *, bpf_u_int32 *, char *)
     pcap_t *pcap_create(const char *, char *)
@@ -203,6 +212,7 @@ cdef extern from "<pcap.h>" nogil:
     int pcap_is_swapped(pcap_t *)
     int pcap_major_version(pcap_t *)
     int pcap_minor_version(pcap_t *)
+    char *pcap_geterr(pcap_t *)
 
     FILE *pcap_file(pcap_t *)
     int pcap_fileno(pcap_t *)
@@ -230,107 +240,14 @@ cdef extern from "<pcap.h>" nogil:
     void pcap_dump_close(pcap_dumper_t *);
     void pcap_dump(u_char *, const pcap_pkthdr *, const u_char *);
 
-    ctypedef int (*activate_op_t)(pcap_t *)
-    ctypedef int (*can_set_rfmon_op_t)(pcap_t *)
-    ctypedef int (*read_op_t)(pcap_t *, int cnt, pcap_handler, u_char *)
-    ctypedef int (*next_packet_op_t)(pcap_t *, pcap_pkthdr *, u_char **)
-    ctypedef int (*inject_op_t)(pcap_t *, const void *, int)
-    ctypedef void (*save_current_filter_op_t)(pcap_t *, const char *)
-    ctypedef int (*setfilter_op_t)(pcap_t *, bpf_program *)
-    ctypedef int (*setdirection_op_t)(pcap_t *, pcap_direction_t)
-    ctypedef int (*set_datalink_op_t)(pcap_t *, int)
-    ctypedef int (*getnonblock_op_t)(pcap_t *)
-    ctypedef int (*setnonblock_op_t)(pcap_t *, int)
-    ctypedef int (*stats_op_t)(pcap_t *, pcap_stat *)
-    ctypedef void (*breakloop_op_t)(pcap_t *)
-    ctypedef void (*pcap_handler)(u_char *,
-                                  const pcap_pkthdr *,
-                                  const u_char *)
-    ctypedef void (*cleanup_op_t)(pcap_t *)
-
-    IF UNAME_SYSNAME == "Linux":
-        struct pcap_opt:
-            char *device
-            int timeout
-            u_int buffer_size;
-            int promisc
-            int rfmon
-            int immediate
-            int nonblock
-            int tstamp_type
-            int tstamp_precision
-            int protocol
-    ELIF UNAME_SYSNAME == "Darwin":
-        struct pcap_opt:
-            char *device
-            int timeout
-            u_int buffer_size;
-            int promisc
-            int rfmon
-            int immediate
-            int nonblock
-            int tstamp_type
-            int tstamp_precision
-
     struct pcap_dumper
 
-    struct pcap_pkthdr:
-        timeval ts
-        bpf_u_int32 caplen
-        bpf_u_int32 len
-
-    struct pcap:
-        read_op_t read_op
-        next_packet_op_t next_packet_op
-        int fd
-        u_int bufsize
-        void *buffer
-        u_char *bp
-        int cc
-        sig_atomic_t break_loop
-        # Not doing pcap_samp rmt_samp
-        int swapped
-        FILE *rfile
-        u_int fddipad
-        pcap *next
-        int version_major
-        int version_minor
-        int snapshot
-        int linktype
-        int linktype_ext
-        int offset
-        int activated
-        int oldstyle
-        pcap_opt opt
-        u_char *pkt
-        pcap_direction_t direction
-        int bpf_codegen_flags
-        int selectable_fd
-        timeval *required_select_timeout
-        bpf_program fcode
-        char errbuf[BUFFSIZE + 1]
-        int dlt_count
-        u_int *dlt_list
-        int tstamp_type_count
-        u_int *tstamp_type_list
-        int tstamp_precision_count
-        u_int *tstamp_precision_list
-        pcap_pkthdr pcap_header
-        #More methods.
-        activate_op_t activate_op
-        can_set_rfmon_op_t can_set_rfmon_op
-        inject_op_t inject_op
-        save_current_filter_op_t save_current_filter_op;
-        setfilter_op_t setfilter_op;
-        setdirection_op_t setdirection_op;
-        set_datalink_op_t set_datalink_op;
-        getnonblock_op_t getnonblock_op;
-        setnonblock_op_t setnonblock_op;
-        stats_op_t stats_op;
-        breakloop_op_t breakloop_op;
-        # Routine to use as callback for pcap_next()/pcap_next_ex().
-        pcap_handler oneshot_callback
-        cleanup_op_t cleanup_op
+    # pcap_t is opaque. This used to carry a hand copy of libpcap's private
+    # struct, guarded by a per-OS IF - deprecated in Cython 3 - because the
+    # layout differs between platforms and between libpcap releases. Nothing
+    # here dereferences it, so declaring it opaque removes both the warning
+    # and the dependency on a layout we do not control.
+    struct pcap
 
     struct pcap_file_header:
         bpf_u_int32 magic
@@ -429,17 +346,22 @@ cdef class PCAPBase:
                         bytes data,
                         uint32_t tv_sec=*,
                         uint32_t tv_usec=*)
+    # except -1: a bad filter raises. Without the except clause a cdef int
+    # function cannot propagate, and Cython 0.28 merely prints the exception
+    # and returns, leaving the caller reading everything on the source.
     cdef int _add_bpf_filter(self,
                              str bpf_filter,
                              pcap_t * sock,
-                             bpf_u_int32 mask)
-    cpdef int add_bpf_filter(self, str bpf_filter)
+                             bpf_u_int32 mask) except -1
+    cpdef int add_bpf_filter(self, str bpf_filter) except -1
 
 
 cdef class PCAPSocket(PCAPBase):
     cdef:
         public object stop_event
-        const char * devicename
+        # owns the encoded device name; a bare char* here dangled once
+        # __init__ returned and its local bytes object was collected.
+        bytes devicename
         pcap_t * sock
         bpf_u_int32 net
         bpf_u_int32 mask
@@ -449,22 +371,24 @@ cdef class PCAPSocket(PCAPBase):
     cpdef int set_timeout(self, int timeout)
     cpdef int getnonblock(self)
     cpdef int setnonblock(self, int nonblock)
-    cpdef int sendpacket(self, bytes pktdata)
-    cpdef int add_bpf_filter(self, str bpf_filter)
+    # except -1: as add_bpf_filter, a failed send must reach the caller.
+    cpdef int sendpacket(self, bytes pktdata) except -1
+    cpdef int add_bpf_filter(self, str bpf_filter) except -1
     cpdef int open_pcap_dumper(self, str file_name)
     cpdef void close(self)
 
 
 cdef class PCAPReader(PCAPBase):
     cdef:
-        const char * filename
+        # owns the encoded file name; see the note on PCAPSocket.devicename.
+        bytes filename
         pcap_t * reader
 
 
     cpdef list pkts(self)
     cpdef void close(self)
     cpdef int open_pcap_dumper(self, str file_name)
-    cpdef int add_bpf_filter(self, str bpf_filter)
+    cpdef int add_bpf_filter(self, str bpf_filter) except -1
 
 
 cdef class PCAPWriter(PCAPBase):
@@ -491,7 +415,7 @@ cpdef int netflow_replay_raw_sock(str device,
                                   unsigned char new_type=*,
                                   str src_ip=*,
                                   str src_mac=*,
-                                  unsigned char blast_mode=*)
+                                  unsigned char blast_mode=*) except -1
 
 cpdef int netflow_replay_system_sock(str pcap_file,
                                      uint16_t pcap_dst_port,
@@ -499,4 +423,4 @@ cpdef int netflow_replay_system_sock(str pcap_file,
                                      uint16_t dest_port,
                                      uint16_t new_version=*,
                                      unsigned char new_type=*,
-                                     unsigned char blast_mode=*)
+                                     unsigned char blast_mode=*) except -1

@@ -1,42 +1,46 @@
-Riverbed SteelScript Packets
-=================================================
+Packets
+=======
 
 This package provides Cython extensions for python to assist in parsing
 PCAP and PCAPNG files. It also includes a library of basic internet packet
-types including Ethernet, IP, TCP, UDP, ARP, and others.
+types including Ethernet, IP, IPv6, TCP, UDP, ICMP, ICMPv6, IGMP, ARP, MPLS,
+and others.
 
-For a complete guide to installation, see:
-
-  `https://support.riverbed.com/apis/steelscript/index.html <https://support.riverbed.com/apis/steelscript/index.html>`_
+This package began as a fork of Riverbed's SteelScript Packets. It no longer
+lives in the ``steelscript`` namespace and does not depend on SteelScript: the
+import path is ``packets``, for example
+``from packets.core.inetpkt import Ethernet``.
 
 License
 =======
 
 Copyright (c) 2019 Riverbed Technology, Inc.
 
-SteelScript-Packets is licensed under the terms and conditions of the MIT
-License accompanying the software ("License").  SteelScript-Packets is
-distributed "AS IS" as set forth in the License.
+Packets is licensed under the terms and conditions of the MIT License
+accompanying the software ("License").  Packets is distributed "AS IS" as set
+forth in the License.
 
-Install steelscript.packets:
-============================
+Install packets:
+================
 
-These installation instructions assume you already have a functioning python 3.6 or 3.7 environment on your machine.
+These installation instructions assume you already have a functioning python 3
+environment on your machine.
 
 Requirements:
 
-1. Python3.6-3.7
+1. Python 3.6 or later
 2. Development tools for your OS
-3. steelscript
-4. Cython
-5. libpcap headers. See note below on installing libpcap on MacOS and Linux.
+3. Cython
+4. libpcap headers. See note below on installing libpcap on MacOS and Linux.
 
 Steps:
 
 1. Install development tools and libpcap as shown below.
 2. $ pip install Cython
-3. $ pip install steelscript
-4. $ pip install steelscript.packets
+3. $ pip install .
+
+Because this package builds Cython extensions against libpcap, it is installed
+from a source checkout rather than from an index.
 
 
 Notes on installing development tools and libpcap on MacOS and Linux:
@@ -50,7 +54,7 @@ Notes on installing development tools and libpcap on MacOS and Linux:
 
   The simplest way to get these headers installed is to use HomeBrew or
   MacPorts.
-  $ sudo homebrew install lippcap
+  $ sudo homebrew install lippcap
   or
   $ sudo port install libpcap
 
