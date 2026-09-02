@@ -1,6 +1,10 @@
 CHANGELOG
 ---------
 
+[2.1.1]
+ * Added stateful NetFlow v1/v5/v7/v9 and IPFIX decoding and generation.
+ * Added scoped templates, fallback handling, replay support, and faster codecs.
+
 [2.1]
  * **Expanded network protocol support and correctness.** Added IPv6 packets,
    extension headers, MPLS dispatch, and query integration. ICMPv6 now covers
