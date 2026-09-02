@@ -135,7 +135,9 @@ cdef object _netflow_decode_context(dict kwargs):
     cdef object context = kwargs.get('decode_context')
 
     if context is None:
-        from packets.protos.netflow import NetflowDecodeContext
+        # NetflowDecodeContext is imported at module scope; the function local
+        # import this used to repeat was a sys.modules lookup and a dict
+        # lookup per reader, for a name already bound.
         context = NetflowDecodeContext()
     return context
 

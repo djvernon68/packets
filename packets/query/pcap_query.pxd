@@ -40,9 +40,10 @@ cdef class PcapQuery:
         bint live
         public dict fields
         dict l7_ports
-        public list field_functions, layer_order, wshark_fields
+        public list layer_order, wshark_fields
         list field_descriptors
         public object stop_event, decode_context
+        bint _skip_decode
 
     cdef tuple _extract_row(self, list layers)
 

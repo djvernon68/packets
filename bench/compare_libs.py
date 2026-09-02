@@ -11,28 +11,123 @@ Measures operations where each library supports them:
   * pcapdec - additionally access the library's formatted source MAC
   * pcapdec_udp - additionally detect UDP and access its source port
 
+``--netflow-pcap`` adds a NetFlow decode smoke test over a capture of export
+datagrams, which is a different kind of work than the frame operations above:
+
+  * nf_pcaprd - read every raw packet of the NetFlow capture (streaming)
+  * nf_simple - decode each datagram without resolving its data sets
+  * nf_decode - decode the datagrams with template state shared across the
+                whole capture, which is what turns v9/IPFIX data sets into
+                flow records
+
+Only a library with a v9/IPFIX decoder can do the last part. The others are
+recorded as ``unsupported`` for that operation rather than compared on some
+cheaper operation that would look deceptively quick.
+
 Run with PYTHONPATH pointed at the packets build directory.
+
+Expect a full run to take several minutes: every pcap operation samples for at
+least ``--pcap-seconds`` and re-reads the whole capture as many times as fit in
+that window, and the pure-Python comparison libraries are one to two orders of
+magnitude slower per packet than a compiled build. A progress log is written to
+stderr as each sample completes so a slow run is distinguishable from a stall;
+use ``--libs`` to measure only the libraries of interest.
 """
 from __future__ import print_function
 import argparse
+import atexit
+import json
+import os
+import sys
 import time
 import gc
 import statistics
 
+LIB_KEYS = ('packets', 'libpcap', 'impacket', 'scapy', 'dpkt')
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--pcap', required=True,
                     help='capture file used for streaming benchmarks')
+parser.add_argument('--netflow-pcap', '--netflow_pcap', dest='netflow_pcap',
+                    help='capture of NetFlow/IPFIX export datagrams. When '
+                         'given, a NetFlow decode smoke test runs after the '
+                         'frame benchmarks. Use a capture that is not cut '
+                         'short, since a truncated tail is a reader error '
+                         'rather than a measurement.')
+parser.add_argument('--netflow-ports', default='2003,2033,2055',
+                    help='comma-separated collector UDP ports carrying '
+                         'NetFlow in --netflow-pcap (default: %(default)s)')
+parser.add_argument('--netflow-seconds', type=float, default=1.0,
+                    help='minimum duration of each NetFlow sample. It is a '
+                         'smoke test, so this defaults below --pcap-seconds.')
 parser.add_argument('--iterations', type=int, default=50000)
 parser.add_argument('--repeats', type=int, default=5)
 parser.add_argument('--pcap-seconds', type=float, default=3.0,
                     help='minimum duration of each pcap sample')
 parser.add_argument('--packets-label', default='packets 2.1',
                     help='result label for the packets build on PYTHONPATH')
+parser.add_argument('--libs', default='all',
+                    help='comma-separated subset of %s to measure, or "all" '
+                         '(default). scapy alone is roughly 70%%%% of a full '
+                         'run.' % ','.join(LIB_KEYS))
+parser.add_argument('--skip-libs', default='',
+                    help='comma-separated libraries to exclude, applied after '
+                         '--libs')
+parser.add_argument('--out',
+                    help='write JSON results to this file instead of stdout. '
+                         'Partial results are flushed after every operation, '
+                         'so an interrupted run still leaves usable data.')
+parser.add_argument('--quiet', action='store_true',
+                    help='suppress the stderr progress log')
 args = parser.parse_args()
 if args.iterations <= 0 or args.repeats <= 0 or args.pcap_seconds <= 0:
     parser.error('iterations, repeats, and pcap-seconds must be positive')
+if args.netflow_seconds <= 0:
+    parser.error('netflow-seconds must be positive')
+
+
+def _parse_lib_list(value):
+    names = [name.strip() for name in value.split(',') if name.strip()]
+    unknown = [name for name in names if name not in LIB_KEYS and name != 'all']
+    if unknown:
+        parser.error('unknown library name(s): %s (choose from %s)'
+                     % (','.join(unknown), ','.join(LIB_KEYS)))
+    if 'all' in names:
+        return list(LIB_KEYS)
+    return names
+
+
+def _parse_port_list(value):
+    ports = []
+    for item in value.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            port = int(item)
+        except ValueError:
+            parser.error('--netflow-ports takes integers, got %r' % item)
+        if not 0 < port < 65536:
+            parser.error('--netflow-ports value out of range: %d' % port)
+        if port not in ports:
+            ports.append(port)
+    if not ports:
+        parser.error('--netflow-ports listed no ports')
+    return ports
+
+
+ENABLED_LIBS = [key for key in _parse_lib_list(args.libs)
+                if key not in _parse_lib_list(args.skip_libs)]
+if not ENABLED_LIBS:
+    parser.error('--libs/--skip-libs excluded every library')
+if not os.path.isfile(args.pcap):
+    parser.error('no such capture file: %s' % args.pcap)
+if args.netflow_pcap and not os.path.isfile(args.netflow_pcap):
+    parser.error('no such capture file: %s' % args.netflow_pcap)
 
 PCAP = args.pcap
+NETFLOW_PCAP = args.netflow_pcap
+NETFLOW_PORTS = _parse_port_list(args.netflow_ports)
 PACKETS_LABEL = args.packets_label
 
 SMAC = "00:11:22:33:44:55"
@@ -49,46 +144,89 @@ N_PARSE = args.iterations
 N_BUILD = args.iterations
 N_PCAP_PASSES = args.repeats
 PCAP_SAMPLE_SECONDS = args.pcap_seconds
+NETFLOW_SAMPLE_SECONDS = args.netflow_seconds
+
+RUN_T0 = time.perf_counter()
 
 
-def timeit(fn, n):
+def log(fmt, *fmt_args):
+    """Write a timestamped progress line to stderr and flush it.
+
+    The benchmark emits a single JSON document when it finishes, so without a
+    heartbeat a healthy multi-minute run is indistinguishable from a hang -
+    especially when stdout is redirected to a file that stays empty until the
+    very last write.
+    """
+    if args.quiet:
+        return
+    message = fmt % fmt_args if fmt_args else fmt
+    sys.stderr.write('[%7.1fs] %s\n' % (time.perf_counter() - RUN_T0, message))
+    sys.stderr.flush()
+
+
+def enabled(key):
+    return key in ENABLED_LIBS
+
+
+def timeit(fn, n, label=''):
     # warm up
     for _ in range(100):
         fn()
     samples = []
     gc.disable()
     try:
-        for _ in range(args.repeats):
+        for index in range(args.repeats):
             t0 = time.perf_counter()
             for _ in range(n):
                 fn()
-            samples.append(time.perf_counter() - t0)
+            elapsed = time.perf_counter() - t0
+            samples.append(elapsed)
+            # Logged after the measurement is captured, so the write is never
+            # part of a timed region.
+            log('    %s sample %d/%d: %.2fs (%.3f us/op)',
+                label, index + 1, args.repeats, elapsed, elapsed / n * 1e6)
     finally:
         gc.enable()
     return samples
 
 
-def time_pcap(fn, passes):
+def time_pcap(fn, passes, label='', seconds=None, source=None):
+    # seconds/source are parameters because the NetFlow smoke test samples a
+    # different capture for a shorter window than the frame benchmarks.
+    seconds = PCAP_SAMPLE_SECONDS if seconds is None else seconds
+    source = PCAP if source is None else source
     elapsed_samples = []
     packet_samples = []
     gc.disable()
     try:
-        for _ in range(passes):
+        for index in range(passes):
             t0 = time.perf_counter()
             npkts = 0
+            file_passes = 0
             while True:
                 npkts += fn()
+                file_passes += 1
                 elapsed = time.perf_counter() - t0
-                if elapsed >= PCAP_SAMPLE_SECONDS:
+                if elapsed >= seconds:
                     break
+            if npkts <= 0:
+                # Fail loudly here instead of dividing by zero in record()
+                # after the whole run has already been paid for.
+                raise RuntimeError('%s read 0 packets from %s'
+                                   % (label or 'pcap benchmark', source))
             elapsed_samples.append(elapsed)
             packet_samples.append(npkts)
+            log('    %s sample %d/%d: %.2fs, %d packets, %d file pass(es) '
+                '(%.3f us/pkt)', label, index + 1, passes, elapsed, npkts,
+                file_passes, elapsed / npkts * 1e6)
     finally:
         gc.enable()
     return elapsed_samples, packet_samples
 
 
 results = {}   # lib -> {op: (per_pkt_us, pkts_per_sec)}
+_stdout_written = [False]
+_final_written = [False]
 
 
 def record(lib, op, total_time, count):
@@ -96,6 +234,11 @@ def record(lib, op, total_time, count):
         total_time = [total_time]
     if not isinstance(count, (list, tuple)):
         count = [count] * len(total_time)
+    for elapsed, packets in zip(total_time, count):
+        if elapsed <= 0 or packets <= 0:
+            raise ValueError('%s/%s produced an unusable sample '
+                             '(%r packets in %r s)' % (lib, op, packets,
+                                                       elapsed))
     per_usec = [elapsed / packets * 1e6
                 for elapsed, packets in zip(total_time, count)]
     rates = [packets / elapsed
@@ -110,7 +253,96 @@ def record(lib, op, total_time, count):
     }
 
 
+def dump_results(final=False):
+    """Serialize whatever has been measured so far.
+
+    Called after every operation so that ``--out`` always holds current data,
+    and registered with atexit so an interrupted or failed run still reports
+    the samples it did complete.
+    """
+    results['_config'] = {
+        'iterations': args.iterations,
+        'repeats': args.repeats,
+        'pcap_min_seconds_per_sample': args.pcap_seconds,
+        'pcap': args.pcap,
+        'netflow_pcap': args.netflow_pcap,
+        'netflow_ports': list(NETFLOW_PORTS),
+        'netflow_min_seconds_per_sample': args.netflow_seconds,
+        'libs': list(ENABLED_LIBS),
+        'elapsed_seconds': round(time.perf_counter() - RUN_T0, 3),
+    }
+    if final:
+        if _final_written[0]:
+            return
+        _final_written[0] = True
+    text = json.dumps(results, indent=2)
+    if args.out:
+        partial = args.out + '.part'
+        with open(partial, 'w') as handle:
+            handle.write(text + '\n')
+        os.rename(partial, args.out)
+        if final:
+            log('results written to %s', args.out)
+    elif final and not _stdout_written[0]:
+        _stdout_written[0] = True
+        sys.stdout.write(text + '\n')
+        sys.stdout.flush()
+
+
+atexit.register(dump_results, True)
+
+
+def bench_op(lib, op, fn, n=None):
+    """Time a per-operation benchmark, logging and checkpointing around it."""
+    n = N_PARSE if n is None else n
+    label = '%s/%s' % (lib, op)
+    log('%s: %d iterations x %d repeats', label, n, args.repeats)
+    record(lib, op, timeit(fn, n, label), n)
+    dump_results()
+
+
+def bench_pcap_op(lib, op, fn, passes=None, seconds=None, source=None):
+    """Time a streaming pcap benchmark, logging and checkpointing around it."""
+    passes = N_PCAP_PASSES if passes is None else passes
+    seconds = PCAP_SAMPLE_SECONDS if seconds is None else seconds
+    label = '%s/%s' % (lib, op)
+    log('%s: %d samples of >=%.1fs each', label, passes, seconds)
+    elapsed_samples, packet_samples = time_pcap(fn, passes, label, seconds,
+                                                source)
+    record(lib, op, elapsed_samples, packet_samples)
+    dump_results()
+
+
+def section_skipped(lib, key):
+    log('%s: skipped, %s not selected by --libs/--skip-libs', lib, key)
+    results.setdefault(lib, {})['skipped'] = 'not selected'
+
+
+def section_failed(lib, exc):
+    # The failure used to be visible only inside the final JSON, so a library
+    # that never imported looked like a library that was simply fast.
+    log('%s: FAILED, %s: %s', lib, exc.__class__.__name__, exc)
+    results.setdefault(lib, {})['error'] = str(exc)
+    dump_results()
+
+
+log('pcap=%s (%.1f MiB)', PCAP, os.path.getsize(PCAP) / 1048576.0)
+log('libs=%s iterations=%d repeats=%d pcap-seconds=%.1f',
+    ','.join(ENABLED_LIBS), args.iterations, args.repeats, args.pcap_seconds)
+log('each selected library runs up to 5 pcap operations of %d x >=%.1fs, so a '
+    'full run takes minutes; scapy is by far the slowest',
+    args.repeats, args.pcap_seconds)
+if NETFLOW_PCAP:
+    log('netflow-pcap=%s (%.2f MiB) ports=%s netflow-seconds=%.1f',
+        NETFLOW_PCAP, os.path.getsize(NETFLOW_PCAP) / 1048576.0,
+        ','.join(str(port) for port in NETFLOW_PORTS), args.netflow_seconds)
+else:
+    log('netflow smoke test disabled; pass --netflow-pcap to enable it')
+
+
 # ----------------------------------------------------------------- packets 2.1
+# Imported unconditionally: the reference frame built here is the input for
+# every other library's parse benchmark.
 from packets.core.inetpkt import Ethernet, IP, UDP
 from packets.core.pcap import PCAPReader
 
@@ -187,258 +419,532 @@ def pcap_decode_udp_packets():
     return n
 
 
-record(PACKETS_LABEL, "build", timeit(build_packets, N_BUILD), N_BUILD)
-record(PACKETS_LABEL, "parse", timeit(parse_packets, N_PARSE), N_PARSE)
-_t, _n = time_pcap(pcap_packets, N_PCAP_PASSES)
-record(PACKETS_LABEL, "pcaprd", _t, _n)
-_t, _n = time_pcap(pcap_decode_construct_packets, N_PCAP_PASSES)
-record(PACKETS_LABEL, "pcapdec_ctor", _t, _n)
-_t, _n = time_pcap(pcap_decode_raw_mac_packets, N_PCAP_PASSES)
-record(PACKETS_LABEL, "pcapdec_rawmac", _t, _n)
-_t, _n = time_pcap(pcap_decode_packets, N_PCAP_PASSES)
-record(PACKETS_LABEL, "pcapdec", _t, _n)
-_t, _n = time_pcap(pcap_decode_udp_packets, N_PCAP_PASSES)
-record(PACKETS_LABEL, "pcapdec_udp", _t, _n)
+if enabled('packets'):
+    log('=== %s ===', PACKETS_LABEL)
+    bench_op(PACKETS_LABEL, "build", build_packets, N_BUILD)
+    bench_op(PACKETS_LABEL, "parse", parse_packets, N_PARSE)
+    bench_pcap_op(PACKETS_LABEL, "pcaprd", pcap_packets)
+    bench_pcap_op(PACKETS_LABEL, "pcapdec_ctor", pcap_decode_construct_packets)
+    bench_pcap_op(PACKETS_LABEL, "pcapdec_rawmac", pcap_decode_raw_mac_packets)
+    bench_pcap_op(PACKETS_LABEL, "pcapdec", pcap_decode_packets)
+    bench_pcap_op(PACKETS_LABEL, "pcapdec_udp", pcap_decode_udp_packets)
+else:
+    section_skipped(PACKETS_LABEL, 'packets')
 
 
 # ---------------------------------------------------- direct libpcap dispatch
-try:
-    from pcap_dispatch_bench import scan_batch, scan_count, scan_extract
+if not enabled('libpcap'):
+    section_skipped("libpcap dispatch", 'libpcap')
+else:
+    log('=== libpcap dispatch ===')
+    try:
+        from pcap_dispatch_bench import scan_batch, scan_count, scan_extract
 
-    for _batch_size in (16, 64, 256):
-        _t, _n = time_pcap(
-            lambda size=_batch_size: scan_count(PCAP, size),
-            N_PCAP_PASSES)
-        record("libpcap dispatch", "count_%d" % _batch_size, _t, _n)
+        for _batch_size in (16, 64, 256):
+            bench_pcap_op("libpcap dispatch", "count_%d" % _batch_size,
+                          lambda size=_batch_size: scan_count(PCAP, size))
+            bench_pcap_op("libpcap dispatch", "batch_%d" % _batch_size,
+                          lambda size=_batch_size: scan_batch(PCAP, size))
 
-        _t, _n = time_pcap(
-            lambda size=_batch_size: scan_batch(PCAP, size),
-            N_PCAP_PASSES)
-        record("libpcap dispatch", "batch_%d" % _batch_size, _t, _n)
+            def extract_count(size=_batch_size):
+                return scan_extract(PCAP, size)[0]
 
-        def extract_count(size=_batch_size):
-            return scan_extract(PCAP, size)[0]
-
-        _t, _n = time_pcap(extract_count, N_PCAP_PASSES)
-        record("libpcap dispatch", "extract_%d" % _batch_size, _t, _n)
-except Exception as e:
-    results.setdefault("libpcap dispatch", {})["error"] = str(e)
+            bench_pcap_op("libpcap dispatch", "extract_%d" % _batch_size,
+                          extract_count)
+    except Exception as e:
+        section_failed("libpcap dispatch", e)
 
 
 # ------------------------------------------------------------------- impacket
-try:
-    from impacket import ImpactPacket
-    from impacket.ImpactDecoder import EthDecoder
-    _dec = EthDecoder()
+if not enabled('impacket'):
+    section_skipped("impacket 0.13.1", 'impacket')
+else:
+    log('=== impacket 0.13.1 ===')
+    try:
+        from impacket import ImpactPacket
+        from impacket.ImpactDecoder import EthDecoder
+        _dec = EthDecoder()
 
-    def build_impacket():
-        eth = ImpactPacket.Ethernet()
-        eth.set_ether_shost(bytearray(SMAC_B))
-        eth.set_ether_dhost(bytearray(DMAC_B))
-        eth.set_ether_type(0x0800)
-        ip = ImpactPacket.IP()
-        ip.set_ip_src(SIP)
-        ip.set_ip_dst(DIP)
-        udp = ImpactPacket.UDP()
-        udp.set_uh_sport(SPORT)
-        udp.set_uh_dport(DPORT)
-        udp.contains(ImpactPacket.Data(PAYLOAD))
-        ip.contains(udp)
-        eth.contains(ip)
-        return eth.get_packet()
+        def build_impacket():
+            eth = ImpactPacket.Ethernet()
+            eth.set_ether_shost(bytearray(SMAC_B))
+            eth.set_ether_dhost(bytearray(DMAC_B))
+            eth.set_ether_type(0x0800)
+            ip = ImpactPacket.IP()
+            ip.set_ip_src(SIP)
+            ip.set_ip_dst(DIP)
+            udp = ImpactPacket.UDP()
+            udp.set_uh_sport(SPORT)
+            udp.set_uh_dport(DPORT)
+            udp.contains(ImpactPacket.Data(PAYLOAD))
+            ip.contains(udp)
+            eth.contains(ip)
+            return eth.get_packet()
 
-    def parse_impacket():
-        p = _dec.decode(RAW)
-        return p.child().child().get_uh_sport()
+        def parse_impacket():
+            p = _dec.decode(RAW)
+            return p.child().child().get_uh_sport()
 
-    record("impacket 0.13.1", "build",
-           timeit(build_impacket, N_BUILD), N_BUILD)
-    record("impacket 0.13.1", "parse",
-           timeit(parse_impacket, N_PARSE), N_PARSE)
-    for _unsupported_op in ('pcaprd', 'pcapdec_ctor', 'pcapdec_rawmac',
-                            'pcapdec', 'pcapdec_udp'):
-        results["impacket 0.13.1"][_unsupported_op] = {
-            'unsupported': 'impacket has no native pcap file reader'
-        }
-except Exception as e:
-    results.setdefault("impacket 0.13.1", {})["error"] = str(e)
+        bench_op("impacket 0.13.1", "build", build_impacket, N_BUILD)
+        bench_op("impacket 0.13.1", "parse", parse_impacket, N_PARSE)
+        for _unsupported_op in ('pcaprd', 'pcapdec_ctor', 'pcapdec_rawmac',
+                                'pcapdec', 'pcapdec_udp'):
+            results["impacket 0.13.1"][_unsupported_op] = {
+                'unsupported': 'impacket has no native pcap file reader'
+            }
+        dump_results()
+    except Exception as e:
+        section_failed("impacket 0.13.1", e)
 
 
 # ---------------------------------------------------------------------- scapy
-try:
-    from scapy.all import Ether, IP as ScIP, UDP as ScUDP, Raw
-    from scapy.utils import RawPcapReader
-    import scapy.all as _scapy_all
+if not enabled('scapy'):
+    section_skipped("scapy 2.5.0", 'scapy')
+else:
+    log('=== scapy 2.5.0 (slowest section, ~70% of a full run) ===')
+    try:
+        from scapy.all import Ether, IP as ScIP, UDP as ScUDP, Raw
+        from scapy.utils import RawPcapReader
+        import scapy.all as _scapy_all
 
-    def build_scapy():
-        pkt = (Ether(src=SMAC, dst=DMAC) /
-               ScIP(src=SIP, dst=DIP) /
-               ScUDP(sport=SPORT, dport=DPORT) /
-               Raw(PAYLOAD))
-        return bytes(pkt)
+        def build_scapy():
+            pkt = (Ether(src=SMAC, dst=DMAC) /
+                   ScIP(src=SIP, dst=DIP) /
+                   ScUDP(sport=SPORT, dport=DPORT) /
+                   Raw(PAYLOAD))
+            return bytes(pkt)
 
-    def parse_scapy():
-        pkt = Ether(RAW)
-        return pkt[ScUDP].sport
+        def parse_scapy():
+            pkt = Ether(RAW)
+            return pkt[ScUDP].sport
 
-    def pcap_scapy():
-        n = 0
-        rdr = RawPcapReader(PCAP)
-        for _ in rdr:
-            n += 1
-        rdr.close()
-        return n
-
-    def pcap_decode_scapy():
-        n = 0
-        rdr = RawPcapReader(PCAP)
-        for raw, _meta in rdr:
-            pkt = Ether(raw)
-            if Ether in pkt and pkt[Ether].src:
+        def pcap_scapy():
+            n = 0
+            rdr = RawPcapReader(PCAP)
+            for _ in rdr:
                 n += 1
-        rdr.close()
-        return n
+            rdr.close()
+            return n
 
-    def pcap_decode_construct_scapy():
-        n = 0
-        rdr = RawPcapReader(PCAP)
-        for raw, _meta in rdr:
-            pkt = Ether(raw)
-            if Ether in pkt:
+        def pcap_decode_scapy():
+            n = 0
+            rdr = RawPcapReader(PCAP)
+            for raw, _meta in rdr:
+                pkt = Ether(raw)
+                if Ether in pkt and pkt[Ether].src:
+                    n += 1
+            rdr.close()
+            return n
+
+        def pcap_decode_construct_scapy():
+            n = 0
+            rdr = RawPcapReader(PCAP)
+            for raw, _meta in rdr:
+                pkt = Ether(raw)
+                if Ether in pkt:
+                    n += 1
+            rdr.close()
+            return n
+
+        def pcap_decode_raw_mac_scapy():
+            n = 0
+            rdr = RawPcapReader(PCAP)
+            for raw, _meta in rdr:
+                pkt = Ether(raw)
+                if Ether in pkt and raw[6:12]:
+                    n += 1
+            rdr.close()
+            return n
+
+        def pcap_decode_udp_scapy():
+            n = 0
+            rdr = RawPcapReader(PCAP)
+            for raw, _meta in rdr:
+                pkt = Ether(raw)
+                if ScUDP in pkt:
+                    _sport = pkt[ScUDP].sport
                 n += 1
-        rdr.close()
-        return n
+            rdr.close()
+            return n
 
-    def pcap_decode_raw_mac_scapy():
-        n = 0
-        rdr = RawPcapReader(PCAP)
-        for raw, _meta in rdr:
-            pkt = Ether(raw)
-            if Ether in pkt and raw[6:12]:
-                n += 1
-        rdr.close()
-        return n
-
-    def pcap_decode_udp_scapy():
-        n = 0
-        rdr = RawPcapReader(PCAP)
-        for raw, _meta in rdr:
-            pkt = Ether(raw)
-            if ScUDP in pkt:
-                _sport = pkt[ScUDP].sport
-            n += 1
-        rdr.close()
-        return n
-
-    record("scapy 2.5.0", "build", timeit(build_scapy, N_BUILD), N_BUILD)
-    record("scapy 2.5.0", "parse", timeit(parse_scapy, N_PARSE), N_PARSE)
-    _t, _n = time_pcap(pcap_scapy, N_PCAP_PASSES)
-    record("scapy 2.5.0", "pcaprd", _t, _n)
-    _t, _n = time_pcap(pcap_decode_construct_scapy, N_PCAP_PASSES)
-    record("scapy 2.5.0", "pcapdec_ctor", _t, _n)
-    _t, _n = time_pcap(pcap_decode_raw_mac_scapy, N_PCAP_PASSES)
-    record("scapy 2.5.0", "pcapdec_rawmac", _t, _n)
-    _t, _n = time_pcap(pcap_decode_scapy, N_PCAP_PASSES)
-    record("scapy 2.5.0", "pcapdec", _t, _n)
-    _t, _n = time_pcap(pcap_decode_udp_scapy, N_PCAP_PASSES)
-    record("scapy 2.5.0", "pcapdec_udp", _t, _n)
-except Exception as e:
-    results.setdefault("scapy 2.5.0", {})["error"] = str(e)
+        bench_op("scapy 2.5.0", "build", build_scapy, N_BUILD)
+        bench_op("scapy 2.5.0", "parse", parse_scapy, N_PARSE)
+        bench_pcap_op("scapy 2.5.0", "pcaprd", pcap_scapy)
+        bench_pcap_op("scapy 2.5.0", "pcapdec_ctor",
+                      pcap_decode_construct_scapy)
+        bench_pcap_op("scapy 2.5.0", "pcapdec_rawmac",
+                      pcap_decode_raw_mac_scapy)
+        bench_pcap_op("scapy 2.5.0", "pcapdec", pcap_decode_scapy)
+        bench_pcap_op("scapy 2.5.0", "pcapdec_udp", pcap_decode_udp_scapy)
+    except Exception as e:
+        section_failed("scapy 2.5.0", e)
 
 
 # ----------------------------------------------------------------------- dpkt
-try:
-    import dpkt
-    import socket as _sock
+if not enabled('dpkt'):
+    section_skipped("dpkt 1.9.8", 'dpkt')
+else:
+    log('=== dpkt 1.9.8 ===')
+    try:
+        import dpkt
+        import socket as _sock
 
-    _sip_b = _sock.inet_aton(SIP)
-    _dip_b = _sock.inet_aton(DIP)
+        _sip_b = _sock.inet_aton(SIP)
+        _dip_b = _sock.inet_aton(DIP)
 
-    def build_dpkt():
-        udp = dpkt.udp.UDP(sport=SPORT, dport=DPORT, data=PAYLOAD)
-        udp.ulen = 8 + len(PAYLOAD)
-        ip = dpkt.ip.IP(src=_sip_b, dst=_dip_b, p=17, data=udp)
-        ip.len = 20 + udp.ulen
-        eth = dpkt.ethernet.Ethernet(src=SMAC_B, dst=DMAC_B,
-                                     type=0x0800, data=ip)
-        return bytes(eth)
+        def build_dpkt():
+            udp = dpkt.udp.UDP(sport=SPORT, dport=DPORT, data=PAYLOAD)
+            udp.ulen = 8 + len(PAYLOAD)
+            ip = dpkt.ip.IP(src=_sip_b, dst=_dip_b, p=17, data=udp)
+            ip.len = 20 + udp.ulen
+            eth = dpkt.ethernet.Ethernet(src=SMAC_B, dst=DMAC_B,
+                                         type=0x0800, data=ip)
+            return bytes(eth)
 
-    def parse_dpkt():
-        eth = dpkt.ethernet.Ethernet(RAW)
-        return eth.data.data.sport
+        def parse_dpkt():
+            eth = dpkt.ethernet.Ethernet(RAW)
+            return eth.data.data.sport
 
-    def pcap_dpkt():
-        n = 0
-        f = open(PCAP, 'rb')
-        for _ts, _buf in dpkt.pcap.Reader(f):
-            n += 1
-        f.close()
-        return n
-
-    def pcap_decode_dpkt():
-        n = 0
-        f = open(PCAP, 'rb')
-        for _ts, raw in dpkt.pcap.Reader(f):
-            pkt = dpkt.ethernet.Ethernet(raw)
-            if isinstance(pkt, dpkt.ethernet.Ethernet) and pkt.src:
+        def pcap_dpkt():
+            n = 0
+            f = open(PCAP, 'rb')
+            for _ts, _buf in dpkt.pcap.Reader(f):
                 n += 1
-        f.close()
-        return n
+            f.close()
+            return n
 
-    def pcap_decode_construct_dpkt():
-        n = 0
-        f = open(PCAP, 'rb')
-        for _ts, raw in dpkt.pcap.Reader(f):
-            pkt = dpkt.ethernet.Ethernet(raw)
-            if isinstance(pkt, dpkt.ethernet.Ethernet):
+        def pcap_decode_dpkt():
+            n = 0
+            f = open(PCAP, 'rb')
+            for _ts, raw in dpkt.pcap.Reader(f):
+                pkt = dpkt.ethernet.Ethernet(raw)
+                if isinstance(pkt, dpkt.ethernet.Ethernet) and pkt.src:
+                    n += 1
+            f.close()
+            return n
+
+        def pcap_decode_construct_dpkt():
+            n = 0
+            f = open(PCAP, 'rb')
+            for _ts, raw in dpkt.pcap.Reader(f):
+                pkt = dpkt.ethernet.Ethernet(raw)
+                if isinstance(pkt, dpkt.ethernet.Ethernet):
+                    n += 1
+            f.close()
+            return n
+
+        def pcap_decode_raw_mac_dpkt():
+            n = 0
+            f = open(PCAP, 'rb')
+            for _ts, raw in dpkt.pcap.Reader(f):
+                pkt = dpkt.ethernet.Ethernet(raw)
+                if isinstance(pkt, dpkt.ethernet.Ethernet) and raw[6:12]:
+                    n += 1
+            f.close()
+            return n
+
+        def pcap_decode_udp_dpkt():
+            n = 0
+            f = open(PCAP, 'rb')
+            for _ts, raw in dpkt.pcap.Reader(f):
+                pkt = dpkt.ethernet.Ethernet(raw)
+                if (isinstance(pkt.data, dpkt.ip.IP) and
+                        isinstance(pkt.data.data, dpkt.udp.UDP)):
+                    _sport = pkt.data.data.sport
                 n += 1
-        f.close()
-        return n
+            f.close()
+            return n
 
-    def pcap_decode_raw_mac_dpkt():
-        n = 0
-        f = open(PCAP, 'rb')
-        for _ts, raw in dpkt.pcap.Reader(f):
-            pkt = dpkt.ethernet.Ethernet(raw)
-            if isinstance(pkt, dpkt.ethernet.Ethernet) and raw[6:12]:
-                n += 1
-        f.close()
-        return n
+        bench_op("dpkt 1.9.8", "build", build_dpkt, N_BUILD)
+        bench_op("dpkt 1.9.8", "parse", parse_dpkt, N_PARSE)
+        bench_pcap_op("dpkt 1.9.8", "pcaprd", pcap_dpkt)
+        bench_pcap_op("dpkt 1.9.8", "pcapdec_ctor", pcap_decode_construct_dpkt)
+        bench_pcap_op("dpkt 1.9.8", "pcapdec_rawmac", pcap_decode_raw_mac_dpkt)
+        bench_pcap_op("dpkt 1.9.8", "pcapdec", pcap_decode_dpkt)
+        bench_pcap_op("dpkt 1.9.8", "pcapdec_udp", pcap_decode_udp_dpkt)
+    except Exception as e:
+        section_failed("dpkt 1.9.8", e)
 
-    def pcap_decode_udp_dpkt():
-        n = 0
-        f = open(PCAP, 'rb')
-        for _ts, raw in dpkt.pcap.Reader(f):
-            pkt = dpkt.ethernet.Ethernet(raw)
-            if (isinstance(pkt.data, dpkt.ip.IP) and
-                    isinstance(pkt.data.data, dpkt.udp.UDP)):
-                _sport = pkt.data.data.sport
-            n += 1
-        f.close()
-        return n
 
-    record("dpkt 1.9.8", "build", timeit(build_dpkt, N_BUILD), N_BUILD)
-    record("dpkt 1.9.8", "parse", timeit(parse_dpkt, N_PARSE), N_PARSE)
-    _t, _n = time_pcap(pcap_dpkt, N_PCAP_PASSES)
-    record("dpkt 1.9.8", "pcaprd", _t, _n)
-    _t, _n = time_pcap(pcap_decode_construct_dpkt, N_PCAP_PASSES)
-    record("dpkt 1.9.8", "pcapdec_ctor", _t, _n)
-    _t, _n = time_pcap(pcap_decode_raw_mac_dpkt, N_PCAP_PASSES)
-    record("dpkt 1.9.8", "pcapdec_rawmac", _t, _n)
-    _t, _n = time_pcap(pcap_decode_dpkt, N_PCAP_PASSES)
-    record("dpkt 1.9.8", "pcapdec", _t, _n)
-    _t, _n = time_pcap(pcap_decode_udp_dpkt, N_PCAP_PASSES)
-    record("dpkt 1.9.8", "pcapdec_udp", _t, _n)
-except Exception as e:
-    results.setdefault("dpkt 1.9.8", {})["error"] = str(e)
+# ------------------------------------------------- NetFlow decode smoke test
+# A NetFlow export capture exercises a decode path the frame benchmarks never
+# reach. Every datagram is UDP payload that has to be walked flowset by
+# flowset, and a v9/IPFIX data set only becomes flow records once the template
+# announced in some other datagram of the same capture has been learned, so
+# the decoder has to carry state across the file. Libraries without a v9/IPFIX
+# decoder are recorded as unsupported here: timing them on a header peek they
+# cannot resolve would read as a win rather than as a missing feature.
+NETFLOW_OPS = ('nf_pcaprd', 'nf_simple', 'nf_decode')
+
+
+def netflow_unsupported(lib, reason, ops=NETFLOW_OPS):
+    for op in ops:
+        results.setdefault(lib, {})[op] = {'unsupported': reason}
+    log('%s: %s', lib, reason)
+    dump_results()
+
+
+def netflow_datagram_probe(fn):
+    """Build a probe reporting the datagram count one pass of fn produced."""
+    def probe():
+        return {'datagrams': fn()}
+    return probe
+
+
+def bench_netflow_op(lib, op, fn, probe=None):
+    """Verify with one untimed pass, then time the operation.
+
+    A decoder that quietly produced nothing would otherwise be timed as the
+    fastest of the group, so the probe counts what came out before any
+    measurement is taken and its counts are kept beside the timings. The
+    failure is scoped to one operation because a library can read the file
+    and walk the datagrams and still not resolve a template in it.
+    """
+    try:
+        if probe is not None:
+            counts = probe()
+            log('  %s/%s decoded: %s', lib, op, ' '.join(
+                '%s=%s' % (name, counts[name]) for name in sorted(counts)))
+            results.setdefault(lib, {})['%s_counts' % op] = dict(counts)
+            dump_results()
+            if not counts.get('datagrams'):
+                raise RuntimeError('decoded no NetFlow datagrams from %s'
+                                   % NETFLOW_PCAP)
+        bench_pcap_op(lib, op, fn, seconds=NETFLOW_SAMPLE_SECONDS,
+                      source=NETFLOW_PCAP)
+    except Exception as exc:
+        log('%s/%s: FAILED, %s: %s', lib, op, exc.__class__.__name__, exc)
+        results.setdefault(lib, {})[op] = {'error': str(exc)}
+        dump_results()
+
+
+if not NETFLOW_PCAP:
+    log('=== NetFlow decode smoke test: skipped, no --netflow-pcap ===')
+else:
+    log('=== NetFlow decode smoke test: %s ===',
+        os.path.basename(NETFLOW_PCAP))
+
+    # ------------------------------------------------------------ packets 2.1
+    if not enabled('packets'):
+        log('%s: NetFlow smoke test skipped, packets not selected',
+            PACKETS_LABEL)
+    else:
+        try:
+            from packets.protos.netflow import (Netflow, NetflowDecodeContext,
+                                                NetflowSimple)
+
+            NF_L7_PORTS = {port: Netflow for port in NETFLOW_PORTS}
+
+            def netflow_read_packets():
+                r = PCAPReader(filename=NETFLOW_PCAP)
+                n = 0
+                for _ in r:
+                    n += 1
+                r.close()
+                return n
+
+            def netflow_simple_packets():
+                # force_simple bypasses template learning, so this is the
+                # header-only cost with the data sets left as wire bytes.
+                context = NetflowDecodeContext(force_simple=True)
+                r = PCAPReader(filename=NETFLOW_PCAP, decode_context=context)
+                n = 0
+                for _ts, _hdr, raw in r:
+                    frame = Ethernet(raw, l7_ports=NF_L7_PORTS,
+                                     decode_context=context)
+                    if isinstance(frame.get_layer('NetflowSimple'),
+                                  NetflowSimple):
+                        n += 1
+                r.close()
+                return n
+
+            def netflow_decode_packets():
+                # One context for the whole file: data sets decode structurally
+                # once their template has been seen.
+                context = NetflowDecodeContext()
+                r = PCAPReader(filename=NETFLOW_PCAP, decode_context=context)
+                n = 0
+                for _ts, _hdr, raw in r:
+                    frame = Ethernet(raw, l7_ports=NF_L7_PORTS,
+                                     decode_context=context)
+                    if isinstance(frame.get_layer('Netflow'), Netflow):
+                        n += 1
+                r.close()
+                return n
+
+            def netflow_counts_packets():
+                counts = {'frames': 0, 'datagrams': 0, 'structured': 0,
+                          'fallback': 0, 'templates': 0, 'records': 0}
+                context = NetflowDecodeContext()
+                r = PCAPReader(filename=NETFLOW_PCAP, decode_context=context)
+                for _ts, _hdr, raw in r:
+                    counts['frames'] += 1
+                    frame = Ethernet(raw, l7_ports=NF_L7_PORTS,
+                                     decode_context=context)
+                    packet = frame.get_layer('Netflow')
+                    if isinstance(packet, Netflow):
+                        counts['datagrams'] += 1
+                        counts['structured'] += 1
+                        counts['records'] += len(packet.records)
+                        counts['templates'] += sum(
+                            len(flowset.templates)
+                            for flowset in packet.flowsets)
+                    elif isinstance(frame.get_layer('NetflowSimple'),
+                                    NetflowSimple):
+                        # A data set that arrives before its template falls
+                        # back to NetflowSimple, which is expected at the head
+                        # of a capture that re-announces templates later.
+                        counts['datagrams'] += 1
+                        counts['fallback'] += 1
+                r.close()
+                return counts
+
+            bench_netflow_op(PACKETS_LABEL, 'nf_pcaprd', netflow_read_packets)
+            bench_netflow_op(PACKETS_LABEL, 'nf_simple',
+                             netflow_simple_packets,
+                             netflow_datagram_probe(netflow_simple_packets))
+            bench_netflow_op(PACKETS_LABEL, 'nf_decode',
+                             netflow_decode_packets, netflow_counts_packets)
+        except Exception as e:
+            section_failed(PACKETS_LABEL, e)
+
+    # --------------------------------------------------------------- libpcap
+    if enabled('libpcap'):
+        try:
+            from pcap_dispatch_bench import scan_count
+
+            bench_netflow_op("libpcap dispatch", 'nf_pcaprd',
+                             lambda: scan_count(NETFLOW_PCAP, 64))
+            netflow_unsupported("libpcap dispatch",
+                                'libpcap dispatch hands frames to a counter; '
+                                'it has no NetFlow decoder',
+                                ('nf_simple', 'nf_decode'))
+        except Exception as e:
+            section_failed("libpcap dispatch", e)
+
+    # -------------------------------------------------------------- impacket
+    if enabled('impacket'):
+        netflow_unsupported("impacket 0.13.1",
+                            'impacket has no native pcap file reader and no '
+                            'NetFlow decoder')
+
+    # ----------------------------------------------------------------- scapy
+    if enabled('scapy'):
+        try:
+            from scapy.all import Ether as NfEther
+            from scapy.config import conf as scapy_conf
+            from scapy.utils import RawPcapReader as NfRawPcapReader
+            try:
+                # 2.4.4 and later ship the NetFlow layer in scapy.layers.
+                from scapy.layers.netflow import (NetflowHeader,
+                                                  NetflowFlowsetV9,
+                                                  NetflowDataflowsetV9,
+                                                  netflowv9_defragment)
+            except ImportError:
+                from scapy.contrib.netflow import (NetflowHeader,
+                                                   NetflowFlowsetV9,
+                                                   NetflowDataflowsetV9,
+                                                   netflowv9_defragment)
+
+            # A data set seen before its template warns once per pass
+            # otherwise, which would both spam the log and be timed.
+            scapy_conf.verb = 0
+
+            def netflow_read_scapy():
+                n = 0
+                rdr = NfRawPcapReader(NETFLOW_PCAP)
+                for _ in rdr:
+                    n += 1
+                rdr.close()
+                return n
+
+            def netflow_simple_scapy():
+                # scapy has no header-only mode: dissection walks the flowsets
+                # but leaves each data set as one raw pseudo-record until
+                # netflowv9_defragment resolves it against a template.
+                n = 0
+                rdr = NfRawPcapReader(NETFLOW_PCAP)
+                for raw, _meta in rdr:
+                    pkt = NfEther(raw)
+                    if NetflowHeader in pkt:
+                        n += 1
+                rdr.close()
+                return n
+
+            def netflow_decode_scapy():
+                # Known scapy limitation to expect here: it generates a record
+                # class per template and its metaclass builds an inspect
+                # signature from the field names, so a template whose fields
+                # map to a repeated scapy name - an options template often
+                # does - raises ValueError instead of decoding. Only this
+                # operation is recorded as failed when that happens.
+                rdr = NfRawPcapReader(NETFLOW_PCAP)
+                plist = [NfEther(raw) for raw, _meta in rdr]
+                rdr.close()
+                # Templates and data sets are matched across the whole list,
+                # which is scapy's equivalent of a shared decode context.
+                netflowv9_defragment(plist)
+                n = 0
+                for pkt in plist:
+                    if NetflowHeader in pkt:
+                        n += 1
+                return n
+
+            def netflow_counts_scapy():
+                counts = {'frames': 0, 'datagrams': 0, 'templates': 0,
+                          'records': 0}
+                rdr = NfRawPcapReader(NETFLOW_PCAP)
+                plist = []
+                for raw, _meta in rdr:
+                    counts['frames'] += 1
+                    plist.append(NfEther(raw))
+                rdr.close()
+                netflowv9_defragment(plist)
+                for pkt in plist:
+                    if NetflowHeader not in pkt:
+                        continue
+                    counts['datagrams'] += 1
+                    layer = pkt.getlayer(NetflowFlowsetV9)
+                    while layer is not None:
+                        counts['templates'] += len(layer.templates)
+                        layer = layer.payload.getlayer(NetflowFlowsetV9)
+                    layer = pkt.getlayer(NetflowDataflowsetV9)
+                    while layer is not None:
+                        counts['records'] += len(layer.records)
+                        layer = layer.payload.getlayer(NetflowDataflowsetV9)
+                return counts
+
+            bench_netflow_op("scapy 2.5.0", 'nf_pcaprd', netflow_read_scapy)
+            bench_netflow_op("scapy 2.5.0", 'nf_simple', netflow_simple_scapy,
+                             netflow_datagram_probe(netflow_simple_scapy))
+            bench_netflow_op("scapy 2.5.0", 'nf_decode', netflow_decode_scapy,
+                             netflow_counts_scapy)
+        except Exception as e:
+            section_failed("scapy 2.5.0", e)
+
+    # ------------------------------------------------------------------ dpkt
+    if enabled('dpkt'):
+        try:
+            import dpkt as nf_dpkt
+
+            def netflow_read_dpkt():
+                n = 0
+                f = open(NETFLOW_PCAP, 'rb')
+                for _ts, _buf in nf_dpkt.pcap.Reader(f):
+                    n += 1
+                f.close()
+                return n
+
+            bench_netflow_op("dpkt 1.9.8", 'nf_pcaprd', netflow_read_dpkt)
+            netflow_unsupported("dpkt 1.9.8",
+                                'dpkt.netflow models v1/v5/v6/v7 only and has '
+                                'no template handling, so it cannot decode a '
+                                'v9/IPFIX datagram',
+                                ('nf_simple', 'nf_decode'))
+        except Exception as e:
+            section_failed("dpkt 1.9.8", e)
 
 
 # --------------------------------------------------------------------- output
-import json
-results['_config'] = {
-    'iterations': args.iterations,
-    'repeats': args.repeats,
-    'pcap_min_seconds_per_sample': args.pcap_seconds,
-    'pcap': args.pcap,
-}
-print(json.dumps(results, indent=2))
+log('done in %.1fs', time.perf_counter() - RUN_T0)
+dump_results(final=True)

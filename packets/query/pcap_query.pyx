@@ -14,7 +14,8 @@ import os
 import time
 
 from packets.core.inetpkt cimport PKT, Ethernet, IP, TCP, ICMP, \
-    IGMP, UDP, ARP, MPLS, NullPkt, IP6, ICMP6, PQ_FRAME, PQ_TCP, PQ_UDP
+    IGMP, UDP, ARP, MPLS, NullPkt, IP6, ICMP6, PQ_FRAME, PQ_TCP, PQ_UDP, \
+    get_short_nibble
 from packets.core.pcap cimport PCAPSocket, PCAPReader, \
     pcap_pkthdr_t, findalldevs
 
@@ -41,6 +42,30 @@ cdef enum:
     FIELD_UDP_DSTPORT = 14
     FIELD_UDP_LENGTH = 15
     FIELD_UDP_CHECKSUM = 16
+    FIELD_TCP_SRCPORT = 17
+    FIELD_TCP_DSTPORT = 18
+    FIELD_TCP_SEQ = 19
+    FIELD_TCP_ACK = 20
+    FIELD_TCP_HDR_LEN = 21
+    FIELD_TCP_LEN = 22
+    FIELD_TCP_FLAGS = 23
+    FIELD_TCP_FLAGS_URG = 24
+    FIELD_TCP_FLAGS_ACK = 25
+    FIELD_TCP_FLAGS_PUSH = 26
+    FIELD_TCP_FLAGS_RESET = 27
+    FIELD_TCP_FLAGS_SYN = 28
+    FIELD_TCP_FLAGS_FIN = 29
+    FIELD_TCP_WINDOW_SIZE = 30
+    FIELD_TCP_CHECKSUM = 31
+    FIELD_TCP_URGENT_POINTER = 32
+    FIELD_IPV6_VERSION = 33
+    FIELD_IPV6_TCLASS = 34
+    FIELD_IPV6_FLOW = 35
+    FIELD_IPV6_PLEN = 36
+    FIELD_IPV6_NXT = 37
+    FIELD_IPV6_HLIM = 38
+    FIELD_IPV6_SRC = 39
+    FIELD_IPV6_DST = 40
 
 known_fields = {
     'frame.time_epoch': FIELD_FRAME_TIME,
@@ -59,6 +84,30 @@ known_fields = {
     'udp.dstport': FIELD_UDP_DSTPORT,
     'udp.length': FIELD_UDP_LENGTH,
     'udp.checksum': FIELD_UDP_CHECKSUM,
+    'tcp.srcport': FIELD_TCP_SRCPORT,
+    'tcp.dstport': FIELD_TCP_DSTPORT,
+    'tcp.seq': FIELD_TCP_SEQ,
+    'tcp.ack': FIELD_TCP_ACK,
+    'tcp.hdr_len': FIELD_TCP_HDR_LEN,
+    'tcp.len': FIELD_TCP_LEN,
+    'tcp.flags': FIELD_TCP_FLAGS,
+    'tcp.flags.urg': FIELD_TCP_FLAGS_URG,
+    'tcp.flags.ack': FIELD_TCP_FLAGS_ACK,
+    'tcp.flags.push': FIELD_TCP_FLAGS_PUSH,
+    'tcp.flags.reset': FIELD_TCP_FLAGS_RESET,
+    'tcp.flags.syn': FIELD_TCP_FLAGS_SYN,
+    'tcp.flags.fin': FIELD_TCP_FLAGS_FIN,
+    'tcp.window_size_value': FIELD_TCP_WINDOW_SIZE,
+    'tcp.checksum': FIELD_TCP_CHECKSUM,
+    'tcp.urgent_pointer': FIELD_TCP_URGENT_POINTER,
+    'ipv6.version': FIELD_IPV6_VERSION,
+    'ipv6.tclass': FIELD_IPV6_TCLASS,
+    'ipv6.flow': FIELD_IPV6_FLOW,
+    'ipv6.plen': FIELD_IPV6_PLEN,
+    'ipv6.nxt': FIELD_IPV6_NXT,
+    'ipv6.hlim': FIELD_IPV6_HLIM,
+    'ipv6.src': FIELD_IPV6_SRC,
+    'ipv6.dst': FIELD_IPV6_DST,
 }
 DEF ERRBUF_SZ = 256
 # Length of the two payload offset field prefixes below. Those are the only
@@ -122,12 +171,6 @@ cdef class Frame:
         return []
 
 
-def get_field_val_f(int layer_index, str field_name):
-    def f(list layers_list):
-        return layers_list[layer_index].get_field_val(field_name)
-    return f
-
-
 cdef class _FieldDescriptor:
     def __cinit__(self, int layer_index, str field_name):
         self.layer_index = layer_index
@@ -173,6 +216,54 @@ cdef inline object _descriptor_value(_FieldDescriptor descriptor,
             return (<UDP>layer).ulen
         elif field_id == FIELD_UDP_CHECKSUM:
             return (<UDP>layer).checksum
+    elif isinstance(layer, TCP):
+        if field_id == FIELD_TCP_SRCPORT:
+            return (<TCP>layer).sport
+        elif field_id == FIELD_TCP_DSTPORT:
+            return (<TCP>layer).dport
+        elif field_id == FIELD_TCP_SEQ:
+            return (<TCP>layer).sequence
+        elif field_id == FIELD_TCP_ACK:
+            return (<TCP>layer).acknowledgment
+        elif field_id == FIELD_TCP_HDR_LEN:
+            return get_short_nibble((<TCP>layer)._off_flags, 12)
+        elif field_id == FIELD_TCP_LEN:
+            return (<TCP>layer).ws_len
+        elif field_id == FIELD_TCP_FLAGS:
+            return (<TCP>layer)._off_flags & 0b111111
+        elif field_id == FIELD_TCP_FLAGS_URG:
+            return ((<TCP>layer)._off_flags >> 5) & 1
+        elif field_id == FIELD_TCP_FLAGS_ACK:
+            return ((<TCP>layer)._off_flags >> 4) & 1
+        elif field_id == FIELD_TCP_FLAGS_PUSH:
+            return ((<TCP>layer)._off_flags >> 3) & 1
+        elif field_id == FIELD_TCP_FLAGS_RESET:
+            return ((<TCP>layer)._off_flags >> 2) & 1
+        elif field_id == FIELD_TCP_FLAGS_SYN:
+            return ((<TCP>layer)._off_flags >> 1) & 1
+        elif field_id == FIELD_TCP_FLAGS_FIN:
+            return (<TCP>layer)._off_flags & 1
+        elif field_id == FIELD_TCP_WINDOW_SIZE:
+            return (<TCP>layer).window
+        elif field_id == FIELD_TCP_CHECKSUM:
+            return (<TCP>layer).checksum
+        elif field_id == FIELD_TCP_URGENT_POINTER:
+            return (<TCP>layer).urg_ptr
+    elif isinstance(layer, IP6):
+        if field_id == FIELD_IPV6_VERSION:
+            return (<IP6>layer)._v_tc_flow >> 28
+        elif field_id == FIELD_IPV6_TCLASS:
+            return ((<IP6>layer)._v_tc_flow >> 20) & 0xff
+        elif field_id == FIELD_IPV6_FLOW:
+            return (<IP6>layer)._v_tc_flow & 0xfffff
+        elif field_id == FIELD_IPV6_PLEN:
+            return (<IP6>layer).payload_len
+        elif field_id == FIELD_IPV6_NXT:
+            return (<IP6>layer)._nh
+        elif field_id == FIELD_IPV6_HLIM:
+            return (<IP6>layer).hop_limit
+        elif field_id == FIELD_IPV6_SRC or field_id == FIELD_IPV6_DST:
+            return (<IP6>layer).get_field_val(descriptor.field_name)
     if isinstance(layer, PKT):
         return (<PKT>layer).get_field_val(descriptor.field_name)
     return layer.get_field_val(descriptor.field_name)
@@ -296,7 +387,6 @@ cdef class PcapQuery:
                                  "".format(kwargs.get('bpf_filter')))
 
         self.layer_order = list()
-        self.field_functions = list()
         self.field_descriptors = list()
         self.fields = dict()
         self.l7_ports = dict()
@@ -326,10 +416,12 @@ cdef class PcapQuery:
             ptype = self.fields[field_key(pfield)]
             if ptype not in self.layer_order:
                 self.layer_order.append(ptype)
-            self.field_functions.append(get_field_val_f(
-                self.layer_order.index(ptype), pfield))
             self.field_descriptors.append(_FieldDescriptor(
                 self.layer_order.index(ptype), pfield))
+
+        self._skip_decode = (len(self.layer_order) == 0 or
+                            (len(self.layer_order) == 1 and
+                             self.layer_order[0] == PQ_FRAME))
         self.stop_event = kwargs.get('stop_event', Event())
 
     cdef tuple _extract_row(self, list layers):
@@ -416,13 +508,19 @@ cdef class PcapQuery:
                     continue
                 break
             layers = list()
-            spkt = Ethernet(pkt, l7_ports=self.l7_ports,
-                            decode_context=self.decode_context)
-            for pq_type in self.layer_order:
-                if pq_type == PQ_FRAME:
+            if self._skip_decode:
+                if len(pkt) < 14:
+                    Ethernet(pkt)
+                for pq_type in self.layer_order:
                     layers.append(Frame(ts, hdr))
-                else:
-                    layers.append(spkt.get_layer_by_type(pq_type))
+            else:
+                spkt = Ethernet(pkt, l7_ports=self.l7_ports,
+                                decode_context=self.decode_context)
+                for pq_type in self.layer_order:
+                    if pq_type == PQ_FRAME:
+                        layers.append(Frame(ts, hdr))
+                    else:
+                        layers.append(spkt.get_layer_by_type(pq_type))
             return self._extract_row(layers)
         raise StopIteration()
 
@@ -479,7 +577,7 @@ cdef class PcapQuery:
             et = 0
 
         pkts = 0
-        no_result = len(self.field_functions)
+        no_result = len(self.field_descriptors)
         layers = list()
         data = list()
         # As in __next__, the row is unpacked untyped so that a live read
@@ -511,14 +609,20 @@ cdef class PcapQuery:
                 elif self.stop_event.is_set():
                     break
                 else:
-                    spkt = Ethernet(pkt, l7_ports=self.l7_ports,
-                                    decode_context=self.decode_context)
                     layers = list()
-                    for pq_type in self.layer_order:
-                        if pq_type == PQ_FRAME:
+                    if self._skip_decode:
+                        if len(pkt) < 14:
+                            Ethernet(pkt)
+                        for pq_type in self.layer_order:
                             layers.append(Frame(ts, hdr))
-                        else:
-                            layers.append(spkt.get_layer_by_type(pq_type))
+                    else:
+                        spkt = Ethernet(pkt, l7_ports=self.l7_ports,
+                                        decode_context=self.decode_context)
+                        for pq_type in self.layer_order:
+                            if pq_type == PQ_FRAME:
+                                layers.append(Frame(ts, hdr))
+                            else:
+                                layers.append(spkt.get_layer_by_type(pq_type))
                     row = self._extract_row(layers)
                     if row.count(None) != no_result:
                         data.append(row)

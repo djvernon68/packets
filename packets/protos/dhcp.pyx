@@ -17,12 +17,13 @@ round-trip without waiting for this example module to learn their semantics.
 
 import socket
 
+from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_GET_SIZE
 from libc.stdint cimport uint8_t, uint16_t, uint32_t
 cimport cython
 
 from packets.core.inetpkt cimport PKT, PktWriter, need_bytes, rd_u16, \
     rd_u32, rd_bytes, w_u8, w_u16, w_u32, w_bytes, w_zeros, w_take, \
-    _serialize
+    _fmt_ipv4_buf, _serialize
 
 
 cdef Py_ssize_t DHCP_FIXED_LEN = 240
@@ -31,6 +32,28 @@ cdef Py_ssize_t DHCP_SNAME_LEN = 64
 cdef Py_ssize_t DHCP_FILE_LEN = 128
 cdef Py_ssize_t DHCP6_NORMAL_LEN = 4
 cdef Py_ssize_t DHCP6_RELAY_LEN = 34
+
+
+cdef inline str _fmt_ipv4_field(bytes packed):
+    """Dot notation for one of the fixed header's four address fields.
+
+    The fields are stored packed and formatted on access, so a decode pays
+    nothing -- but get_field_val routes dhcp.ciaddr through dhcp.giaddr
+    straight here, and a query naming those columns formats four addresses
+    for every packet in the capture. socket.inet_ntop is a Python call that
+    packs its arguments and dispatches on the family before reaching the same
+    conversion; the shared writer is the conversion on its own.
+
+    Anything that is not exactly 4 bytes goes back to socket.inet_ntop so the
+    exception these properties have always raised stays the caller's
+    contract.
+
+    :param packed: the 4 packed network order bytes.
+    :return: the address as a str, e.g. '10.0.0.99'.
+    """
+    if packed is None or PyBytes_GET_SIZE(packed) != 4:
+        return socket.inet_ntop(socket.AF_INET, packed)
+    return _fmt_ipv4_buf(<const unsigned char *>PyBytes_AS_STRING(packed))
 
 
 cdef inline bytes _owned_bytes(object value):
@@ -286,25 +309,25 @@ cdef class DHCP(PKT):
 
     property ciaddr:
         def __get__(self):
-            return socket.inet_ntop(socket.AF_INET, self._ciaddr)
+            return _fmt_ipv4_field(self._ciaddr)
         def __set__(self, str value):
             self._ciaddr = socket.inet_pton(socket.AF_INET, value)
 
     property yiaddr:
         def __get__(self):
-            return socket.inet_ntop(socket.AF_INET, self._yiaddr)
+            return _fmt_ipv4_field(self._yiaddr)
         def __set__(self, str value):
             self._yiaddr = socket.inet_pton(socket.AF_INET, value)
 
     property siaddr:
         def __get__(self):
-            return socket.inet_ntop(socket.AF_INET, self._siaddr)
+            return _fmt_ipv4_field(self._siaddr)
         def __set__(self, str value):
             self._siaddr = socket.inet_pton(socket.AF_INET, value)
 
     property giaddr:
         def __get__(self):
-            return socket.inet_ntop(socket.AF_INET, self._giaddr)
+            return _fmt_ipv4_field(self._giaddr)
         def __set__(self, str value):
             self._giaddr = socket.inet_pton(socket.AF_INET, value)
 

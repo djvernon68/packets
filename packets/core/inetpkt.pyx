@@ -8,14 +8,27 @@
 
 from struct import pack, unpack
 cimport cython
-from cpython.array cimport array
+from cpython.array cimport array, clone
 from cpython.bytes cimport PyBytes_FromStringAndSize
+from cpython.unicode cimport PyUnicode_DecodeASCII
 import binascii
 import socket
 import re
 
 from libc.stdint cimport uint32_t, uint16_t
 from libc.stdlib cimport malloc, realloc, free
+from libc.string cimport strlen
+
+# The same conversion the socket module performs, reached directly. An IPv6
+# address has no single canonical text form until RFC 5952 zero compression
+# is applied, so hand rolling the formatter risks disagreeing with every
+# other tool on the host; calling the platform's own converter cannot.
+cdef extern from "sys/socket.h":
+    int AF_INET6
+
+cdef extern from "arpa/inet.h":
+    const char *inet_ntop(int af, const void *src, char *dst,
+                          unsigned int size) nogil
 
 offset_re = re.compile(r'^(udp|tcp)\.payload\.offset\[(\d*):(\d*)\]$')
 
@@ -561,6 +574,148 @@ cdef array pack_mac(str mac):
     return array('B', [int(x, 16) for x in mac.split(':')])
 
 
+# Lowercase hex digits indexed by nibble, and the two separators plus the
+# digit base as their ASCII code points -- Cython has no character literal.
+# The literal below becomes a C string constant, not a Python object.
+cdef const char *_HEX_DIGITS = b'0123456789abcdef'
+DEF ASCII_COLON = 0x3a
+# Widest text form of a MAC address, written into a stack buffer of exactly
+# that size. The dotted quad equivalent lives with _fmt_ipv4_buf in the pxd.
+DEF MAC_TEXT_LEN = 17
+# INET6_ADDRSTRLEN: 8 groups of 4 hex digits, 7 colons, the IPv4 mapped tail
+# and the terminating NUL inet_ntop writes.
+DEF IPV6_TEXT_LEN = 46
+
+
+cdef inline str _fmt_mac_buf(const unsigned char *src):
+    """Format 6 address bytes as lowercase colon notation, entirely in C.
+
+    The counterpart of :func:`pack_mac`, and open to the same objection:
+    ``"%02x:..." % unpack("BBBBBB", buf)`` is two Python calls and a six
+    element tuple per address. Reading an address is not a one off -- a
+    pcap_query asking for eth.src and eth.dst pays it twice for every packet
+    in the capture -- and it measured larger than parsing the whole frame.
+
+    :param src: at least 6 readable bytes of address.
+    :return: the address as a str, e.g. '01:02:03:04:05:06'.
+    """
+    cdef char out[MAC_TEXT_LEN]
+    cdef Py_ssize_t i, j = 0
+    cdef unsigned char octet
+
+    for i in range(6):              # MAC_LEN, as a C loop bound
+        if i:
+            out[j] = ASCII_COLON
+            j += 1
+        octet = src[i]
+        out[j] = _HEX_DIGITS[octet >> 4]
+        out[j + 1] = _HEX_DIGITS[octet & 0x0f]
+        j += 2
+    return PyUnicode_DecodeASCII(out, j, NULL)
+
+
+cdef inline str _fmt_mac(array mac):
+    """Colon notation for an address held as the usual array('B') of 6."""
+    if mac is None or len(mac) < 6:
+        # Shorter than an address: keep the original code's behaviour of
+        # raising out of the unpack rather than inventing bytes.
+        return "%02x:%02x:%02x:%02x:%02x:%02x" % unpack("BBBBBB", mac)
+    return _fmt_mac_buf(mac.data.as_uchars)
+
+
+cdef inline array _mac_from_buf(const unsigned char *src):
+    """Copy 6 address bytes out of a parse buffer into a fresh array('B').
+
+    ``array('B', rd_bytes(mv, a, b))`` is two allocations and two copies: one
+    bytes object purely to hand to the array constructor, then the array
+    itself. Every frame parses two MAC addresses before any IP work, so this
+    is one allocation and one copy instead of four of each per frame.
+
+    :param src: at least 6 readable bytes of address.
+    :return: array('B') of the address bytes.
+    """
+    cdef array out = clone(_EMPTY_BUF, 6, False)
+    memcpy(out.data.as_uchars, src, 6)
+    return out
+
+
+cdef inline str _fmt_ipv4(bytes packed):
+    """Format 4 address bytes as dot notation, entirely in C.
+
+    socket.inet_ntoa does the same job correctly, but as a Python call taking
+    a bytes argument, and ip.src/ip.dst are the most frequently read fields
+    in the library. Anything that is not exactly 4 bytes is handed to
+    inet_ntoa so its exception stays the caller's contract.
+
+    The digit writer itself is _fmt_ipv4_buf in inetpkt.pxd, so the proto
+    modules parsing straight out of a buffer share it instead of copying it.
+
+    :param packed: the 4 packed network order bytes.
+    :return: the address as a str, e.g. '10.1.2.3'.
+    """
+    if packed is None or PyBytes_GET_SIZE(packed) != 4:
+        return _inet_ntoa(packed)
+    return _fmt_ipv4_buf(<const unsigned char *>PyBytes_AS_STRING(packed))
+
+
+cdef inline str _fmt_ipv6(bytes packed):
+    """Format 16 address bytes as colon notation, entirely in C.
+
+    socket.inet_ntop is a Python call that packs its arguments, dispatches on
+    the address family and builds a str; this is the C function underneath it
+    writing into a stack buffer. Anything that is not exactly 16 bytes, or a
+    conversion the platform refuses, is handed back to socket.inet_ntop so
+    its exception stays the caller's contract.
+
+    :param packed: the 16 packed network order bytes.
+    :return: the address as a str, e.g. '2001:db8::1'.
+    """
+    cdef char out[IPV6_TEXT_LEN]
+
+    if packed is None or PyBytes_GET_SIZE(packed) != 16:
+        return _inet_ntop(_AF_INET6, packed)
+    if inet_ntop(AF_INET6, PyBytes_AS_STRING(packed), out,
+                 IPV6_TEXT_LEN) == NULL:
+        return _inet_ntop(_AF_INET6, packed)
+    return PyUnicode_DecodeASCII(out, strlen(out), NULL)
+
+
+cdef inline bytes _payload_offset_bytes(PKT payload, object first,
+                                       object last):
+    """Bytes ``[first:last]`` of a payload without serializing all of it.
+
+    ``udp.payload.offset[0:32]`` used to answer a 32 byte question by running
+    pkt2net over the whole payload -- a full copy of a 1400 byte datagram,
+    for every packet in the capture. When layer 7 was not decoded the bytes
+    are already held, either directly or as a range in the frame that owns
+    them, so only the requested window needs copying. Python slice semantics
+    are preserved by handing anything unusual -- negative or out of range
+    indices -- back to a real slice.
+
+    :param payload: the payload layer being queried.
+    :param first: slice start, as the caller wrote it.
+    :param last: slice stop, as the caller wrote it.
+    :return: the requested bytes.
+    """
+    cdef NullPkt raw
+    cdef Py_ssize_t a, b, n
+
+    if isinstance(payload, NullPkt):
+        raw = <NullPkt>payload
+        if raw._payload is not None:
+            return raw._payload[first:last]
+        n = raw._length
+        if 0 <= first <= n and 0 <= last <= n:
+            a = first
+            b = last
+            if a >= b:
+                return b''
+            return PyBytes_FromStringAndSize(
+                PyBytes_AS_STRING(raw._owner) + raw._start + a, b - a)
+        return raw._payload_bytes()[first:last]
+    return payload.pkt2net({})[first:last]
+
+
 cdef bytes pack_ipv6(str ip):
     """Validate and convert a colon notation IPv6 address in one call.
 
@@ -1030,9 +1185,9 @@ cdef class ARP(PKT):
                        self.proto_len == IPV4_LEN):
                 need_bytes(mv, 28, 'ARP')
                 self._sender_hw_addr = buf[8:14]
-                self.sender_proto_addr = _inet_ntoa(rd_bytes(mv, 14, 18))
+                self.sender_proto_addr = _fmt_ipv4(rd_bytes(mv, 14, 18))
                 self._target_hw_addr = buf[18:24]
-                self.target_proto_addr = _inet_ntoa(rd_bytes(mv, 24, 28))
+                self.target_proto_addr = _fmt_ipv4(rd_bytes(mv, 24, 28))
             else:
                 s_proto_start = 8 + self.hardware_len
                 t_hw_start = s_proto_start + self.proto_len
@@ -1084,15 +1239,13 @@ cdef class ARP(PKT):
 
     property sender_hw_addr:
         def __get__(self):
-            return "%02x:%02x:%02x:%02x:%02x:%02x" % unpack("BBBBBB",
-                                                        self._sender_hw_addr)
+            return _fmt_mac(self._sender_hw_addr)
         def __set__(self, str val):
             self._sender_hw_addr = pack_mac(val)
 
     property target_hw_addr:
         def __get__(self):
-            return "%02x:%02x:%02x:%02x:%02x:%02x" % unpack("BBBBBB",
-                                                        self._target_hw_addr)
+            return _fmt_mac(self._target_hw_addr)
         def __set__(self, str val):
             self._target_hw_addr = pack_mac(val)
 
@@ -1706,9 +1859,9 @@ cdef class UDP(PKT):
         elif f == 'udp.payload.offset':
             offsets = (field[19:field.index(']')].split(':'))
             if len(offsets) == 2:
-                return self.payload.pkt2net({})[
-                       int(offsets[0]):int(offsets[1])
-                       ]
+                return _payload_offset_bytes(self.payload,
+                                             int(offsets[0]),
+                                             int(offsets[1]))
             return None
         else:
             return None
@@ -2072,9 +2225,9 @@ cdef class TCP(PKT):
         elif f == 'tcp.payload.offset':
             offsets = (field[19:field.index(']')].split(':'))
             if len(offsets) == 2:
-                return self.payload.pkt2net({})[
-                       int(offsets[0]):int(offsets[1])
-                       ]
+                return _payload_offset_bytes(self.payload,
+                                             int(offsets[0]),
+                                             int(offsets[1]))
             return None
         else:
             return None
@@ -2553,7 +2706,7 @@ cdef class ICMP(PKT):
 
     property address:
         def __get__(self):
-            return _inet_ntoa(self._address)
+            return _fmt_ipv4(self._address)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv4(value)
             if packed is None:
@@ -2634,7 +2787,7 @@ cdef class IGMPGroupRecord(PKT):
 
     property group_address:
         def __get__(self):
-            return _inet_ntoa(self._group_address)
+            return _fmt_ipv4(self._group_address)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv4(value)
             if packed is None:
@@ -2651,7 +2804,7 @@ cdef class IGMPGroupRecord(PKT):
                 r = list()
                 for i in range(self.num_src):
                     r.append(
-                        _inet_ntoa(self._source_addresses[i*4:i*4+4])
+                        _fmt_ipv4(self._source_addresses[i*4:i*4+4])
                     )
                 return r
             else:
@@ -2967,7 +3120,7 @@ cdef class IGMP(PKT):
 
     property group_address:
         def __get__(self):
-            return _inet_ntoa(self._group_address)
+            return _fmt_ipv4(self._group_address)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv4(value)
             if packed is None:
@@ -3008,7 +3161,7 @@ cdef class IGMP(PKT):
             if self._source_addresses:
                 r = list()
                 for i in range(self.num_records):
-                    r.append(_inet_ntoa(self._source_addresses[i*4:i*4+4]))
+                    r.append(_fmt_ipv4(self._source_addresses[i*4:i*4+4]))
                 return r
             else:
                 return list()
@@ -3566,7 +3719,7 @@ cdef class IP(PKT):
 
     property src:
         def __get__(self):
-            return _inet_ntoa(self._src)
+            return _fmt_ipv4(self._src)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv4(value)
             if packed is None:
@@ -3582,7 +3735,7 @@ cdef class IP(PKT):
 
     property dst:
         def __get__(self):
-            return _inet_ntoa(self._dst)
+            return _fmt_ipv4(self._dst)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv4(value)
             if packed is None:
@@ -3955,7 +4108,7 @@ cdef class IP6(PKT):
 
     property src:
         def __get__(self):
-            return _inet_ntop(_AF_INET6, self._src)
+            return _fmt_ipv6(self._src)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv6(value)
             if packed is None:
@@ -3972,7 +4125,7 @@ cdef class IP6(PKT):
 
     property dst:
         def __get__(self):
-            return _inet_ntop(_AF_INET6, self._dst)
+            return _fmt_ipv6(self._dst)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv6(value)
             if packed is None:
@@ -4138,8 +4291,8 @@ cdef class ICMP6Opt(PKT):
         address option. None when the option is too short to hold one."""
         def __get__(self):
             if len(self._data) >= MAC_LEN:
-                return "%02x:%02x:%02x:%02x:%02x:%02x" % \
-                       unpack("BBBBBB", self._data[:MAC_LEN])
+                return _fmt_mac_buf(
+                    <const unsigned char *>PyBytes_AS_STRING(self._data))
             return None
         def __set__(self, str val):
             self.data = pack_mac(val).tobytes()
@@ -4193,7 +4346,7 @@ cdef class ICMP6Opt(PKT):
         """Prefix Information (3): the prefix in colon notation."""
         def __get__(self):
             if self.type == ICMP6_OPT_PREFIX_INFO and len(self._data) >= 30:
-                return _inet_ntop(_AF_INET6, self._data[14:30])
+                return _fmt_ipv6(self._data[14:30])
             return None
 
     cpdef bytes pkt2net(self, dict kwargs):
@@ -4278,7 +4431,7 @@ cdef class MLDv2AddressRecord(PKT):
 
     property multicast_address:
         def __get__(self):
-            return _inet_ntop(_AF_INET6, self._multicast_address)
+            return _fmt_ipv6(self._multicast_address)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv6(value)
             if packed is None:
@@ -4294,8 +4447,8 @@ cdef class MLDv2AddressRecord(PKT):
             if self._source_addresses:
                 r = list()
                 for i in range(self.num_src):
-                    r.append(_inet_ntop(_AF_INET6,
-                                        self._source_addresses[i*16:i*16+16]))
+                    r.append(_fmt_ipv6(
+                        self._source_addresses[i*16:i*16+16]))
                 return r
             else:
                 return list()
@@ -4841,7 +4994,7 @@ cdef class ICMP6(PKT):
     property target_address:
         """ND target address (types 135, 136 and 137) in colon notation."""
         def __get__(self):
-            return _inet_ntop(_AF_INET6, self._target_address)
+            return _fmt_ipv6(self._target_address)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv6(value)
             if packed is None:
@@ -4852,7 +5005,7 @@ cdef class ICMP6(PKT):
     property dest_address:
         """Redirect (137) destination address in colon notation."""
         def __get__(self):
-            return _inet_ntop(_AF_INET6, self._dest_address)
+            return _fmt_ipv6(self._dest_address)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv6(value)
             if packed is None:
@@ -4863,7 +5016,7 @@ cdef class ICMP6(PKT):
     property multicast_address:
         """MLD multicast address in colon notation."""
         def __get__(self):
-            return _inet_ntop(_AF_INET6, self._multicast_address)
+            return _fmt_ipv6(self._multicast_address)
         def __set__(self, str value):
             cdef bytes packed = pack_ipv6(value)
             if packed is None:
@@ -4880,8 +5033,8 @@ cdef class ICMP6(PKT):
             if self._source_addresses:
                 r = list()
                 for i in range(self.num_src):
-                    r.append(_inet_ntop(_AF_INET6,
-                                        self._source_addresses[i*16:i*16+16]))
+                    r.append(_fmt_ipv6(
+                        self._source_addresses[i*16:i*16+16]))
                 return r
             else:
                 return list()
@@ -5337,14 +5490,12 @@ cdef int _decode_arp(ARP pkt, bytes owner, Py_ssize_t start,
             pkt.hardware_len == MAC_LEN and
             pkt.proto_len == IPV4_LEN):
         _need_range(start, end, 28, 'ARP')
-        pkt._sender_hw_addr = array('B', rd_bytes(mv, start + 8,
-                                                  start + 14))
-        pkt.sender_proto_addr = _inet_ntoa(rd_bytes(mv, start + 14,
-                                                    start + 18))
-        pkt._target_hw_addr = array('B', rd_bytes(mv, start + 18,
-                                                  start + 24))
-        pkt.target_proto_addr = _inet_ntoa(rd_bytes(mv, start + 24,
-                                                    start + 28))
+        pkt._sender_hw_addr = _mac_from_buf(&mv[start + 8])
+        pkt.sender_proto_addr = _fmt_ipv4(rd_bytes(mv, start + 14,
+                                                   start + 18))
+        pkt._target_hw_addr = _mac_from_buf(&mv[start + 18])
+        pkt.target_proto_addr = _fmt_ipv4(rd_bytes(mv, start + 24,
+                                                   start + 28))
     else:
         s_proto_start = start + 8 + pkt.hardware_len
         t_hw_start = s_proto_start + pkt.proto_len
@@ -5688,15 +5839,14 @@ cdef inline int _decode_eth_ip_udp_fast(Ethernet pkt, bytes owner,
                                         Py_ssize_t end) except -1:
     cdef:
         Py_ssize_t ip_start = 14
-        Py_ssize_t udp_start, raw_start, datagram_end
+        Py_ssize_t udp_start, datagram_end
         unsigned char iphl, hl_bytes
         IP ip
         UDP udp
-        NullPkt raw
 
     _need_range(0, end, 14, 'Ethernet')
-    pkt._dst_mac = array('B', rd_bytes(mv, 0, 6))
-    pkt._src_mac = array('B', rd_bytes(mv, 6, 12))
+    pkt._dst_mac = _mac_from_buf(&mv[0])
+    pkt._src_mac = _mac_from_buf(&mv[6])
     pkt.type = rd_u16(mv, 12)
     if pkt.type == ETH_TYPE_8021Q:
         _need_range(0, end, 18, 'Ethernet')
@@ -5755,17 +5905,13 @@ cdef inline int _decode_eth_ip_udp_fast(Ethernet pkt, bytes owner,
         udp._trailer = rd_bytes(mv, datagram_end, end)
         end = datagram_end
 
-    raw_start = udp_start + 8
-    raw = NullPkt.__new__(NullPkt)
-    raw._l7_ports = None
-    raw.pkt_name = 'NullPkt'
-    raw.pq_type, raw.query_fields = _QI_NULLPKT
-    raw._payload = PyBytes_FromStringAndSize(
-        PyBytes_AS_STRING(owner) + raw_start, end - raw_start)
-    raw._owner = None
-    raw._start = 0
-    raw._length = 0
-    udp.payload = raw
+    # The datagram body is handed on as an owner plus a range, which is what
+    # _null_range does for the general path and what the whole owner/offset
+    # design is for. Copying it here made this path allocate and memcpy the
+    # entire payload of every packet in a capture -- the one thing the fast
+    # path was supposed to avoid -- and left the two paths returning
+    # NullPkts with different internal representations of the same bytes.
+    udp.payload = _null_range(owner, udp_start + 8, end, None)
     ip.payload = udp
     pkt.payload = ip
     return 0
@@ -6221,8 +6367,8 @@ cdef inline int _decode_ethernet(Ethernet pkt, bytes owner,
         MPLS mpls
         ARP arp
     _need_range(start, end, 14, 'Ethernet')
-    pkt._dst_mac = array('B', rd_bytes(mv, start, start + 6))
-    pkt._src_mac = array('B', rd_bytes(mv, start + 6, start + 12))
+    pkt._dst_mac = _mac_from_buf(&mv[start])
+    pkt._src_mac = _mac_from_buf(&mv[start + 6])
     pkt.type = rd_u16(mv, start + 12)
     if pkt.type == ETH_TYPE_8021Q:
         _need_range(start, end, 18, 'Ethernet')
@@ -6279,11 +6425,13 @@ cdef inline int _init_ethernet_kwargs(Ethernet pkt,
     if 'src_mac' in kwargs:
         pkt.src_mac = kwargs['src_mac']
     else:
-        pkt._src_mac = array('B', b'\x00\x00\x00\x00\x00\x00')
+        # clone(zero=True) is calloc'd storage: no bytes literal to walk and
+        # no array constructor call for the default address pair.
+        pkt._src_mac = clone(_EMPTY_BUF, 6, True)
     if 'dst_mac' in kwargs:
         pkt.dst_mac = kwargs['dst_mac']
     else:
-        pkt._dst_mac = array('B', b'\x00\x00\x00\x00\x00\x00')
+        pkt._dst_mac = clone(_EMPTY_BUF, 6, True)
     if 'type' in kwargs:
         pkt.type = kwargs['type']
     else:
@@ -6452,15 +6600,13 @@ cdef class Ethernet(PKT):
 
     property src_mac:
         def __get__(self):
-            return "%02x:%02x:%02x:%02x:%02x:%02x" % unpack("BBBBBB",
-                                                            self._src_mac)
+            return _fmt_mac(self._src_mac)
         def __set__(self, str val):
             self._src_mac = pack_mac(val)
 
     property dst_mac:
         def __get__(self):
-            return "%02x:%02x:%02x:%02x:%02x:%02x" % unpack("BBBBBB",
-                                                            self._dst_mac)
+            return _fmt_mac(self._dst_mac)
         def __set__(self, str val):
             self._dst_mac = pack_mac(val)
 
