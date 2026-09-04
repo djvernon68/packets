@@ -24,7 +24,14 @@ are comparable.
 
 Usage:
     python3 bench/microbench.py [iterations] [repeats]
+    python3 bench/microbench.py --json [iterations] [repeats]
+
+With --json the human table is written to stderr and a machine-diffable
+{label: {median_ns, best_ns, pps}} document is written to stdout, which is what
+regression.py consumes.
 """
+import argparse
+import json
 import sys
 import gc
 import statistics
@@ -275,7 +282,29 @@ def make_phase_c2_corpus():
     }
 
 
+# Number of untimed warm-up calls before each measurement, mirroring
+# compare_libs.timeit so the first timed pass is not charged one-time
+# allocation/JIT-of-the-interpreter costs the later passes never pay.
+WARMUP = 100
+
+# Populated by every bench() call: label -> {median_ns, best_ns, pps}. Emitted
+# as JSON when --json is given.
+RESULTS = {}
+
+# Stream the human-readable table is written to. Redirected to stderr in --json
+# mode so stdout carries only the JSON document.
+_table = sys.stdout
+
+
+def _row(text):
+    _table.write(text + '\n')
+    _table.flush()
+
+
 def bench(label, fn, iterations, repeats):
+    # warm up
+    for _ in range(WARMUP):
+        fn()
     samples = []
     gc.disable()
     try:
@@ -291,21 +320,38 @@ def bench(label, fn, iterations, repeats):
     best_ns = best / iterations * 1e9
     median_ns = median / iterations * 1e9
     median_pps = iterations / median
-    print('%-22s median %10.1f ns/pkt  best %10.1f  %12.0f pkt/s' %
-          (label, median_ns, best_ns, median_pps))
+    RESULTS[label] = {'median_ns': median_ns, 'best_ns': best_ns,
+                      'pps': median_pps}
+    _row('%-22s median %10.1f ns/pkt  best %10.1f  %12.0f pkt/s' %
+         (label, median_ns, best_ns, median_pps))
     return median_ns
 
 
 def main():
-    iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 50000
-    repeats = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('iterations', nargs='?', type=int, default=50000)
+    parser.add_argument('repeats', nargs='?', type=int, default=5)
+    parser.add_argument('--json', action='store_true',
+                        help='emit {label: {median_ns, best_ns, pps}} as JSON '
+                             'on stdout; the human table goes to stderr')
+    args = parser.parse_args()
+    iterations = args.iterations
+    repeats = args.repeats
+    if iterations <= 0 or repeats <= 0:
+        parser.error('iterations and repeats must be positive')
+
+    global _table
+    if args.json:
+        _table = sys.stderr
 
     udp_raw = make_udp().pkt2net({'csum': 1, 'update': 1})
     tcp_raw = make_tcp().pkt2net({'csum': 1, 'update': 1})
 
-    print('iterations=%d repeats=%d (median and best)  udp_len=%d tcp_len=%d'
-          % (iterations, repeats, len(udp_raw), len(tcp_raw)))
-    print('-' * 82)
+    _row('iterations=%d repeats=%d (median and best)  udp_len=%d tcp_len=%d'
+         % (iterations, repeats, len(udp_raw), len(tcp_raw)))
+    _row('-' * 82)
     bench('construct_udp', make_udp, iterations, repeats)
     bench('construct_tcp', make_tcp, iterations, repeats)
     bench('build_udp+csum', lambda: make_udp().pkt2net({'csum': 1, 'update': 1}),
@@ -331,7 +377,7 @@ def main():
 
     parsed_udp = Ethernet(udp_raw)
     parsed_ip = parsed_udp.payload
-    print('-' * 82)
+    _row('-' * 82)
     bench('access_eth_src_x1', lambda: parsed_udp.src_mac,
           iterations, repeats)
     bench('access_eth_src_x16', lambda: access_eth_src_16(parsed_udp),
@@ -355,7 +401,7 @@ def main():
 
     corpus = make_layer_corpus()
     phase_c2 = make_phase_c2_corpus()
-    print('-' * 82)
+    _row('-' * 82)
     bench('parse_arp', lambda: ARP(corpus['arp']), iterations, repeats)
     bench('parse_icmp_echo', lambda: ICMP(corpus['icmp_echo']),
           iterations, repeats)
@@ -431,7 +477,7 @@ def main():
     icmp_du_pkt = ICMP(corpus['icmp_du'])
     igmp_v3_pkt = IGMP(corpus['igmp_v3'])
     mpls_pkt = MPLS(corpus['mpls'])
-    print('-' * 82)
+    _row('-' * 82)
     bench('serialize_arp', lambda: arp_pkt.pkt2net({}), iterations, repeats)
     bench('serialize_icmp_du', lambda: icmp_du_pkt.pkt2net({'csum': 1}),
           iterations, repeats)
@@ -448,6 +494,11 @@ def main():
     bench('serialize_dns_nocompress',
           lambda: dns_pkt.pkt2net({'update': 1, 'compress': 0}),
           iterations, repeats)
+
+    if args.json:
+        json.dump(RESULTS, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write('\n')
+        sys.stdout.flush()
 
 
 if __name__ == '__main__':

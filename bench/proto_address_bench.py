@@ -87,6 +87,9 @@ def dhcp_datagram():
 
 
 def bench(label, operation, iterations, repeats, per_call, unit):
+    # warm up (mirrors compare_libs.timeit's warmup) so the first timed pass is
+    # not charged one-time costs the later passes never pay.
+    operation(min(100, iterations))
     samples = []
     gc.disable()
     try:

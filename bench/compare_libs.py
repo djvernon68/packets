@@ -24,6 +24,26 @@ Only a library with a v9/IPFIX decoder can do the last part. The others are
 recorded as ``unsupported`` for that operation rather than compared on some
 cheaper operation that would look deceptively quick.
 
+``--l7-pcap`` adds a full layer-7 decode comparison over a capture whose frames
+carry valid application-layer messages on well-known ports (build it with
+``make_corpus.py --l7``). Unlike the frame benchmarks above -- whose opaque L4
+ports deliberately keep the payload from being interpreted -- every frame here
+decodes all the way to L7, one row per protocol:
+
+  * l7_dns     - DNS over UDP/53
+  * l7_dns_tcp - DNS over TCP/53 (packets only; see the fairness note)
+  * l7_http    - HTTP request/response over TCP/80
+  * l7_dhcp    - BOOTP/DHCPv4 over UDP/67
+  * l7_dhcp6   - DHCPv6 over UDP/547
+  * l7_netflow - NetFlow v9 over UDP/2055 (template state shared per bucket)
+
+Each library decodes only the protocols it actually supports; a protocol it
+cannot decode is recorded as ``unsupported``. The L7 timing is in-memory: the
+frames are read once (untimed) and bucketed by protocol, then each op decodes
+its bucket from bytes, so the numbers are a pure decode comparison that is not
+skewed by each library's different pcap-reader speed (read cost is already the
+``pcaprd`` rows over ``--pcap``).
+
 Run with PYTHONPATH pointed at the packets build directory.
 
 Expect a full run to take several minutes: every pcap operation samples for at
@@ -32,6 +52,28 @@ that window, and the pure-Python comparison libraries are one to two orders of
 magnitude slower per packet than a compiled build. A progress log is written to
 stderr as each sample completes so a slow run is distinguishable from a stall;
 use ``--libs`` to measure only the libraries of interest.
+
+Fairness notes:
+  * packets decodes L2-L4 eagerly and L7 lazily; the ``pcapdec_*`` variants
+    exist so the comparison is against equivalent work in each other library
+    (raw read, construct-and-discard, raw-MAC access, formatted-MAC access,
+    UDP-port access) rather than a single decode depth that would flatter one
+    library's laziness.
+  * the dpkt ``build`` row presets the wire lengths by hand
+    (``udp.ulen``/``ip.len``) before serializing, because dpkt does not
+    recompute them. packets and scapy recompute lengths and checksums during
+    serialization, so dpkt's build number reflects strictly less work; read
+    the build comparison with that caveat in mind.
+  * the ``libpcap dispatch`` rows are the C-level ceiling (count / batched
+    count / count-plus-touch-MAC via ``pcap_dispatch``); they need the
+    ``bench/pcap_dispatch_bench`` extension built first with
+    ``python3 bench/setup_dispatch.py build_ext --inplace``.
+  * the ``l7_*`` rows carry *valid* protocol payloads, so a full decode is
+    representative work for every library (no eager-dissector thrash on random
+    bytes). ``l7_dns_tcp`` is packets-only because packets decodes DNS-over-TCP
+    from the raw message while dpkt/scapy require the 2-byte length prefix, so
+    a single frame cannot feed both fairly; the shared DNS comparison is
+    therefore ``l7_dns`` over UDP.
 """
 from __future__ import print_function
 import argparse
@@ -60,6 +102,14 @@ parser.add_argument('--netflow-ports', default='2003,2033,2055',
 parser.add_argument('--netflow-seconds', type=float, default=1.0,
                     help='minimum duration of each NetFlow sample. It is a '
                          'smoke test, so this defaults below --pcap-seconds.')
+parser.add_argument('--l7-pcap', '--l7_pcap', dest='l7_pcap',
+                    help='capture whose frames carry valid application-layer '
+                         'payloads on well-known ports (build it with '
+                         'make_corpus.py --l7). When given, a full L7 decode '
+                         'comparison runs per protocol.')
+parser.add_argument('--l7-seconds', type=float, default=1.0,
+                    help='minimum duration of each L7 decode sample '
+                         '(default: %(default)s)')
 parser.add_argument('--iterations', type=int, default=50000)
 parser.add_argument('--repeats', type=int, default=5)
 parser.add_argument('--pcap-seconds', type=float, default=3.0,
@@ -124,9 +174,14 @@ if not os.path.isfile(args.pcap):
     parser.error('no such capture file: %s' % args.pcap)
 if args.netflow_pcap and not os.path.isfile(args.netflow_pcap):
     parser.error('no such capture file: %s' % args.netflow_pcap)
+if args.l7_pcap and not os.path.isfile(args.l7_pcap):
+    parser.error('no such capture file: %s' % args.l7_pcap)
+if args.l7_seconds <= 0:
+    parser.error('l7-seconds must be positive')
 
 PCAP = args.pcap
 NETFLOW_PCAP = args.netflow_pcap
+L7_PCAP = args.l7_pcap
 NETFLOW_PORTS = _parse_port_list(args.netflow_ports)
 PACKETS_LABEL = args.packets_label
 
@@ -145,6 +200,7 @@ N_BUILD = args.iterations
 N_PCAP_PASSES = args.repeats
 PCAP_SAMPLE_SECONDS = args.pcap_seconds
 NETFLOW_SAMPLE_SECONDS = args.netflow_seconds
+L7_SAMPLE_SECONDS = args.l7_seconds
 
 RUN_T0 = time.perf_counter()
 
@@ -268,6 +324,8 @@ def dump_results(final=False):
         'netflow_pcap': args.netflow_pcap,
         'netflow_ports': list(NETFLOW_PORTS),
         'netflow_min_seconds_per_sample': args.netflow_seconds,
+        'l7_pcap': args.l7_pcap,
+        'l7_min_seconds_per_sample': args.l7_seconds,
         'libs': list(ENABLED_LIBS),
         'elapsed_seconds': round(time.perf_counter() - RUN_T0, 3),
     }
@@ -326,6 +384,18 @@ def section_failed(lib, exc):
     dump_results()
 
 
+def section_missing_extension(lib, hint):
+    # A not-yet-built benchmark extension is an operator step, not a crash, so
+    # it is logged as a plain instruction rather than a scary FAILED/traceback.
+    log('%s: not built -- %s', lib, hint)
+    results.setdefault(lib, {})['error'] = hint
+    dump_results()
+
+
+DISPATCH_BUILD_HINT = ('build bench/pcap_dispatch_bench first: '
+                       'python3 bench/setup_dispatch.py build_ext --inplace')
+
+
 log('pcap=%s (%.1f MiB)', PCAP, os.path.getsize(PCAP) / 1048576.0)
 log('libs=%s iterations=%d repeats=%d pcap-seconds=%.1f',
     ','.join(ENABLED_LIBS), args.iterations, args.repeats, args.pcap_seconds)
@@ -338,6 +408,11 @@ if NETFLOW_PCAP:
         ','.join(str(port) for port in NETFLOW_PORTS), args.netflow_seconds)
 else:
     log('netflow smoke test disabled; pass --netflow-pcap to enable it')
+if L7_PCAP:
+    log('l7-pcap=%s (%.2f MiB) l7-seconds=%.1f',
+        L7_PCAP, os.path.getsize(L7_PCAP) / 1048576.0, args.l7_seconds)
+else:
+    log('L7 decode comparison disabled; pass --l7-pcap to enable it')
 
 
 # ----------------------------------------------------------------- packets 2.1
@@ -451,6 +526,8 @@ else:
 
             bench_pcap_op("libpcap dispatch", "extract_%d" % _batch_size,
                           extract_count)
+    except ImportError:
+        section_missing_extension("libpcap dispatch", DISPATCH_BUILD_HINT)
     except Exception as e:
         section_failed("libpcap dispatch", e)
 
@@ -819,6 +896,8 @@ else:
                                 'libpcap dispatch hands frames to a counter; '
                                 'it has no NetFlow decoder',
                                 ('nf_simple', 'nf_decode'))
+        except ImportError:
+            section_missing_extension("libpcap dispatch", DISPATCH_BUILD_HINT)
         except Exception as e:
             section_failed("libpcap dispatch", e)
 
@@ -943,6 +1022,352 @@ else:
                                 ('nf_simple', 'nf_decode'))
         except Exception as e:
             section_failed("dpkt 1.9.8", e)
+
+
+# ------------------------------------------------ full layer-7 decode compare
+# The --l7-pcap capture carries valid application-layer messages on well-known
+# ports, so decoding it exercises the full L2..L7 stack rather than the opaque
+# payload the frame benchmarks leave alone. Each library decodes every protocol
+# it actually supports; a protocol a library cannot decode is recorded as
+# unsupported rather than timed on a cheaper peek that would read as a win.
+#
+# Timing is in-memory: the raw frames are read once (untimed) and bucketed by
+# protocol, then each per-protocol op decodes its bucket from bytes. Read cost
+# is deliberately excluded so the number is a pure decode comparison and is not
+# skewed by each library's different pcap reader speed (that read cost is
+# already reported by the pcaprd rows over --pcap).
+L7_OPS = ('l7_dns', 'l7_dns_tcp', 'l7_http', 'l7_dhcp', 'l7_dhcp6',
+          'l7_netflow')
+
+# (l4 proto, dst port) -> bucket name. Every shape the make_corpus --l7 writer
+# emits lands its well-known port on the destination side, so dport classifies.
+L7_CLASSIFY = {
+    ('udp', 53): 'dns_udp',
+    ('tcp', 53): 'dns_tcp',
+    ('tcp', 80): 'http',
+    ('udp', 67): 'dhcp',
+    ('udp', 547): 'dhcp6',
+    ('udp', 2055): 'netflow',
+}
+L7_BUCKET_ORDER = ('dns_udp', 'dns_tcp', 'http', 'dhcp', 'dhcp6', 'netflow')
+
+
+def _l7_classify(raw):
+    """Return the bucket name for a raw frame, or None if it is not L7 corpus.
+
+    A tiny struct-free parse (Ethernet II + IPv4/IPv6 + UDP/TCP) is enough for
+    this capture and stays library-agnostic, so the same buckets feed every
+    library without any one library's decoder shaping the classification.
+    """
+    if len(raw) < 14:
+        return None
+    ethtype = (raw[12] << 8) | raw[13]
+    offset = 14
+    if ethtype == 0x0800:
+        if len(raw) < offset + 20:
+            return None
+        proto = raw[offset + 9]
+        offset += (raw[offset] & 0x0f) * 4
+    elif ethtype == 0x86dd:
+        if len(raw) < offset + 40:
+            return None
+        proto = raw[offset + 6]
+        offset += 40
+    else:
+        return None
+    if proto == 17:
+        name = 'udp'
+    elif proto == 6:
+        name = 'tcp'
+    else:
+        return None
+    if len(raw) < offset + 4:
+        return None
+    dport = (raw[offset + 2] << 8) | raw[offset + 3]
+    return L7_CLASSIFY.get((name, dport))
+
+
+def _load_l7_buckets():
+    buckets = dict((name, []) for name in L7_BUCKET_ORDER)
+    reader = PCAPReader(filename=L7_PCAP)
+    try:
+        for _ts, _hdr, raw in reader:
+            frame = bytes(raw)
+            name = _l7_classify(frame)
+            if name is not None:
+                buckets[name].append(frame)
+    finally:
+        reader.close()
+    return buckets
+
+
+def _l7_probe(fn):
+    """Wrap a decode fn so bench_l7_op can verify it resolved something."""
+    def probe():
+        return {'decoded': fn()}
+    return probe
+
+
+def bench_l7_op(lib, op, fn, verify=None):
+    """Verify one untimed decode pass resolves, then time the operation."""
+    try:
+        if verify is not None:
+            counts = verify()
+            log('  %s/%s decoded: %s', lib, op, ' '.join(
+                '%s=%s' % (name, counts[name]) for name in sorted(counts)))
+            results.setdefault(lib, {})['%s_counts' % op] = dict(counts)
+            dump_results()
+            if not counts.get('decoded'):
+                raise RuntimeError('%s decoded nothing from %s' % (op, L7_PCAP))
+        bench_pcap_op(lib, op, fn, seconds=L7_SAMPLE_SECONDS, source=L7_PCAP)
+    except Exception as exc:
+        log('%s/%s: FAILED, %s: %s', lib, op, exc.__class__.__name__, exc)
+        results.setdefault(lib, {})[op] = {'error': str(exc)}
+        dump_results()
+
+
+def l7_unsupported(lib, ops, reason):
+    for op in ops:
+        results.setdefault(lib, {})[op] = {'unsupported': reason}
+    log('%s: %s', lib, reason)
+    dump_results()
+
+
+if not L7_PCAP:
+    log('=== full L7 decode comparison: skipped, no --l7-pcap ===')
+else:
+    log('=== full L7 decode comparison: %s ===', os.path.basename(L7_PCAP))
+    L7_BUCKETS = _load_l7_buckets()
+    log('l7 buckets: %s', ' '.join(
+        '%s=%d' % (name, len(L7_BUCKETS[name])) for name in L7_BUCKET_ORDER))
+    _empty = [name for name in L7_BUCKET_ORDER if not L7_BUCKETS[name]]
+    if _empty:
+        log('l7 capture is missing protocols: %s -- rebuild it with '
+            'make_corpus.py --l7', ','.join(_empty))
+
+    # ------------------------------------------------------------ packets 2.1
+    if not enabled('packets'):
+        log('%s: L7 decode skipped, packets not selected', PACKETS_LABEL)
+    else:
+        # Import each protocol module independently so a packets build that
+        # lacks one still benches the protocols it does have, marking the rest
+        # unsupported, instead of failing the whole column. This makes the L7
+        # comparison capability-aware across releases: e.g. 2.0.2 ships only
+        # packets.protos.dns (no dhcp/http/netflow), and the v9 netflow module
+        # arrived at 2.1.6, so an older build contributes just its DNS row.
+        L7_PORTS = {}
+        _l7_missing = {}
+        try:
+            from packets.protos.dns import DNS as L7DNS
+            L7_PORTS[53] = L7DNS
+        except ImportError as _exc:
+            L7DNS = None
+            _l7_missing['dns'] = str(_exc)
+        try:
+            from packets.protos.http import HTTP as L7HTTP
+            L7_PORTS[80] = L7HTTP
+        except ImportError as _exc:
+            L7HTTP = None
+            _l7_missing['http'] = str(_exc)
+        try:
+            from packets.protos.dhcp import DHCP as L7DHCP, DHCP6 as L7DHCP6
+            L7_PORTS[67] = L7DHCP
+            L7_PORTS[547] = L7DHCP6
+        except ImportError as _exc:
+            L7DHCP = None
+            L7DHCP6 = None
+            _l7_missing['dhcp'] = str(_exc)
+        try:
+            from packets.protos.netflow import (Netflow as L7Netflow,
+                                                NetflowDecodeContext)
+            L7_PORTS[2055] = L7Netflow
+        except ImportError as _exc:
+            L7Netflow = None
+            NetflowDecodeContext = None
+            _l7_missing['netflow'] = str(_exc)
+
+        def _packets_decode(bucket, name, cls):
+            n = 0
+            for raw in L7_BUCKETS[bucket]:
+                frame = Ethernet(raw, l7_ports=L7_PORTS)
+                if isinstance(frame.get_layer(name), cls):
+                    n += 1
+            return n
+
+        def _packets_netflow():
+            # One decode context for the whole bucket: a data set resolves
+            # once the template (emitted periodically by the generator) has
+            # been learned, exactly as a live collector would carry state.
+            context = NetflowDecodeContext()
+            n = 0
+            for raw in L7_BUCKETS['netflow']:
+                frame = Ethernet(raw, l7_ports=L7_PORTS,
+                                 decode_context=context)
+                if isinstance(frame.get_layer('Netflow'), L7Netflow):
+                    n += 1
+            return n
+
+        def _packets_decoder(bucket, name, cls):
+            # bind the loop values so each op decodes its own bucket/class.
+            return lambda: _packets_decode(bucket, name, cls)
+
+        # (op, module key, decode fn). A protocol whose module did not import
+        # is recorded unsupported with the ImportError reason, not benched.
+        _packets_l7_ops = (
+            ('l7_dns', 'dns', _packets_decoder('dns_udp', 'DNS', L7DNS)),
+            ('l7_dns_tcp', 'dns', _packets_decoder('dns_tcp', 'DNS', L7DNS)),
+            ('l7_http', 'http', _packets_decoder('http', 'HTTP', L7HTTP)),
+            ('l7_dhcp', 'dhcp', _packets_decoder('dhcp', 'DHCP', L7DHCP)),
+            ('l7_dhcp6', 'dhcp', _packets_decoder('dhcp6', 'DHCP6', L7DHCP6)),
+            ('l7_netflow', 'netflow', _packets_netflow),
+        )
+        for _op, _key, _fn in _packets_l7_ops:
+            if _key in _l7_missing:
+                l7_unsupported(PACKETS_LABEL, (_op,),
+                               'this packets build has no packets.protos.%s '
+                               '(%s)' % (_key, _l7_missing[_key]))
+            else:
+                bench_l7_op(PACKETS_LABEL, _op, _fn, _l7_probe(_fn))
+
+    # ----------------------------------------------------------- libpcap
+    if enabled('libpcap'):
+        l7_unsupported("libpcap dispatch", L7_OPS,
+                       'libpcap dispatch is a C frame counter, not an L7 '
+                       'decoder')
+
+    # ---------------------------------------------------------- impacket
+    if enabled('impacket'):
+        l7_unsupported("impacket 0.13.1", L7_OPS,
+                       'impacket has no native pcap reader and no DNS/HTTP/'
+                       'DHCP/NetFlow decoders')
+
+    # ------------------------------------------------------------- dpkt
+    if enabled('dpkt'):
+        try:
+            import dpkt
+            import dpkt.dns
+            import dpkt.dhcp
+            import dpkt.http
+            import dpkt.ethernet
+
+            def _dpkt_l4_payload(raw):
+                eth = dpkt.ethernet.Ethernet(raw)
+                return bytes(eth.data.data.data)
+
+            def _dpkt_dns():
+                n = 0
+                for raw in L7_BUCKETS['dns_udp']:
+                    msg = dpkt.dns.DNS(_dpkt_l4_payload(raw))
+                    if msg.qd or msg.an:
+                        n += 1
+                return n
+
+            def _dpkt_http():
+                n = 0
+                for raw in L7_BUCKETS['http']:
+                    payload = _dpkt_l4_payload(raw)
+                    try:
+                        dpkt.http.Request(payload)
+                    except (dpkt.dpkt.UnpackError, dpkt.dpkt.NeedData):
+                        dpkt.http.Response(payload)
+                    n += 1
+                return n
+
+            def _dpkt_dhcp():
+                n = 0
+                for raw in L7_BUCKETS['dhcp']:
+                    dpkt.dhcp.DHCP(_dpkt_l4_payload(raw))
+                    n += 1
+                return n
+
+            bench_l7_op("dpkt 1.9.8", 'l7_dns', _dpkt_dns,
+                        _l7_probe(_dpkt_dns))
+            bench_l7_op("dpkt 1.9.8", 'l7_http', _dpkt_http,
+                        _l7_probe(_dpkt_http))
+            bench_l7_op("dpkt 1.9.8", 'l7_dhcp', _dpkt_dhcp,
+                        _l7_probe(_dpkt_dhcp))
+            l7_unsupported("dpkt 1.9.8", ('l7_dns_tcp',),
+                           'DNS-over-TCP framing differs: this corpus carries '
+                           'the raw message packets decodes, without the '
+                           '2-byte length prefix dpkt requires')
+            l7_unsupported("dpkt 1.9.8", ('l7_dhcp6',),
+                           'dpkt has no DHCPv6 decoder')
+            l7_unsupported("dpkt 1.9.8", ('l7_netflow',),
+                           'dpkt.netflow models v1/v5/v6/v7 only, with no v9 '
+                           'template handling')
+        except Exception as e:
+            section_failed("dpkt 1.9.8", e)
+
+    # ------------------------------------------------------------ scapy
+    if enabled('scapy'):
+        try:
+            from scapy.all import Ether as L7Ether
+            from scapy.config import conf as l7_conf
+            from scapy.layers.dns import DNS as ScDNS
+            from scapy.layers.dhcp import BOOTP as ScBOOTP
+            from scapy.layers.dhcp6 import DHCP6 as ScDHCP6
+            # Importing the http layer registers the port-80 bindings, so a
+            # plain Ether(raw) dissects the request/response through to HTTP.
+            from scapy.layers.http import HTTP as ScHTTP
+            try:
+                from scapy.layers.netflow import (NetflowHeader as ScNfHeader,
+                                                  netflowv9_defragment)
+            except ImportError:
+                from scapy.contrib.netflow import (NetflowHeader as ScNfHeader,
+                                                   netflowv9_defragment)
+
+            l7_conf.verb = 0
+
+            def _scapy_haslayer(bucket, layer):
+                n = 0
+                for raw in L7_BUCKETS[bucket]:
+                    if layer in L7Ether(raw):
+                        n += 1
+                return n
+
+            def _scapy_dhcp6():
+                # DHCPv6 messages dissect to per-type subclasses (DHCP6_Solicit
+                # ...), so match on the family by layer-name prefix rather than
+                # a single class, which stays robust across scapy versions.
+                n = 0
+                for raw in L7_BUCKETS['dhcp6']:
+                    pkt = L7Ether(raw)
+                    if any(cls.__name__.startswith('DHCP6')
+                           for cls in pkt.layers()):
+                        n += 1
+                return n
+
+            def _scapy_netflow():
+                # netflowv9_defragment matches data sets to templates across
+                # the whole list, scapy's equivalent of a shared decode state.
+                plist = [L7Ether(raw) for raw in L7_BUCKETS['netflow']]
+                netflowv9_defragment(plist)
+                n = 0
+                for pkt in plist:
+                    if ScNfHeader in pkt:
+                        n += 1
+                return n
+
+            _scapy_dns = lambda: _scapy_haslayer('dns_udp', ScDNS)
+            _scapy_http = lambda: _scapy_haslayer('http', ScHTTP)
+            _scapy_dhcp = lambda: _scapy_haslayer('dhcp', ScBOOTP)
+
+            bench_l7_op("scapy 2.5.0", 'l7_dns', _scapy_dns,
+                        _l7_probe(_scapy_dns))
+            bench_l7_op("scapy 2.5.0", 'l7_http', _scapy_http,
+                        _l7_probe(_scapy_http))
+            bench_l7_op("scapy 2.5.0", 'l7_dhcp', _scapy_dhcp,
+                        _l7_probe(_scapy_dhcp))
+            bench_l7_op("scapy 2.5.0", 'l7_dhcp6', _scapy_dhcp6,
+                        _l7_probe(_scapy_dhcp6))
+            bench_l7_op("scapy 2.5.0", 'l7_netflow', _scapy_netflow,
+                        _l7_probe(_scapy_netflow))
+            l7_unsupported("scapy 2.5.0", ('l7_dns_tcp',),
+                           'DNS-over-TCP framing differs: this corpus carries '
+                           'the raw message packets decodes, without the '
+                           '2-byte length prefix scapy requires')
+        except Exception as e:
+            section_failed("scapy 2.5.0", e)
 
 
 # --------------------------------------------------------------------- output
