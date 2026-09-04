@@ -1,6 +1,27 @@
 CHANGELOG
 ---------
 
+[2.1.7]
+ * **Benchmark suite (`bench/`) made deliverable; no library changes.** Closed
+   the operational gaps that prevented the `bench/` suite from producing
+   credible, repeatable numbers both version-over-version and against other
+   Python packet libraries (dpkt, impacket, scapy). Added the previously
+   missing libpcap C-level ceiling extension (`pcap_dispatch_bench.pyx` +
+   `setup_dispatch.py`) that `compare_libs.py` already called, so the cross-
+   library floor is measured instead of logging `FAILED`. Added
+   `make_corpus.py`, a deterministic corpus generator (mixed TCP/UDP/IPv6/
+   VLAN/MPLS frames, a seeded NetFlow v9 capture, and an L7 protocol capture)
+   so streaming benchmarks measure per-packet cost rather than file-reopen
+   overhead. Added `regression.py`, a version-over-version driver that builds a
+   baseline tag and the working tree in isolated git worktrees and diffs
+   timings and correctness, never touching the installed package. Added a full
+   layer-7 decode comparison (DNS, DNS-over-TCP, HTTP, DHCP, DHCPv6, NetFlow
+   v9) that benches `packets` against dpkt/scapy on every shared protocol.
+   Gave `microbench.py` a warmup pass and machine-diffable `--json` output,
+   added a warmup pass to `proto_address_bench.py`, made `compare_libs.py`
+   print a clear "build the dispatch extension first" hint instead of a bare
+   traceback, and documented the end-to-end workflow in `bench/README.md`.
+
 [2.1.6]
  * **ARP decodes extended and non-standard opcodes instead of rejecting
    them.** `ARP.operation` used to enforce values 1-9 at decode and assignment
