@@ -160,6 +160,7 @@ PQ_NETFLOW_SIMPLE = 2005
 PQ_ICMP6OPT = 2006
 PQ_MLDV2_ADDRESS_RECORD = 2007
 PQ_OSPFV3 = 2008
+PQ_BGP = 179
 PQ_NULLPKT = 0xffff
 NOT_FOUND = -1
 
@@ -190,6 +191,7 @@ cdef tuple _QI_ETH
 cdef tuple _QI_GRE
 cdef tuple _QI_OSPF
 cdef tuple _QI_OSPFV3
+cdef tuple _QI_BGP
 
 # Address conversion entry points, bound once at import. These sit on the
 # construction path (every src/dst set) and on the parse path (every address
@@ -332,6 +334,7 @@ cdef class IP_CONST:
         self.PQ_GRE = PQ_GRE
         self.PQ_OSPF = PQ_OSPF
         self.PQ_OSPFV3 = PQ_OSPFV3
+        self.PQ_BGP = PQ_BGP
         self.PQ_NETFLOW_SIMPLE = PQ_NETFLOW_SIMPLE
         self.PQ_NULLPKT = PQ_NULLPKT
 
@@ -6982,6 +6985,783 @@ cdef OSPFLSA _lsr_entry_v3(const unsigned char[:] mv, Py_ssize_t off):
     return lsa
 
 
+# --- BGP (RFC 4271 / 4760 / 5492 / 6793 / 7911) -----------------------------
+# BGP rides on TCP port 179 and is dispatched via the l7_ports mechanism like
+# any other layer-7 protocol: register {179: BGP} in l7_ports (or hand
+# pcap_query pkt_classes=[BGP], whose default_ports() returns [179]). There is
+# no hardcoded IP/IP6 branch -- BGP is not an IP-protocol-number protocol.
+#
+# This is a SINGLE-MESSAGE codec (CRITICAL-1, Option A): one BGP object decodes
+# exactly one message that starts at the 16-byte marker. The caller owns TCP
+# stream reassembly and must hand a buffer that begins at a marker. A buffer
+# carrying several back-to-back messages decodes the first and chains the
+# remainder as a trailing BGP payload, so a whole segment still decodes and
+# round-trips; a buffer shorter than the length field claims is marked
+# malformed and decoded to whatever is present.
+#
+# Parsing follows the routing never-raise contract: a truncated or unparsable
+# message sets ``malformed`` and keeps its exact bytes in ``_raw`` so it
+# re-serializes to what came in. Field names and enum text are the Wireshark
+# packet-bgp.c abbreviations and value_string renderings, so a Wireshark
+# display-filter name resolves through get_field_val() unchanged.
+
+# value_string tables copied from packet-bgp.c so enum fields render exactly as
+# Wireshark shows them; an unknown wire value renders "Unknown (N)".
+cdef dict _BGP_TYPE_VALS = {
+    1: 'OPEN Message', 2: 'UPDATE Message', 3: 'NOTIFICATION Message',
+    4: 'KEEPALIVE Message', 5: 'ROUTE-REFRESH Message',
+    6: 'CAPABILITY Message', 0x80: 'Cisco ROUTE-REFRESH Message'}
+cdef dict _BGP_ATTR_TYPE_VALS = {
+    1: 'ORIGIN', 2: 'AS_PATH', 3: 'NEXT_HOP', 4: 'MULTI_EXIT_DISC',
+    5: 'LOCAL_PREF', 6: 'ATOMIC_AGGREGATE', 7: 'AGGREGATOR', 8: 'COMMUNITIES',
+    9: 'ORIGINATOR_ID', 10: 'CLUSTER_LIST', 11: 'DPA', 12: 'ADVERTISER',
+    13: 'RCID_PATH / CLUSTER_ID', 14: 'MP_REACH_NLRI', 15: 'MP_UNREACH_NLRI',
+    16: 'EXTENDED_COMMUNITIES', 17: 'AS4_PATH', 18: 'AS4_AGGREGATOR',
+    19: 'SAFI_SPECIFIC_ATTRIBUTE', 20: 'Connector Attribute',
+    21: 'AS_PATHLIMIT ', 22: 'PMSI_TUNNEL_ATTRIBUTE',
+    23: 'TUNNEL_ENCAPSULATION_ATTRIBUTE', 24: 'Traffic Engineering',
+    25: 'IPv6 Address Specific Extended Community', 26: 'AIGP',
+    27: 'PE Distinguisher Labels',
+    28: 'BGP Entropy Label Capability Attribute', 29: 'BGP-LS Attribute',
+    30: 'Deprecated', 31: 'Deprecated', 32: 'LARGE_COMMUNITY',
+    33: 'BGPsec_PATH', 35: 'OTC', 36: 'D_PATH', 37: 'SFP Attribute',
+    38: 'BFD Discriminator', 39: 'BGP Next Hop Dependent Capabilities',
+    40: 'BGP Prefix-SID', 99: 'LINK_STATE (unofficial code point)',
+    128: 'ATTR_SET', 129: 'Deprecated', 241: 'Deprecated', 242: 'Deprecated',
+    243: 'Deprecated'}
+cdef dict _BGP_ORIGIN_VALS = {0: 'IGP', 1: 'EGP', 2: 'INCOMPLETE'}
+cdef dict _BGP_AS_SEG_VALS = {
+    1: 'AS_SET', 2: 'AS_SEQUENCE', 3: 'AS_CONFED_SEQUENCE', 4: 'AS_CONFED_SET'}
+cdef dict _BGP_CAP_VALS = {
+    0: 'Reserved capability', 1: 'Multiprotocol extensions capability',
+    2: 'Route refresh capability',
+    3: 'Cooperative route filtering capability',
+    4: 'Multiple routes to a destination capability',
+    5: 'Extended Next Hop Encoding', 6: 'BGP-Extended Message',
+    7: 'BGPsec capability', 8: 'Multiple Labels capability', 9: 'BGP Role',
+    64: 'Graceful Restart capability',
+    65: 'Support for 4-octet AS number capability',
+    66: 'Deprecated Dynamic Capability (Cisco)',
+    67: 'Support for Dynamic capability', 68: 'Multisession BGP Capability',
+    69: 'Support for Additional Paths',
+    70: 'Enhanced route refresh capability',
+    71: 'Long-Lived Graceful Restart (LLGR) Capability',
+    72: 'CP-ORF Capability', 73: 'FQDN Capability',
+    74: 'BFD Strict-Mode capability', 75: 'Software Version Capability',
+    76: 'PATHS-LIMIT Capability', 77: 'Link-Local Next Hop Capability',
+    128: 'Route Refresh Capability (Cisco)',
+    129: 'Routing Policy Distribution (Cisco)',
+    130: 'Outbound Route Filtering (Cisco)', 131: 'Multisession (Cisco)',
+    184: 'FQDN (Cisco)', 185: 'OPERATIONAL message (Cisco)'}
+cdef dict _BGP_SR_VALS = {1: 'Receive', 2: 'Send', 3: 'Both'}
+cdef dict _BGP_NOTIFY_MAJOR = {
+    1: 'Message Header Error', 2: 'OPEN Message Error',
+    3: 'UPDATE Message Error', 4: 'Hold Timer Expired',
+    5: 'Finite State Machine Error', 6: 'Cease',
+    7: 'ROUTE-REFRESH Message Error', 8: 'Send Hold Timer Expired'}
+cdef dict _BGP_NOTIFY_MINOR = {
+    1: {1: 'Connection Not Synchronized', 2: 'Bad Message Length',
+        3: 'Bad Message Type'},
+    2: {1: 'Unsupported Version Number', 2: 'Bad Peer AS',
+        3: 'Bad BGP Identifier', 4: 'Unsupported Optional Parameter',
+        5: 'Authentication Failure [Deprecated]',
+        6: 'Unacceptable Hold Time', 7: 'Unsupported Capability',
+        8: 'No supported AFI/SAFI (Cisco)', 11: 'Role Mismatch'},
+    3: {1: 'Malformed Attribute List',
+        2: 'Unrecognized Well-known Attribute',
+        3: 'Missing Well-known Attribute', 4: 'Attribute Flags Error',
+        5: 'Attribute Length Error', 6: 'Invalid ORIGIN Attribute',
+        7: 'AS Routing Loop [Deprecated]', 8: 'Invalid NEXT_HOP Attribute',
+        9: 'Optional Attribute Error', 10: 'Invalid Network Field',
+        11: 'Malformed AS_PATH'},
+    5: {1: 'Receive Unexpected Message in OpenSent State',
+        2: 'Receive Unexpected Message in OpenConfirm State',
+        3: 'Receive Unexpected Message in Established State'},
+    6: {1: 'Maximum Number of Prefixes Reached',
+        2: 'Administratively Shutdown', 3: 'Peer De-configured',
+        4: 'Administratively Reset', 5: 'Connection Rejected',
+        6: 'Other Configuration Change',
+        7: 'Connection Collision Resolution', 8: 'Out of Resources',
+        9: 'Hard Reset', 10: 'BFD Down'}}
+cdef dict _BGP_AFI_VALS = {1: 'IP (IP version 4)', 2: 'IP6 (IP version 6)',
+                           25: 'L2VPN'}
+cdef dict _BGP_SAFI_VALS = {
+    1: 'Unicast', 2: 'Multicast', 4: 'MPLS Labeled', 65: 'VPLS', 66: 'MDT',
+    67: 'BGP 4over6', 69: '6VPE', 70: 'Multicast VPN', 71: 'BGP-LS',
+    72: 'BGP-LS-VPN', 73: 'SR TE Policy', 74: 'SD-WAN',
+    75: 'Flow Specification', 76: 'Flow Specification VPN', 78: 'BGP-EPE',
+    79: 'BGP-LS-SPF', 80: 'BGP-LS-SR-Policy', 128: 'MPLS VPN',
+    129: 'Multicast MPLS VPN', 132: 'Route Target',
+    133: 'Flow Specification', 134: 'Flow Specification VPN'}
+cdef dict _BGP_WELLKNOWN_COMMUNITY = {
+    0xFFFF0000: 'GRACEFUL_SHUTDOWN', 0xFFFF0001: 'ACCEPT_OWN',
+    0xFFFF0002: 'ROUTE_FILTER_TRANSLATED_v4', 0xFFFF0003: 'ROUTE_FILTER_v4',
+    0xFFFF0004: 'ROUTE_FILTER_TRANSLATED_v6', 0xFFFF0005: 'ROUTE_FILTER_v6',
+    0xFFFF0006: 'LLGR_STALE', 0xFFFF0007: 'NO_LLGR',
+    0xFFFF0008: 'accept-own-nexthop', 0xFFFF0009: 'Standby PE',
+    0xFFFF029A: 'BLACKHOLE', 0xFFFFFF01: 'NO_EXPORT',
+    0xFFFFFF02: 'NO_ADVERTISE', 0xFFFFFF03: 'NO_EXPORT_SUBCONFED',
+    0xFFFFFF04: 'NOPEER'}
+
+
+cdef inline str _bgp_vs(dict table, object key):
+    """Render an enum value as Wireshark does: its string, else 'Unknown (N)'."""
+    cdef object txt = table.get(key)
+    if txt is None:
+        return 'Unknown (%d)' % key
+    return txt
+
+
+cdef inline str _bgp_fmt_community(uint32_t comm):
+    """A 32-bit community as its well-known name, else Wireshark's asn:value."""
+    cdef object wk = _BGP_WELLKNOWN_COMMUNITY.get(comm)
+    if wk is not None:
+        return wk
+    return '%d:%d' % (comm >> 16, comm & 0xffff)
+
+
+@cython.final
+cdef class BGPParam(PKT):
+    """One decoded BGP sub-structure: an OPEN capability or an UPDATE path
+    attribute.
+
+    The bytes are kept whole in ``_raw`` so the parent BGP message
+    re-serializes byte for byte; the decoded fields land in ``fields`` keyed by
+    their Wireshark ``bgp.*`` name.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._base_l7(kwargs)
+        self.pkt_name = 'BGPParam'
+        self.pq_type = PQ_BGP
+        self.query_fields = ()
+        self.malformed = 0
+        self._raw = kwargs.get('data', b'') or b''
+        self.fields = {}
+        self.payload = NullPkt(b'')
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Network-order bytes of just this parameter/attribute."""
+        return self._raw if self._raw is not None else b''
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        if self._raw is not None:
+            w_bytes(w, self._raw)
+        return 0
+
+    cpdef object get_field_val(self, str field):
+        """Resolve a single parameter/attribute-scoped Wireshark field name."""
+        if field in self.fields:
+            return self.fields[field]
+        return None
+
+
+cdef inline BGPParam _new_bgp_param(const unsigned char[:] mv, Py_ssize_t s,
+                                    Py_ssize_t e):
+    """Allocate a BGPParam holding the raw bytes [s, e) with empty fields."""
+    cdef BGPParam p = BGPParam.__new__(BGPParam)
+    p.pkt_name = 'BGPParam'
+    p.pq_type = PQ_BGP
+    p.query_fields = ()
+    p.malformed = 0
+    p.fields = {}
+    p.payload = NullPkt(b'')
+    p._raw = rd_bytes(mv, s, e)
+    return p
+
+
+@cython.final
+cdef class BGP(PKT):
+    """BGP (RFC 4271 and extensions), carried over TCP port 179.
+
+    Single-message codec: one BGP object decodes exactly one message starting
+    at the 16-byte marker. The caller is responsible for TCP stream reassembly
+    and for handing a buffer that begins at a marker and contains at least the
+    message's ``length`` bytes. Several back-to-back messages in one buffer are
+    handled by decoding the first and chaining the remainder as a trailing BGP
+    payload. Parsing never raises: a truncated message sets ``malformed`` and
+    keeps its exact bytes so it round-trips.
+
+    Field names are the Wireshark packet-bgp.c ``bgp.*`` abbreviations;
+    enumerated fields (bgp.type, path-attribute type, origin, capability code,
+    notification errors, AFI/SAFI, communities) render the Wireshark
+    value_string text. Human-readable renderings: router/BGP identifiers and
+    IPv4 next hops as dotted quad, AS numbers as ints, communities as either
+    their well-known name or ``asn:value``, large communities as
+    ``global:ldp1:ldp2``, NLRI/withdrawn prefixes as a dotted-quad network with
+    a separate ``bgp.prefix_length``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize a BGP object.
+
+        Args:
+            :args (list): optional one-element list of network-order bytes.
+            :data (bytes): optional network-order bytes starting at the marker.
+            :type (unsigned char): message type 1..5 (default 4, KEEPALIVE).
+            :marker (bytes): the 16-byte marker, default 16 * 0xff.
+            :body (bytes): the message body after the 19-byte header.
+            :add_path (bool) / :add_path_afi_safi: parse hint (Q9). When set,
+                a lone UPDATE parsed with no preceding OPEN treats its NLRI (and
+                withdrawn routes) as each carrying a leading 4-byte Path
+                Identifier (RFC 7911). Default off.
+            :payload (PKT): a following BGP message, when building by hand.
+        """
+        self._base_l7(kwargs)
+        self.pkt_name = 'BGP'
+        self.pq_type, self.query_fields = _QI_BGP
+        cdef:
+            bytes owner
+            const unsigned char[:] mv
+        self._add_path = 1 if (kwargs.get('add_path', 0) or
+                               kwargs.get('add_path_afi_safi', 0)) else 0
+        owner = _owned_buffer(args, kwargs)
+        if owner is not None:
+            mv = owner
+            _decode_bgp(self, owner, mv, 0, len(owner), self._l7_ports)
+            return
+
+        # Keyword construction.
+        self._raw = None
+        self.malformed = 0
+        self.type = kwargs.get('type', 4)
+        self._marker = kwargs.get('marker', b'\xff' * 16)
+        if self._marker is None or len(self._marker) != 16:
+            self._marker = b'\xff' * 16
+        self.body = {}
+        self.params = []
+        self._body = kwargs.get('body', b'') or b''
+        self.length = 19 + len(self._body)
+        if 'payload' in kwargs and isinstance(kwargs['payload'], PKT):
+            self.payload = kwargs['payload']
+        else:
+            self.payload = NullPkt(b'')
+
+    property marker:
+        """The 16-byte marker, as raw bytes (Wireshark bgp.marker)."""
+        def __get__(self):
+            return self._marker
+        def __set__(self, bytes val):
+            self._marker = val
+
+    @classmethod
+    def query_info(cls):
+        """pcap_query field names (Wireshark packet-bgp.c) and PQ type."""
+        return (PQ_BGP,
+                ('bgp.type', 'bgp.length', 'bgp.marker',
+                 'bgp.open.version', 'bgp.open.myas', 'bgp.open.holdtime',
+                 'bgp.open.identifier', 'bgp.open.opt_param_len',
+                 'bgp.cap.type', 'bgp.cap.length',
+                 'bgp.cap.mp.afi', 'bgp.cap.mp.safi',
+                 'bgp.cap.ap.afi', 'bgp.cap.ap.safi',
+                 'bgp.cap.ap.sendreceive',
+                 'bgp.update.withdrawn_routes.length',
+                 'bgp.update.path_attributes.length',
+                 'bgp.withdrawn_prefix', 'bgp.nlri_prefix',
+                 'bgp.prefix_length', 'bgp.nlri_path_id',
+                 'bgp.update.path_attribute.type_code',
+                 'bgp.update.path_attribute.flags.optional',
+                 'bgp.update.path_attribute.flags.transitive',
+                 'bgp.update.path_attribute.flags.partial',
+                 'bgp.update.path_attribute.flags.extended_length',
+                 'bgp.update.path_attribute.length',
+                 'bgp.update.path_attribute.origin',
+                 'bgp.update.path_attribute.as_path_segment.type',
+                 'bgp.update.path_attribute.as_path_segment.length',
+                 'bgp.update.path_attribute.as_path_segment.as2',
+                 'bgp.update.path_attribute.as_path_segment.as4',
+                 'bgp.update.path_attribute.next_hop',
+                 'bgp.update.path_attribute.multi_exit_disc',
+                 'bgp.update.path_attribute.local_pref',
+                 'bgp.update.path_attribute.aggregator_as',
+                 'bgp.update.path_attribute.aggregator_origin',
+                 'bgp.update.path_attribute.community',
+                 'bgp.update.path_attribute.community_wellknown',
+                 'bgp.update.path_attribute.originator_id',
+                 'bgp.update.path_attribute.mp_reach_nlri.afi',
+                 'bgp.update.path_attribute.mp_reach_nlri.safi',
+                 'bgp.update.path_attribute.mp_reach_nlri.next_hop',
+                 'bgp.update.path_attribute.mp_unreach_nlri.afi',
+                 'bgp.update.path_attribute.mp_unreach_nlri.safi',
+                 'bgp.large_communities',
+                 'bgp.notify.major_error', 'bgp.notify.minor_error',
+                 'bgp.route_refresh.afi', 'bgp.route_refresh.safi',
+                 'bgp.route_refresh.reserved'))
+
+    cpdef object get_field_val(self, str field):
+        """Return the value of a Wireshark-format field name, else None.
+
+        Enum fields render the Wireshark value_string text. Fields that do not
+        apply to the current message type return None. Capability- and
+        path-attribute-scoped fields resolve against the first param/attribute
+        that carries them, mirroring how OSPF resolves LSA-scoped fields.
+        """
+        cdef BGPParam p
+        cdef object v
+        if field == 'bgp.type':
+            return _bgp_vs(_BGP_TYPE_VALS, self.type)
+        elif field == 'bgp.type_int':
+            return self.type
+        elif field == 'bgp.length':
+            return self.length
+        elif field == 'bgp.marker':
+            return self._marker
+        elif (field.startswith('bgp.cap.') or
+              field.startswith('bgp.update.path_attribute.') or
+              field.startswith('bgp.large_comm') or
+              field.startswith('bgp.ext_comm')):
+            for p in self.params:
+                v = p.get_field_val(field)
+                if v is not None:
+                    return v
+            return None
+        elif field.startswith('bgp.open.'):
+            return self.body.get(field) if self.type == 1 else None
+        elif field.startswith('bgp.notify.'):
+            return self.body.get(field) if self.type == 3 else None
+        elif field.startswith('bgp.route_refresh.'):
+            return self.body.get(field) if self.type == 5 else None
+        elif (field.startswith('bgp.update.') or
+              field == 'bgp.withdrawn_prefix' or
+              field == 'bgp.nlri_prefix' or field == 'bgp.prefix_length' or
+              field == 'bgp.nlri_path_id'):
+            return self.body.get(field) if self.type == 2 else None
+        elif isinstance(self.payload, PKT):
+            return self.payload.get_field_val(field)
+        return None
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Export this BGP message (and any chained following message) in
+        network order.
+
+        A parsed message is emitted exactly as it arrived. With ``update`` set
+        the message is rebuilt from fields and the 2-byte length is recomputed
+        (BGP carries no checksum).
+        """
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        cdef:
+            bint update
+            Py_ssize_t start = w.n
+            uint16_t plen
+        update = kwargs.get('update', 0)
+        # A malformed message keeps its exact parsed bytes in _raw (which for a
+        # truncated header already spans the whole remainder) and emits them
+        # verbatim without also writing the payload, which would double-count
+        # the same bytes. Mirrors GRE's malformed guard.
+        if self.malformed and self._raw is not None:
+            w_bytes(w, self._raw)
+            return 0
+        # Default: re-emit the exact parsed bytes so a parsed message
+        # round-trips, then append any chained following message.
+        if self._raw is not None and not update:
+            w_bytes(w, self._raw)
+            if isinstance(self.payload, PKT):
+                (<PKT>self.payload)._write(w, kwargs)
+            return 0
+        # Rebuild: 16-byte marker, 2-byte length (patched), 1-byte type, body.
+        w_take_into(w, self._marker, 16)
+        w_u16(w, self.length)               # patched below
+        w_u8(w, self.type)
+        w_bytes(w, self._body)
+        plen = <uint16_t>(w.n - start)
+        w_set_u16(w, start + 16, plen)
+        self.length = plen
+        if isinstance(self.payload, PKT):
+            (<PKT>self.payload)._write(w, kwargs)
+        return 0
+
+
+cdef BGP _bgp_chain(bytes owner, const unsigned char[:] mv, Py_ssize_t start,
+                    Py_ssize_t end, dict l7_ports, bint add_path):
+    """Decode one more BGP message at ``start`` for the single-message chain."""
+    cdef BGP nxt = BGP.__new__(BGP)
+    nxt._l7_ports = l7_ports
+    nxt.pkt_name = 'BGP'
+    nxt.pq_type, nxt.query_fields = _QI_BGP
+    nxt._add_path = add_path
+    _decode_bgp(nxt, owner, mv, start, end, l7_ports)
+    return nxt
+
+
+cdef list _bgp_read_prefixes(const unsigned char[:] mv, Py_ssize_t o,
+                             Py_ssize_t end, bint add_path):
+    """Read a run of length-prefixed NLRI, each a (dotted-quad, prefix_len).
+
+    Each entry is an optional 4-byte Add-Path identifier, a 1-byte prefix
+    length in bits, then ceil(bits/8) address bytes. Never raises: a partial
+    entry ends the run.
+    """
+    cdef:
+        list out = []
+        unsigned char plen, nbytes
+        unsigned char b0, b1, b2, b3
+    while o < end:
+        if add_path:
+            if not _have_range(o, end, 4):
+                break
+            o += 4
+        if not _have_range(o, end, 1):
+            break
+        plen = mv[o]
+        o += 1
+        nbytes = (plen + 7) // 8
+        if nbytes > 4 or not _have_range(o, end, nbytes):
+            break
+        b0 = mv[o] if nbytes > 0 else 0
+        b1 = mv[o + 1] if nbytes > 1 else 0
+        b2 = mv[o + 2] if nbytes > 2 else 0
+        b3 = mv[o + 3] if nbytes > 3 else 0
+        out.append(('%d.%d.%d.%d' % (b0, b1, b2, b3), plen))
+        o += nbytes
+    return out
+
+
+cdef void _decode_bgp_attr_value(BGPParam p, unsigned char atype,
+                                 const unsigned char[:] mv, Py_ssize_t o,
+                                 Py_ssize_t end):
+    """Decode one path-attribute value to Wireshark depth; never raises."""
+    cdef:
+        Py_ssize_t s
+        unsigned char seg_type, seg_len, asn_size, i, nhlen
+        list segs, comms
+        uint32_t comm
+    if atype == 1:                       # ORIGIN
+        if _have_range(o, end, 1):
+            p.fields['bgp.update.path_attribute.origin'] = \
+                _bgp_vs(_BGP_ORIGIN_VALS, mv[o])
+    elif atype == 2 or atype == 17:      # AS_PATH / AS4_PATH (first segment)
+        s = o
+        if _have_range(s, end, 2):
+            seg_type = mv[s]
+            seg_len = mv[s + 1]
+            asn_size = 4 if atype == 17 else 2
+            p.fields['bgp.update.path_attribute.as_path_segment.type'] = \
+                _bgp_vs(_BGP_AS_SEG_VALS, seg_type)
+            p.fields['bgp.update.path_attribute.as_path_segment.length'] = \
+                seg_len
+            s += 2
+            segs = []
+            for i in range(seg_len):
+                if not _have_range(s, end, asn_size):
+                    break
+                if asn_size == 4:
+                    segs.append(rd_u32(mv, s))
+                else:
+                    segs.append(rd_u16(mv, s))
+                s += asn_size
+            if segs:
+                if asn_size == 4:
+                    p.fields[
+                        'bgp.update.path_attribute.as_path_segment.as4'] = \
+                        segs[0]
+                else:
+                    p.fields[
+                        'bgp.update.path_attribute.as_path_segment.as2'] = \
+                        segs[0]
+    elif atype == 3:                     # NEXT_HOP
+        if _have_range(o, end, 4):
+            p.fields['bgp.update.path_attribute.next_hop'] = \
+                _fmt_ipv4_buf(&mv[o])
+    elif atype == 4:                     # MULTI_EXIT_DISC
+        if _have_range(o, end, 4):
+            p.fields['bgp.update.path_attribute.multi_exit_disc'] = \
+                rd_u32(mv, o)
+    elif atype == 5:                     # LOCAL_PREF
+        if _have_range(o, end, 4):
+            p.fields['bgp.update.path_attribute.local_pref'] = rd_u32(mv, o)
+    elif atype == 7:                     # AGGREGATOR (2-byte AS)
+        if _have_range(o, end, 6):
+            p.fields['bgp.update.path_attribute.aggregator_as'] = \
+                rd_u16(mv, o)
+            p.fields['bgp.update.path_attribute.aggregator_origin'] = \
+                _fmt_ipv4_buf(&mv[o + 2])
+    elif atype == 18:                    # AS4_AGGREGATOR (4-byte AS)
+        if _have_range(o, end, 8):
+            p.fields['bgp.update.path_attribute.aggregator_as'] = \
+                rd_u32(mv, o)
+            p.fields['bgp.update.path_attribute.aggregator_origin'] = \
+                _fmt_ipv4_buf(&mv[o + 4])
+    elif atype == 8:                     # COMMUNITIES
+        comms = []
+        s = o
+        while _have_range(s, end, 4):
+            comm = rd_u32(mv, s)
+            comms.append(_bgp_fmt_community(comm))
+            s += 4
+        if comms:
+            p.fields['bgp.update.path_attribute.community'] = comms[0]
+            p.fields['bgp.update.path_attribute.community_wellknown'] = comms
+    elif atype == 9:                     # ORIGINATOR_ID
+        if _have_range(o, end, 4):
+            p.fields['bgp.update.path_attribute.originator_id'] = \
+                _fmt_ipv4_buf(&mv[o])
+    elif atype == 14:                    # MP_REACH_NLRI
+        if _have_range(o, end, 3):
+            p.fields['bgp.update.path_attribute.mp_reach_nlri.afi'] = \
+                _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, o))
+            p.fields['bgp.update.path_attribute.mp_reach_nlri.safi'] = \
+                _bgp_vs(_BGP_SAFI_VALS, mv[o + 2])
+            if _have_range(o + 3, end, 1):
+                nhlen = mv[o + 3]
+                if _have_range(o + 4, end, nhlen):
+                    p.fields[
+                        'bgp.update.path_attribute.mp_reach_nlri.next_hop'] = \
+                        rd_bytes(mv, o + 4, o + 4 + nhlen)
+    elif atype == 15:                    # MP_UNREACH_NLRI
+        if _have_range(o, end, 3):
+            p.fields['bgp.update.path_attribute.mp_unreach_nlri.afi'] = \
+                _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, o))
+            p.fields['bgp.update.path_attribute.mp_unreach_nlri.safi'] = \
+                _bgp_vs(_BGP_SAFI_VALS, mv[o + 2])
+    elif atype == 32:                    # LARGE_COMMUNITY
+        comms = []
+        s = o
+        while _have_range(s, end, 12):
+            comms.append('%d:%d:%d' % (rd_u32(mv, s), rd_u32(mv, s + 4),
+                                       rd_u32(mv, s + 8)))
+            s += 12
+        if comms:
+            p.fields['bgp.large_communities'] = comms[0]
+
+
+cdef Py_ssize_t _decode_bgp_pathattr(BGP pkt, const unsigned char[:] mv,
+                                     Py_ssize_t o, Py_ssize_t end) except? -2:
+    """Decode one path attribute at ``o``; return the offset past it, or -1."""
+    cdef:
+        unsigned char flags, atype
+        Py_ssize_t alen, vstart, vend
+        BGPParam p
+    if not _have_range(o, end, 2):
+        return -1
+    flags = mv[o]
+    atype = mv[o + 1]
+    if flags & 0x10:                     # extended length: 2-byte length
+        if not _have_range(o, end, 4):
+            return -1
+        alen = rd_u16(mv, o + 2)
+        vstart = o + 4
+    else:
+        if not _have_range(o, end, 3):
+            return -1
+        alen = mv[o + 2]
+        vstart = o + 3
+    vend = vstart + alen
+    if vend > end:
+        vend = end
+    p = _new_bgp_param(mv, o, vend)
+    p.fields['bgp.update.path_attribute.type_code'] = \
+        _bgp_vs(_BGP_ATTR_TYPE_VALS, atype)
+    p.fields['bgp.update.path_attribute.type_code_int'] = atype
+    p.fields['bgp.update.path_attribute.flags.optional'] = \
+        1 if (flags & 0x80) else 0
+    p.fields['bgp.update.path_attribute.flags.transitive'] = \
+        1 if (flags & 0x40) else 0
+    p.fields['bgp.update.path_attribute.flags.partial'] = \
+        1 if (flags & 0x20) else 0
+    p.fields['bgp.update.path_attribute.flags.extended_length'] = \
+        1 if (flags & 0x10) else 0
+    p.fields['bgp.update.path_attribute.length'] = alen
+    _decode_bgp_attr_value(p, atype, mv, vstart, vend)
+    pkt.params.append(p)
+    return vend
+
+
+cdef void _bgp_add_cap(BGP pkt, const unsigned char[:] mv, Py_ssize_t start,
+                       Py_ssize_t end, unsigned char cap_type,
+                       unsigned char cap_len):
+    """Decode one OPEN capability [start, end) into a BGPParam."""
+    cdef:
+        BGPParam p = _new_bgp_param(mv, start, end)
+        Py_ssize_t v = start + 2
+    p.fields['bgp.cap.type'] = _bgp_vs(_BGP_CAP_VALS, cap_type)
+    p.fields['bgp.cap.type_int'] = cap_type
+    p.fields['bgp.cap.length'] = cap_len
+    if cap_type == 1:                    # Multiprotocol extensions
+        if _have_range(v, end, 4):
+            p.fields['bgp.cap.mp.afi'] = _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, v))
+            p.fields['bgp.cap.mp.safi'] = _bgp_vs(_BGP_SAFI_VALS, mv[v + 3])
+    elif cap_type == 69:                 # Additional Paths (RFC 7911)
+        if _have_range(v, end, 4):
+            p.fields['bgp.cap.ap.afi'] = _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, v))
+            p.fields['bgp.cap.ap.safi'] = _bgp_vs(_BGP_SAFI_VALS, mv[v + 2])
+            p.fields['bgp.cap.ap.sendreceive'] = \
+                _bgp_vs(_BGP_SR_VALS, mv[v + 3])
+    pkt.params.append(p)
+
+
+cdef void _decode_bgp_open(BGP pkt, const unsigned char[:] mv,
+                           Py_ssize_t off, Py_ssize_t end):
+    """Decode an OPEN body and its capabilities; never raises."""
+    cdef:
+        Py_ssize_t o = off, pend, pstart, cstart, cend
+        unsigned char opt_len, ptype, opl, cap_type, cap_len
+        Py_ssize_t clen
+    if not _have_range(o, end, 10):
+        return
+    pkt.body['bgp.open.version'] = mv[o]
+    pkt.body['bgp.open.myas'] = rd_u16(mv, o + 1)
+    pkt.body['bgp.open.holdtime'] = rd_u16(mv, o + 3)
+    pkt.body['bgp.open.identifier'] = _fmt_ipv4_buf(&mv[o + 5])
+    opt_len = mv[o + 9]
+    pkt.body['bgp.open.opt_param_len'] = opt_len
+    o += 10
+    pend = o + opt_len
+    if pend > end:
+        pend = end
+    # Optional parameters: type(1), len(1), value. Type 2 = Capability, whose
+    # value is one or more capabilities: code(1), len(1), value.
+    while _have_range(o, pend, 2):
+        ptype = mv[o]
+        opl = mv[o + 1]
+        pstart = o + 2
+        if pstart + opl > pend:
+            opl = <unsigned char>(pend - pstart)
+        if ptype == 2:
+            cstart = pstart
+            cend = pstart + opl
+            while _have_range(cstart, cend, 2):
+                cap_type = mv[cstart]
+                cap_len = mv[cstart + 1]
+                clen = cap_len
+                if cstart + 2 + clen > cend:
+                    clen = cend - (cstart + 2)
+                _bgp_add_cap(pkt, mv, cstart, cstart + 2 + clen, cap_type,
+                             cap_len)
+                cstart += 2 + clen
+        o = pstart + opl
+
+
+cdef void _decode_bgp_update(BGP pkt, const unsigned char[:] mv,
+                             Py_ssize_t off, Py_ssize_t end):
+    """Decode an UPDATE body: withdrawn routes, path attributes, NLRI."""
+    cdef:
+        Py_ssize_t o = off, wend, tpa_end, nxt
+        uint16_t wlen, tpalen
+        list withdrawn, nlri
+    if not _have_range(o, end, 2):
+        return
+    wlen = rd_u16(mv, o)
+    pkt.body['bgp.update.withdrawn_routes.length'] = wlen
+    o += 2
+    wend = o + wlen
+    if wend > end:
+        wend = end
+    withdrawn = _bgp_read_prefixes(mv, o, wend, pkt._add_path)
+    if withdrawn:
+        pkt.body['bgp.withdrawn_prefix'] = withdrawn[0][0]
+    o = wend
+    if not _have_range(o, end, 2):
+        return
+    tpalen = rd_u16(mv, o)
+    pkt.body['bgp.update.path_attributes.length'] = tpalen
+    o += 2
+    tpa_end = o + tpalen
+    if tpa_end > end:
+        tpa_end = end
+    while _have_range(o, tpa_end, 3):
+        nxt = _decode_bgp_pathattr(pkt, mv, o, tpa_end)
+        if nxt <= o:
+            break
+        o = nxt
+    o = tpa_end
+    nlri = _bgp_read_prefixes(mv, o, end, pkt._add_path)
+    if nlri:
+        pkt.body['bgp.nlri_prefix'] = nlri[0][0]
+        pkt.body['bgp.prefix_length'] = nlri[0][1]
+
+
+cdef void _decode_bgp_notify(BGP pkt, const unsigned char[:] mv,
+                             Py_ssize_t o, Py_ssize_t end):
+    """Decode a NOTIFICATION body: major/minor error."""
+    cdef:
+        unsigned char major, minor
+        object mt
+    if not _have_range(o, end, 2):
+        return
+    major = mv[o]
+    minor = mv[o + 1]
+    pkt.body['bgp.notify.major_error'] = _bgp_vs(_BGP_NOTIFY_MAJOR, major)
+    mt = _BGP_NOTIFY_MINOR.get(major)
+    if isinstance(mt, dict):
+        pkt.body['bgp.notify.minor_error'] = _bgp_vs(<dict>mt, minor)
+    else:
+        pkt.body['bgp.notify.minor_error'] = 'Unknown (%d)' % minor
+
+
+cdef void _decode_bgp_route_refresh(BGP pkt, const unsigned char[:] mv,
+                                    Py_ssize_t o, Py_ssize_t end):
+    """Decode a ROUTE-REFRESH body: AFI, reserved, SAFI."""
+    if _have_range(o, end, 4):
+        pkt.body['bgp.route_refresh.afi'] = \
+            _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, o))
+        pkt.body['bgp.route_refresh.reserved'] = mv[o + 2]
+        pkt.body['bgp.route_refresh.safi'] = \
+            _bgp_vs(_BGP_SAFI_VALS, mv[o + 3])
+
+
+cdef int _decode_bgp(BGP pkt, bytes owner, const unsigned char[:] mv,
+                     Py_ssize_t start, Py_ssize_t end,
+                     dict l7_ports) except -1:
+    cdef:
+        Py_ssize_t off, msg_end
+        uint16_t mlen
+    pkt.malformed = 0
+    pkt._raw = None
+    pkt.type = 0
+    pkt.length = 0
+    pkt._marker = b'\xff' * 16
+    pkt.body = {}
+    pkt.params = []
+    pkt._body = b''
+    pkt.payload = NullPkt(b'')
+
+    # 19-byte header: 16-byte marker, 2-byte length, 1-byte type.
+    if not _have_range(start, end, 19):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        pkt.payload = _null_range(owner, start, end, l7_ports)
+        return 0
+    pkt._marker = rd_bytes(mv, start, start + 16)
+    mlen = rd_u16(mv, start + 16)
+    pkt.type = mv[start + 18]
+    pkt.length = mlen
+
+    # The length field names where this message ends. A short buffer (length
+    # claims more than is present) is malformed but still decoded to whatever
+    # is present; a long buffer carries following messages.
+    msg_end = end
+    if mlen >= 19 and start + mlen <= end:
+        msg_end = start + mlen
+    elif mlen > 0 and start + mlen > end:
+        pkt.malformed = 1
+    off = start + 19
+    pkt._raw = rd_bytes(mv, start, msg_end)
+    pkt._body = rd_bytes(mv, off, msg_end)
+
+    # Type-specific body. Every read is bounds-checked; a short body simply
+    # yields fewer fields and never raises. Type 4 KEEPALIVE has no body.
+    if pkt.type == 1:
+        _decode_bgp_open(pkt, mv, off, msg_end)
+    elif pkt.type == 2:
+        _decode_bgp_update(pkt, mv, off, msg_end)
+    elif pkt.type == 3:
+        _decode_bgp_notify(pkt, mv, off, msg_end)
+    elif pkt.type == 5:
+        _decode_bgp_route_refresh(pkt, mv, off, msg_end)
+
+    # Remainder after this message: another BGP message (chained) if there is
+    # room for a header, else trailing bytes (single-message codec, Option A).
+    if msg_end < end:
+        if _have_range(msg_end, end, 19):
+            pkt.payload = _bgp_chain(owner, mv, msg_end, end, l7_ports,
+                                     pkt._add_path)
+        else:
+            pkt.payload = _null_range(owner, msg_end, end, l7_ports)
+    return 0
+
+
 cdef bytes _owned_buffer(tuple args, dict kwargs):
     """Return the public parse input as one immutable owner, or None."""
     cdef object value
@@ -8302,3 +9082,4 @@ _QI_ETH = Ethernet.query_info()
 _QI_GRE = GRE.query_info()
 _QI_OSPF = OSPFv2.query_info()
 _QI_OSPFV3 = OSPFv3.query_info()
+_QI_BGP = BGP.query_info()

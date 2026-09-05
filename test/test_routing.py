@@ -13,7 +13,7 @@ import unittest
 from array import array
 
 from packets.core.inetpkt import IP_CONST, GRE, IP, IP6, ICMP, ICMP6, \
-    MPLS, Ethernet, NullPkt, OSPFv2, OSPFv3, OSPFLSA
+    MPLS, Ethernet, NullPkt, OSPFv2, OSPFv3, OSPFLSA, TCP, BGP, BGPParam
 
 C = IP_CONST()
 
@@ -664,6 +664,308 @@ class OSPFv3TestCase(unittest.TestCase):
         o = OSPFv3(raw)
         self.assertIsInstance(o, OSPFv3)
         self.assertEqual(o.pkt2net({}), raw)
+
+
+# ---------------------------------------------------------------------------
+# BGP (Stage 3): RFC 4271 + extensions, carried over TCP port 179. Fixtures are
+# built by hand from the RFC wire layout so the tests do not depend on the
+# encoder to prove the decoder. BGP is a single-message codec (CRITICAL-1,
+# Option A): the caller owns TCP reassembly.
+# ---------------------------------------------------------------------------
+
+BGP_PORT = 179
+BGP_MARKER = b'\xff' * 16
+
+
+def _bgp_msg(mtype, body):
+    return BGP_MARKER + struct.pack('!H', 19 + len(body)) + bytes([mtype]) + body
+
+
+def _bgp_keepalive():
+    return _bgp_msg(4, b'')
+
+
+def _bgp_cap(code, value):
+    return bytes([code, len(value)]) + value
+
+
+def _bgp_open(myas=65001, holdtime=180, ident='1.1.1.1', caps=b''):
+    optparams = _bgp_cap(2, caps) if caps else b''
+    body = (bytes([4]) + struct.pack('!H', myas) + struct.pack('!H', holdtime) +
+            _ip4(ident) + bytes([len(optparams)]) + optparams)
+    return _bgp_msg(1, body)
+
+
+def _bgp_pa(flags, atype, value):
+    return bytes([flags, atype, len(value)]) + value
+
+
+def _bgp_update(withdrawn=b'', attrs=b'', nlri=b''):
+    body = (struct.pack('!H', len(withdrawn)) + withdrawn +
+            struct.pack('!H', len(attrs)) + attrs + nlri)
+    return _bgp_msg(2, body)
+
+
+def _bgp_notification(major, minor, data=b''):
+    return _bgp_msg(3, bytes([major, minor]) + data)
+
+
+def _bgp_route_refresh(afi=1, safi=1):
+    return _bgp_msg(5, struct.pack('!H', afi) + bytes([0, safi]))
+
+
+def _bgp_std_update():
+    attrs = (_bgp_pa(0x40, 1, bytes([0])) +                       # ORIGIN=IGP
+             _bgp_pa(0x40, 2, bytes([2, 1]) + struct.pack('!H', 65010)) +  # AS_PATH
+             _bgp_pa(0x40, 3, _ip4('9.9.9.9')) +                  # NEXT_HOP
+             _bgp_pa(0x80, 4, struct.pack('!I', 100)) +           # MED
+             _bgp_pa(0x40, 5, struct.pack('!I', 200)) +           # LOCAL_PREF
+             _bgp_pa(0xC0, 8, struct.pack('!I', 0xFFFFFF01)))     # COMMUNITIES NO_EXPORT
+    nlri = bytes([8, 10])                                         # 10.0.0.0/8
+    return _bgp_update(attrs=attrs, nlri=nlri)
+
+
+class BGPHeaderTestCase(unittest.TestCase):
+
+    def test_keepalive_parse_and_roundtrip(self):
+        raw = _bgp_keepalive()
+        b = BGP(raw)
+        self.assertFalse(b.malformed)
+        self.assertEqual(b.get_field_val('bgp.type'), 'KEEPALIVE Message')
+        self.assertEqual(b.get_field_val('bgp.length'), 19)
+        self.assertEqual(b.length, 19)
+        self.assertEqual(b.pkt2net({}), raw)
+        self.assertEqual(BGP(b.pkt2net({})).pkt2net({}), raw)
+
+    def test_unknown_type_preserved(self):
+        raw = _bgp_msg(99, b'\x01\x02\x03')
+        b = BGP(raw)
+        self.assertEqual(b.get_field_val('bgp.type'), 'Unknown (99)')
+        self.assertEqual(b.pkt2net({}), raw)
+
+    def test_keyword_construction_roundtrips(self):
+        body = struct.pack('!H', 0) + struct.pack('!H', 0)
+        b = BGP(type=2, body=body)
+        wire = b.pkt2net({})
+        parsed = BGP(wire)
+        self.assertEqual(parsed.get_field_val('bgp.type'), 'UPDATE Message')
+        self.assertEqual(parsed.length, 19 + len(body))
+        self.assertEqual(parsed.pkt2net({}), wire)
+
+    def test_update_flag_recomputes_length(self):
+        b = BGP(type=4, body=b'')
+        self.assertEqual(BGP(b.pkt2net({'update': 1})).length, 19)
+
+
+class BGPOpenTestCase(unittest.TestCase):
+
+    def test_open_fields_and_roundtrip(self):
+        caps = (_bgp_cap(1, struct.pack('!H', 1) + bytes([0, 1])) +   # MP IPv4 unicast
+                _bgp_cap(65, struct.pack('!I', 65001)) +              # 4-octet AS
+                _bgp_cap(69, struct.pack('!H', 1) + bytes([1, 3])))   # add-path Both
+        raw = _bgp_open(myas=65001, ident='1.1.1.1', caps=caps)
+        b = BGP(raw)
+        self.assertFalse(b.malformed)
+        self.assertEqual(b.get_field_val('bgp.open.version'), 4)
+        self.assertEqual(b.get_field_val('bgp.open.myas'), 65001)
+        self.assertEqual(b.get_field_val('bgp.open.holdtime'), 180)
+        self.assertEqual(b.get_field_val('bgp.open.identifier'), '1.1.1.1')
+        self.assertEqual(b.get_field_val('bgp.cap.mp.afi'), 'IP (IP version 4)')
+        self.assertEqual(b.get_field_val('bgp.cap.mp.safi'), 'Unicast')
+        self.assertEqual(b.get_field_val('bgp.cap.ap.afi'), 'IP (IP version 4)')
+        self.assertEqual(b.get_field_val('bgp.cap.ap.safi'), 'Unicast')
+        # Wireshark orf_send_recv_vals renders 3 as "Both", not
+        # "Send and Receive" -- Q10 makes Wireshark the source of truth.
+        self.assertEqual(b.get_field_val('bgp.cap.ap.sendreceive'), 'Both')
+        self.assertEqual(len(b.params), 3)
+        self.assertEqual(b.pkt2net({}), raw)
+
+    def test_capability_type_renders_wireshark_string(self):
+        caps = _bgp_cap(65, struct.pack('!I', 65001))
+        b = BGP(_bgp_open(caps=caps))
+        self.assertEqual(b.get_field_val('bgp.cap.type'),
+                         'Support for 4-octet AS number capability')
+
+
+class BGPUpdateTestCase(unittest.TestCase):
+
+    def test_path_attributes_decode(self):
+        b = BGP(_bgp_std_update())
+        self.assertEqual(b.get_field_val('bgp.type'), 'UPDATE Message')
+        self.assertEqual(b.get_field_val('bgp.update.path_attribute.origin'),
+                         'IGP')
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.as_path_segment.type'), 'AS_SEQUENCE')
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.as_path_segment.as2'), 65010)
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.next_hop'), '9.9.9.9')
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.multi_exit_disc'), 100)
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.local_pref'), 200)
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.community'), 'NO_EXPORT')
+        self.assertEqual(b.get_field_val('bgp.nlri_prefix'), '10.0.0.0')
+        self.assertEqual(b.get_field_val('bgp.prefix_length'), 8)
+        self.assertEqual(b.pkt2net({}), _bgp_std_update())
+
+    def test_path_attribute_flags(self):
+        b = BGP(_bgp_std_update())
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.type_code'), 'ORIGIN')
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.flags.optional'), 0)
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.flags.transitive'), 1)
+
+    def test_as4_path_and_aggregator(self):
+        attrs = (_bgp_pa(0xC0, 17, bytes([2, 1]) + struct.pack('!I', 200000)) +
+                 _bgp_pa(0xC0, 18, struct.pack('!I', 200000) + _ip4('2.2.2.2')))
+        b = BGP(_bgp_update(attrs=attrs))
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.as_path_segment.as4'), 200000)
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.aggregator_as'), 200000)
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.aggregator_origin'), '2.2.2.2')
+        self.assertEqual(b.pkt2net({}), _bgp_update(attrs=attrs))
+
+    def test_extended_length_attribute(self):
+        # MP_REACH_NLRI with the extended-length flag (2-byte length):
+        # AFI=1 (IPv4), SAFI=2 (Multicast), next-hop length 4, next hop.
+        val = struct.pack('!H', 1) + bytes([2]) + bytes([4]) + _ip4('1.2.3.4')
+        attr = bytes([0x90, 14]) + struct.pack('!H', len(val)) + val
+        b = BGP(_bgp_update(attrs=attr))
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.flags.extended_length'), 1)
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.mp_reach_nlri.afi'),
+            'IP (IP version 4)')
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.mp_reach_nlri.safi'), 'Multicast')
+        self.assertEqual(b.pkt2net({}), _bgp_update(attrs=attr))
+
+    def test_mp_unreach_and_large_community(self):
+        mpu = _bgp_pa(0x80, 15, struct.pack('!H', 2) + bytes([1]))   # IPv6 unicast
+        lc = _bgp_pa(0xC0, 32, struct.pack('!III', 65001, 1, 2))
+        b = BGP(_bgp_update(attrs=mpu + lc))
+        self.assertEqual(b.get_field_val(
+            'bgp.update.path_attribute.mp_unreach_nlri.afi'),
+            'IP6 (IP version 6)')
+        self.assertEqual(b.get_field_val('bgp.large_communities'),
+                         '65001:1:2')
+        self.assertEqual(b.pkt2net({}), _bgp_update(attrs=mpu + lc))
+
+    def test_withdrawn_routes(self):
+        b = BGP(_bgp_update(withdrawn=bytes([16, 192, 168])))
+        self.assertEqual(b.get_field_val(
+            'bgp.update.withdrawn_routes.length'), 3)
+        self.assertEqual(b.get_field_val('bgp.withdrawn_prefix'), '192.168.0.0')
+        self.assertEqual(b.pkt2net({}),
+                         _bgp_update(withdrawn=bytes([16, 192, 168])))
+
+    def test_add_path_nlri_hint(self):
+        # With add_path, each NLRI carries a leading 4-byte path identifier.
+        nlri = struct.pack('!I', 7) + bytes([8, 10])
+        raw = _bgp_update(nlri=nlri)
+        without = BGP(raw)
+        self.assertNotEqual(without.get_field_val('bgp.nlri_prefix'),
+                            '10.0.0.0')
+        with_hint = BGP(raw, add_path=1)
+        self.assertEqual(with_hint.get_field_val('bgp.nlri_prefix'),
+                         '10.0.0.0')
+        self.assertEqual(with_hint.pkt2net({}), raw)
+
+
+class BGPNotificationTestCase(unittest.TestCase):
+
+    def test_notification_enums(self):
+        b = BGP(_bgp_notification(6, 2, b'\x00'))
+        self.assertEqual(b.get_field_val('bgp.notify.major_error'), 'Cease')
+        self.assertEqual(b.get_field_val('bgp.notify.minor_error'),
+                         'Administratively Shutdown')
+        self.assertEqual(b.pkt2net({}), _bgp_notification(6, 2, b'\x00'))
+
+    def test_notification_open_error(self):
+        b = BGP(_bgp_notification(2, 4))
+        self.assertEqual(b.get_field_val('bgp.notify.major_error'),
+                         'OPEN Message Error')
+        self.assertEqual(b.get_field_val('bgp.notify.minor_error'),
+                         'Unsupported Optional Parameter')
+
+
+class BGPRouteRefreshTestCase(unittest.TestCase):
+
+    def test_route_refresh(self):
+        raw = _bgp_route_refresh(afi=1, safi=1)
+        b = BGP(raw)
+        self.assertEqual(b.get_field_val('bgp.type'), 'ROUTE-REFRESH Message')
+        self.assertEqual(b.get_field_val('bgp.route_refresh.afi'),
+                         'IP (IP version 4)')
+        self.assertEqual(b.get_field_val('bgp.route_refresh.safi'), 'Unicast')
+        self.assertEqual(b.pkt2net({}), raw)
+
+
+class BGPContractTestCase(unittest.TestCase):
+
+    def test_inapplicable_fields_return_none(self):
+        b = BGP(_bgp_keepalive())
+        self.assertIsNone(b.get_field_val('bgp.open.version'))
+        self.assertIsNone(b.get_field_val('bgp.update.path_attribute.origin'))
+        self.assertIsNone(b.get_field_val('bgp.notify.major_error'))
+
+    def test_every_advertised_field_resolves_or_none(self):
+        _, fields = BGP.query_info()
+        b = BGP(_bgp_std_update())
+        for f in fields:
+            # Must not raise; either a value or None.
+            b.get_field_val(f)
+
+    def test_truncation_never_raises(self):
+        wire = _bgp_std_update()
+        for n in (0, 1, 15, 18, 19, 21, 25, len(wire) - 1):
+            parsed = BGP(wire[:n])
+            self.assertIsInstance(parsed, BGP)
+            self.assertEqual(parsed.pkt2net({}), wire[:n],
+                             'round-trip failed at %d bytes' % n)
+
+    def test_short_message_marked_malformed(self):
+        # length field claims more than is present.
+        raw = BGP_MARKER + struct.pack('!H', 60) + bytes([4])
+        b = BGP(raw)
+        self.assertTrue(b.malformed)
+        self.assertEqual(b.pkt2net({}), raw)
+
+    def test_back_to_back_messages_chain(self):
+        two = _bgp_keepalive() + _bgp_std_update()
+        b = BGP(two)
+        self.assertEqual(b.get_field_val('bgp.type'), 'KEEPALIVE Message')
+        self.assertIsInstance(b.payload, BGP)
+        self.assertEqual(b.payload.get_field_val('bgp.type'), 'UPDATE Message')
+        self.assertEqual(b.pkt2net({}), two)
+
+
+class BGPDispatchTestCase(unittest.TestCase):
+
+    def test_tcp_l7_dispatch(self):
+        raw = _bgp_std_update()
+        tcp = TCP(TCP(sport=50000, dport=BGP_PORT, payload=raw).pkt2net({}),
+                  l7_ports={BGP_PORT: BGP})
+        self.assertIsInstance(tcp.payload, BGP)
+        self.assertEqual(tcp.payload.get_field_val('bgp.type'),
+                         'UPDATE Message')
+
+    def test_nested_ip_tcp_bgp(self):
+        raw = _bgp_std_update()
+        outer = IP(src='10.0.0.1', dst='10.0.0.2', proto=C.PROTO_TCP,
+                   payload=TCP(sport=50000, dport=BGP_PORT, payload=raw))
+        wire = outer.pkt2net({'update': 1, 'csum': 1})
+        parsed = IP(wire, l7_ports={BGP_PORT: BGP})
+        bgp = parsed.get_layer_by_type(C.PQ_BGP)
+        self.assertIsInstance(bgp, BGP)
+        self.assertEqual(bgp.get_field_val(
+            'bgp.update.path_attribute.origin'), 'IGP')
 
 
 if __name__ == '__main__':

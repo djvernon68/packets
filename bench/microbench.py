@@ -56,6 +56,12 @@ try:
     from packets.core.inetpkt import OSPFv2
 except ImportError:
     OSPFv2 = None
+try:
+    # BGP ships with the Stage 3 routing codecs; import optionally so the
+    # harness still runs against a pre-BGP baseline (the BGP row is skipped).
+    from packets.core.inetpkt import BGP
+except ImportError:
+    BGP = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_CNAME, RCLASS_IN
 
@@ -198,6 +204,15 @@ def make_layer_corpus():
         corpus['ospf'] = OSPFv2(version=2, type=1, srcrouter='1.1.1.1',
                                 area_id='0.0.0.0',
                                 body=_hello_body).pkt2net({'update': 1})
+    if BGP is not None:
+        # A BGP UPDATE with two path attributes and one NLRI, so the parse row
+        # walks the 19-byte header and the path-attribute loop. Built from a
+        # keyword body so no capture file is needed on the appliance.
+        _bgp_attrs = (bytes([0x40, 1, 1, 0]) +
+                      bytes([0x40, 3, 4]) + bytes([9, 9, 9, 9]))
+        _bgp_body = (b'\x00\x00' + bytes([0, len(_bgp_attrs)]) + _bgp_attrs +
+                     bytes([8, 10]))
+        corpus['bgp'] = BGP(type=2, body=_bgp_body).pkt2net({'update': 1})
     return corpus
 
 
@@ -482,6 +497,9 @@ def main():
         bench('parse_gre', lambda: GRE(corpus['gre']), iterations, repeats)
     if OSPFv2 is not None:
         bench('parse_ospf', lambda: OSPFv2(corpus['ospf']),
+              iterations, repeats)
+    if BGP is not None:
+        bench('parse_bgp', lambda: BGP(corpus['bgp']),
               iterations, repeats)
     bench('parse_netflow', lambda: NetflowSimple(corpus['netflow']),
           iterations, repeats)

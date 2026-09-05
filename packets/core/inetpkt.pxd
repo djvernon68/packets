@@ -366,6 +366,7 @@ cdef:
     uint16_t PQ_ICMP6OPT
     uint16_t PQ_MLDV2_ADDRESS_RECORD
     uint16_t PQ_OSPFV3
+    unsigned char PQ_BGP
     uint16_t PQ_NULLPKT
     unsigned char PTR_VAL
     object offset_re
@@ -521,6 +522,7 @@ cdef class IP_CONST:
         readonly uint16_t PQ_ICMP6OPT
         readonly uint16_t PQ_MLDV2_ADDRESS_RECORD
         readonly uint16_t PQ_OSPFV3
+        readonly unsigned char PQ_BGP
         readonly uint16_t PQ_NULLPKT
 
 cdef class PKT:
@@ -960,6 +962,48 @@ cdef class OSPFv3(PKT):
     cpdef object get_field_val(self, str field)
 
 
+cdef class BGPParam(PKT):
+    # One decoded BGP sub-structure: an OPEN capability or an UPDATE path
+    # attribute. The bytes are kept whole in ``_raw`` so the parent BGP message
+    # re-serializes byte for byte; decoded fields land in ``fields`` keyed by
+    # their Wireshark ``bgp.*`` name.
+    cdef:
+        bytes _raw
+        readonly bint malformed
+        public dict fields
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
+cdef class BGP(PKT):
+    # BGP (RFC 4271 + extensions) over TCP 179, dispatched via l7_ports. Single
+    # message codec (CRITICAL-1 Option A): one object decodes one message from
+    # the marker; a multi-message buffer chains the remainder as a trailing BGP
+    # payload. Follows the never-raise/_raw contract, re-serializing verbatim
+    # and rebuilding only the 2-byte length under a pkt2net ``update``.
+    cdef:
+        bytes _raw
+        bytes _marker, _body
+        bint _add_path
+        readonly bint malformed
+        public unsigned char type
+        public uint16_t length
+        public dict body
+        public list params
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
 # Private owner/range parser entry points.  Public constructors use these
 # after normalizing bytes/array input to one immutable bytes owner.
 cdef bytes _owned_buffer(tuple args, dict kwargs)
@@ -1021,6 +1065,9 @@ cdef int _decode_ospfv2(OSPFv2 pkt, bytes owner, const unsigned char[:] mv,
 cdef int _decode_ospfv3(OSPFv3 pkt, bytes owner, const unsigned char[:] mv,
                         Py_ssize_t start, Py_ssize_t end,
                         dict l7_ports) except -1
+cdef int _decode_bgp(BGP pkt, bytes owner, const unsigned char[:] mv,
+                     Py_ssize_t start, Py_ssize_t end,
+                     dict l7_ports) except -1
 cdef int _decode_ethernet(Ethernet pkt, bytes owner,
                           const unsigned char[:] mv,
                           Py_ssize_t start, Py_ssize_t end,

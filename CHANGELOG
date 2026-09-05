@@ -1,6 +1,38 @@
 CHANGELOG
 ---------
 
+[2.1.10]
+ * **BGP is decoded, queried, and re-serialized as a first-class layer
+   (RFC 4271 and its extensions), carried over TCP port 179.** TCP payloads on
+   port 179 previously stopped at a raw `data` blob, so nothing inside a BGP
+   message could be inspected. A new `BGP` class in `packets.core.inetpkt`
+   parses the 19-byte message header (16-byte marker, length, and message type)
+   and then the body for every message type: OPEN (version, my-AS, hold time,
+   BGP identifier, and its optional-parameter capabilities), UPDATE (withdrawn
+   routes, the path attributes, and the NLRI), NOTIFICATION (major and minor
+   error), KEEPALIVE, and ROUTE-REFRESH. Path attributes are decoded to the
+   depth Wireshark shows - ORIGIN, AS_PATH / AS4_PATH, NEXT_HOP,
+   MULTI_EXIT_DISC, LOCAL_PREF, AGGREGATOR / AS4_AGGREGATOR, COMMUNITIES (with
+   the well-known names), ORIGINATOR_ID, MP_REACH_NLRI / MP_UNREACH_NLRI (AFI /
+   SAFI and next hop), and LARGE_COMMUNITY - into a generic `BGPParam` object,
+   and any other attribute or capability code is preserved whole so it
+   round-trips. Capabilities decoded include Multiprotocol extensions, 4-octet
+   AS number, and Additional Paths (RFC 7911, code 69); the ADD-PATH send/
+   receive value renders with Wireshark's own text ("Receive" / "Send" /
+   "Both"). BGP is a single-message codec: one object decodes one message
+   starting at the marker and, when a segment carries several messages
+   back-to-back, chains the remainder as a following BGP layer - the caller
+   owns TCP stream reassembly. BGP is dispatched over TCP port 179 through the
+   existing `l7_ports` mechanism (pass `pkt_classes=[BGP]` to `pcap_query`, or
+   `l7_ports={179: BGP}` when parsing directly), and `BGP.default_ports()`
+   returns `[179]`. A new `PQ_BGP` packet-query type exposes the header,
+   message-body, capability, and path-attribute fields under their Wireshark
+   `bgp.*` names, with enumerations rendered using Wireshark's own value-string
+   text. An `add_path` parse-hint keyword lets a lone UPDATE with no preceding
+   OPEN decode NLRI that carries a 4-byte Path Identifier. Malformed or
+   truncated BGP - at any header, attribute, or NLRI boundary - decodes into
+   whatever is present rather than raising, so partial captures still parse.
+
 [2.1.9]
  * **OSPF is decoded, queried, and re-serialized as a first-class layer, for
    both OSPFv2 (RFC 2328) over IPv4 and OSPFv3 (RFC 5340) over IPv6.** IP

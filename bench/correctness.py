@@ -36,6 +36,13 @@ try:
 except ImportError:
     OSPFv2 = None
     OSPFv3 = None
+try:
+    # BGP ships with the Stage 3 routing codecs. Import optionally so the
+    # harness still runs against a pre-BGP baseline (the BGP golden records
+    # are simply absent from the emitted JSON there).
+    from packets.core.inetpkt import BGP
+except ImportError:
+    BGP = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_AAAA, DNSTYPE_CNAME, DNSTYPE_NS, DNSTYPE_PTR, \
     DNSTYPE_SOA, DNSTYPE_TXT, RCLASS_IN
@@ -133,6 +140,8 @@ def corpus():
         out.update(gre_corpus())
     if OSPFv2 is not None:
         out.update(ospf_corpus())
+    if BGP is not None:
+        out.update(bgp_corpus())
     return out
 
 
@@ -322,6 +331,83 @@ def ospf_corpus():
                        payload=OSPFv3(_ospf3_hello_bytes()))
     n, r = record_ospf('ospf3_hello', eth6, C.PQ_OSPFV3, out)
     out[n] = r
+    return out
+
+
+# --- BGP golden corpus ------------------------------------------------------
+# BGP rides on TCP port 179, so each message is wrapped in an Ethernet/IP/TCP
+# frame and reparsed with l7_ports={179: BGP}. Reparsing walks the TCP L7
+# dispatch, the 19-byte header, the per-type body and the path
+# attributes/capabilities the reader recovered, plus the full wire hash -- so
+# the golden diff catches any change to the header layout, an attribute body,
+# the enum renderings or the never-raise/round-trip contract.
+
+def _bgp_bytes(mtype, body):
+    import struct as _s
+    return b'\xff' * 16 + _s.pack('!H', 19 + len(body)) + bytes([mtype]) + body
+
+
+def _bgp_open_bytes():
+    import struct as _s
+    caps = (bytes([1, 4]) + _s.pack('!H', 1) + bytes([0, 1]) +      # MP v4 unicast
+            bytes([65, 4]) + _s.pack('!I', 65001) +                 # 4-octet AS
+            bytes([69, 4]) + _s.pack('!H', 1) + bytes([1, 3]))      # add-path Both
+    optparams = bytes([2, len(caps)]) + caps
+    body = (bytes([4]) + _s.pack('!H', 65001) + _s.pack('!H', 180) +
+            _ip4b('1.1.1.1') + bytes([len(optparams)]) + optparams)
+    return _bgp_bytes(1, body)
+
+
+def _bgp_update_bytes():
+    import struct as _s
+    def pa(flags, t, v):
+        return bytes([flags, t, len(v)]) + v
+    attrs = (pa(0x40, 1, bytes([0])) +
+             pa(0x40, 2, bytes([2, 1]) + _s.pack('!H', 65010)) +
+             pa(0x40, 3, _ip4b('9.9.9.9')) +
+             pa(0x80, 4, _s.pack('!I', 100)) +
+             pa(0xC0, 8, _s.pack('!I', 0xFFFFFF01)))
+    body = (_s.pack('!H', 0) + _s.pack('!H', len(attrs)) + attrs +
+            bytes([8, 10]))
+    return _bgp_bytes(2, body)
+
+
+def record_bgp(name, raw, out):
+    """Wrap a BGP message in Ethernet/IP/TCP(179), serialize with update, and
+    reparse it with l7_ports so the TCP L7 dispatch surfaces the BGP layer.
+    """
+    eth = Ethernet(dst_mac='02:00:00:00:00:02', src_mac='02:00:00:00:00:01')
+    eth.payload = IP(proto=C.PROTO_TCP, src='10.8.1.1', dst='10.8.1.2',
+                     payload=TCP(sport=50000, dport=179, payload=raw))
+    wire = eth.pkt2net({'csum': 1, 'update': 1})
+    copy = Ethernet(wire, l7_ports={179: BGP})
+    b = copy.get_layer_by_type(C.PQ_BGP)
+    rec = {
+        'wire_len': len(wire),
+        'wire_sha1': hashlib.sha1(wire).hexdigest(),
+        'bgp.type': b.get_field_val('bgp.type'),
+        'bgp.length': b.get_field_val('bgp.length'),
+        'bgp.malformed': b.malformed,
+        'bgp.param_count': len(b.params),
+        'bgp.open.myas': b.get_field_val('bgp.open.myas'),
+        'bgp.open.identifier': b.get_field_val('bgp.open.identifier'),
+        'bgp.cap.ap.sendreceive': b.get_field_val('bgp.cap.ap.sendreceive'),
+        'bgp.origin': b.get_field_val('bgp.update.path_attribute.origin'),
+        'bgp.next_hop': b.get_field_val('bgp.update.path_attribute.next_hop'),
+        'bgp.community': b.get_field_val('bgp.update.path_attribute.community'),
+        'bgp.nlri_prefix': b.get_field_val('bgp.nlri_prefix'),
+    }
+    out[name] = rec
+
+
+def bgp_corpus():
+    """BGP read/write coverage: an OPEN with MP/4-octet-AS/add-path
+    capabilities and an UPDATE carrying ORIGIN/AS_PATH/NEXT_HOP/MED/COMMUNITIES
+    plus one NLRI, each dispatched via TCP port 179.
+    """
+    out = {}
+    record_bgp('bgp_open', _bgp_open_bytes(), out)
+    record_bgp('bgp_update', _bgp_update_bytes(), out)
     return out
 
 
