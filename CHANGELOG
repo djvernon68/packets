@@ -1,6 +1,36 @@
 CHANGELOG
 ---------
 
+[2.1.9]
+ * **OSPF is decoded, queried, and re-serialized as a first-class layer, for
+   both OSPFv2 (RFC 2328) over IPv4 and OSPFv3 (RFC 5340) over IPv6.** IP
+   payloads carrying protocol 89 and IPv6 payloads with next-header 89
+   previously stopped at a raw `data` blob, so nothing inside an OSPF packet
+   could be inspected. New `OSPFv2` and `OSPFv3` classes in
+   `packets.core.inetpkt` parse the common header (version, message type,
+   packet length, source router id, area id, checksum, and - for v2 - the
+   authentication type and 64-bit authentication field; for v3 the instance
+   id) and then the body for every packet type: Hello, Database Description,
+   Link State Request, Link State Update, and Link State Acknowledgment. Link
+   State Advertisements inside an LS Update are decoded to the depth Wireshark
+   shows - Router, Network, Summary, ASBR-Summary, AS-External, and NSSA for
+   v2, and Router, Network, Inter-Area-Prefix, Inter-Area-Router, AS-External,
+   Link, and Intra-Area-Prefix for v3 - into an `OSPFLSA` object; any other LSA
+   type (including the Opaque LSAs) is preserved whole so it round-trips. `IP`
+   dispatches protocol 89 to `OSPFv2` and `IP6` dispatches next-header 89 to
+   `OSPFv3` automatically. Authentication is human-readable both ways: v2
+   AuType 0/1/2 (including the RFC 5709 crypto sequence/key-id fields) and the
+   RFC 7166 OSPFv3 Authentication Trailer (`ospf.at.*`) decode into fields and
+   are emitted verbatim, with the header length and checksum recomputed only
+   when serialized with the `update` flag set (mirroring the GRE checksum
+   gating). New `PQ_OSPF` and `PQ_OSPFV3` packet-query types expose the header,
+   packet-type, LSA, and auth fields under their Wireshark `ospf.*` names, with
+   enumerations rendered using Wireshark's own value-string text. Malformed or
+   truncated OSPF - at any header, LSA, or trailer boundary - decodes into
+   whatever is present rather than raising, so partial captures still parse,
+   and IPsec-protected (AH/ESP) OSPFv3 is left to the IP layer and never
+   raises.
+
 [2.1.8]
  * **GRE tunnels are decoded, queried, and re-encapsulated as a first-class
    layer.** IP and IPv6 payloads carrying protocol 47 previously stopped at a

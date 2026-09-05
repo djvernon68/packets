@@ -50,6 +50,12 @@ try:
     from packets.core.inetpkt import GRE
 except ImportError:
     GRE = None
+try:
+    # OSPF ships with the Stage 2 routing codecs; import optionally so the
+    # harness still runs against a pre-OSPF baseline (the OSPF row is skipped).
+    from packets.core.inetpkt import OSPFv2
+except ImportError:
+    OSPFv2 = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_CNAME, RCLASS_IN
 
@@ -181,6 +187,17 @@ def make_layer_corpus():
         corpus['gre'] = GRE(key=0x11223344,
                             payload=IP(embedded)).pkt2net({'csum': 1,
                                                            'update': 1})
+    if OSPFv2 is not None:
+        # An OSPFv2 Hello: a 24-byte common header plus the hello body, so the
+        # parse row walks the header decode and the neighbour list. Built from
+        # a keyword body so no capture file is needed on the appliance.
+        _hello_body = (bytes([255, 255, 255, 0]) + b'\x00\x0a' +
+                       bytes([0x02, 1]) + b'\x00\x00\x00\x28' +
+                       bytes([1, 1, 1, 1]) + b'\x00\x00\x00\x00' +
+                       bytes([2, 2, 2, 2]))
+        corpus['ospf'] = OSPFv2(version=2, type=1, srcrouter='1.1.1.1',
+                                area_id='0.0.0.0',
+                                body=_hello_body).pkt2net({'update': 1})
     return corpus
 
 
@@ -463,6 +480,9 @@ def main():
     bench('parse_mpls', lambda: MPLS(corpus['mpls']), iterations, repeats)
     if GRE is not None:
         bench('parse_gre', lambda: GRE(corpus['gre']), iterations, repeats)
+    if OSPFv2 is not None:
+        bench('parse_ospf', lambda: OSPFv2(corpus['ospf']),
+              iterations, repeats)
     bench('parse_netflow', lambda: NetflowSimple(corpus['netflow']),
           iterations, repeats)
     bench('parse_dns', lambda: DNS(corpus['dns']), iterations, repeats)

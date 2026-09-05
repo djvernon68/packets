@@ -28,6 +28,14 @@ try:
     from packets.core.inetpkt import GRE
 except ImportError:
     GRE = None
+try:
+    # OSPF ships with the Stage 2 routing codecs. Import optionally so the
+    # harness still runs against a pre-OSPF baseline (the OSPF golden records
+    # are simply absent from the emitted JSON there).
+    from packets.core.inetpkt import OSPFv2, OSPFv3
+except ImportError:
+    OSPFv2 = None
+    OSPFv3 = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_AAAA, DNSTYPE_CNAME, DNSTYPE_NS, DNSTYPE_PTR, \
     DNSTYPE_SOA, DNSTYPE_TXT, RCLASS_IN
@@ -123,6 +131,8 @@ def corpus():
     out.update(dns_corpus())
     if GRE is not None:
         out.update(gre_corpus())
+    if OSPFv2 is not None:
+        out.update(ospf_corpus())
     return out
 
 
@@ -209,6 +219,109 @@ def gre_corpus():
                _gre_eth_wrap(GRE(version=1, sequence_number=0x1111,
                                  ack_number=0x2222, proto=0x880b,
                                  payload=NullPkt(b'ppp-payload'))), out)
+    return out
+
+
+# --- OSPF golden corpus -----------------------------------------------------
+# OSPFv2 rides on IPv4 proto 89 and OSPFv3 on IPv6 next-header 89, so wrapping
+# a raw OSPF packet in an Ethernet/IP(6) frame and reparsing it walks the
+# hardcoded dispatch, the common header, the per-type body and the LSAs the
+# reader recovered, plus the full wire hash -- so the golden diff sees any
+# change to the header layout, an LSA body, the enum renderings or the
+# never-raise/round-trip contract.
+
+def _ip4b(addr):
+    return bytes(int(x) for x in addr.split('.'))
+
+
+def _ospf2_hello_bytes():
+    body = (_ip4b('255.255.255.0') + b'\x00\x0a' + bytes([0x02, 1]) +
+            b'\x00\x00\x00\x28' + _ip4b('1.1.1.1') + _ip4b('0.0.0.0') +
+            _ip4b('2.2.2.2'))
+    length = 24 + len(body)
+    return (bytes([2, 1]) + bytes([length >> 8, length & 0xff]) +
+            _ip4b('1.1.1.1') + _ip4b('0.0.0.0') + b'\x00\x00' + b'\x00\x00' +
+            b'\x00' * 8 + body)
+
+
+def _ospf2_lsupdate_bytes():
+    def lsa(age, opt, typ, lsid, adv, seq, lbody):
+        L = 20 + len(lbody)
+        return (bytes([age >> 8, age & 0xff, opt, typ]) + _ip4b(lsid) +
+                _ip4b(adv) + bytes([(seq >> 24) & 0xff, (seq >> 16) & 0xff,
+                                    (seq >> 8) & 0xff, seq & 0xff]) +
+                b'\x00\x00' + bytes([L >> 8, L & 0xff]) + lbody)
+    rbody = (b'\x00\x00\x00\x01' + _ip4b('10.0.0.1') +
+             _ip4b('255.255.255.255') + bytes([1, 0]) + b'\x00\x05')
+    rlsa = lsa(1, 0x02, 1, '1.1.1.1', '1.1.1.1', 0x80000001, rbody)
+    ebody = (_ip4b('255.255.255.0') + bytes([0x80, 0, 0, 0x14]) +
+             _ip4b('9.9.9.9') + b'\x00\x00\x00\x64')
+    elsa = lsa(2, 0x02, 5, '20.0.0.0', '2.2.2.2', 0x80000002, ebody)
+    body = b'\x00\x00\x00\x02' + rlsa + elsa
+    length = 24 + len(body)
+    return (bytes([2, 4]) + bytes([length >> 8, length & 0xff]) +
+            _ip4b('1.1.1.1') + _ip4b('0.0.0.0') + b'\x00\x00' + b'\x00\x00' +
+            b'\x00' * 8 + body)
+
+
+def _ospf3_hello_bytes():
+    body = (b'\x00\x00\x00\x05' + bytes([1]) + bytes([0, 0, 0x13]) +
+            b'\x00\x0a' + b'\x00\x28' + _ip4b('1.1.1.1') +
+            _ip4b('0.0.0.0') + _ip4b('2.2.2.2'))
+    length = 16 + len(body)
+    return (bytes([3, 1]) + bytes([length >> 8, length & 0xff]) +
+            _ip4b('1.1.1.1') + _ip4b('0.0.0.0') + b'\x00\x00' + bytes([0, 0]) +
+            body)
+
+
+def record_ospf(name, eth, pq_type, out):
+    """Serialize an OSPF frame with update, reparse it, and capture the common
+    header, the packet-type/LSA fields and the full wire hash the reader
+    recovered. Fields that do not apply to a given packet report None, which
+    is exactly the shape the golden diff should pin.
+    """
+    wire = eth.pkt2net({'csum': 1, 'update': 1})
+    copy = Ethernet(wire)
+    o = copy.get_layer_by_type(pq_type)
+    rec = {
+        'wire_len': len(wire),
+        'wire_sha1': hashlib.sha1(wire).hexdigest(),
+        'ospf.version': o.get_field_val('ospf.version'),
+        'ospf.msg': o.get_field_val('ospf.msg'),
+        'ospf.packet_length': o.get_field_val('ospf.packet_length'),
+        'ospf.srcrouter': o.get_field_val('ospf.srcrouter'),
+        'ospf.area_id': o.get_field_val('ospf.area_id'),
+        'ospf.lsa_count': len(o.lsas),
+        'ospf.malformed': o.malformed,
+    }
+    if o.lsas:
+        rec['lsa0.type'] = o.lsas[0].get_field_val('ospf.lsa.type') \
+            if pq_type == C.PQ_OSPF \
+            else o.lsas[0].get_field_val('ospf.v3.lsa.type')
+        rec['lsa0.id'] = o.lsas[0].get_field_val('ospf.lsa.id')
+        rec['lsa0.seqnum'] = o.lsas[0].get_field_val('ospf.lsa.seqnum')
+    return name, rec
+
+
+def ospf_corpus():
+    """OSPFv2/v3 read/write coverage: a v2 Hello, a v2 LS Update carrying a
+    Router-LSA and an AS-External-LSA, and a v3 Hello over IPv6.
+    """
+    out = {}
+    for label, raw in (('ospf2_hello', _ospf2_hello_bytes()),
+                       ('ospf2_lsupdate', _ospf2_lsupdate_bytes())):
+        eth = Ethernet(dst_mac='01:00:5e:00:00:05',
+                       src_mac='02:00:00:00:00:01')
+        eth.payload = IP(proto=C.PROTO_OSPF, src='10.8.1.1', dst='224.0.0.5',
+                         payload=OSPFv2(raw))
+        n, r = record_ospf(label, eth, C.PQ_OSPF, out)
+        out[n] = r
+    eth6 = Ethernet(dst_mac='33:33:00:00:00:05',
+                    src_mac='02:00:00:00:00:02')
+    eth6.payload = IP6(next_header=C.PROTO_OSPF, src='fe80::1', dst='ff02::5',
+                       payload=OSPFv3(_ospf3_hello_bytes()))
+    n, r = record_ospf('ospf3_hello', eth6, C.PQ_OSPFV3, out)
+    out[n] = r
     return out
 
 

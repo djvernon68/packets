@@ -117,6 +117,7 @@ PROTO_IGMP = 2
 PROTO_TCP = 6
 PROTO_UDP = 17
 PROTO_GRE = 47
+PROTO_OSPF = 89
 PROTO_ICMPV6 = 58
 IPV6_HDR_LEN = 40
 ICMP6_DST_UNREACH = 1
@@ -154,9 +155,11 @@ PQ_ICMPV6 = 58
 PQ_ARP = 0x0806
 PQ_MPLS = 0x8847
 PQ_GRE = 47
+PQ_OSPF = 89
 PQ_NETFLOW_SIMPLE = 2005
 PQ_ICMP6OPT = 2006
 PQ_MLDV2_ADDRESS_RECORD = 2007
+PQ_OSPFV3 = 2008
 PQ_NULLPKT = 0xffff
 NOT_FOUND = -1
 
@@ -185,6 +188,8 @@ cdef tuple _QI_MLDv2AddressRecord
 cdef tuple _QI_MPLS
 cdef tuple _QI_ETH
 cdef tuple _QI_GRE
+cdef tuple _QI_OSPF
+cdef tuple _QI_OSPFV3
 
 # Address conversion entry points, bound once at import. These sit on the
 # construction path (every src/dst set) and on the parse path (every address
@@ -288,6 +293,7 @@ cdef class IP_CONST:
         self.PROTO_TCP = PROTO_TCP
         self.PROTO_UDP = PROTO_UDP
         self.PROTO_GRE = PROTO_GRE
+        self.PROTO_OSPF = PROTO_OSPF
         self.PROTO_ICMPV6 = PROTO_ICMPV6
         self.IPV6_HDR_LEN = IPV6_HDR_LEN
         self.ICMP6_DST_UNREACH = ICMP6_DST_UNREACH
@@ -324,6 +330,8 @@ cdef class IP_CONST:
         self.PQ_ARP = PQ_ARP
         self.PQ_MPLS = PQ_MPLS
         self.PQ_GRE = PQ_GRE
+        self.PQ_OSPF = PQ_OSPF
+        self.PQ_OSPFV3 = PQ_OSPFV3
         self.PQ_NETFLOW_SIMPLE = PQ_NETFLOW_SIMPLE
         self.PQ_NULLPKT = PQ_NULLPKT
 
@@ -5889,6 +5897,1091 @@ cdef int _decode_gre(GRE pkt, bytes owner, const unsigned char[:] mv,
     return 0
 
 
+# --- OSPF (RFC 2328 / RFC 5340) ---------------------------------------------
+# OSPFv2 rides directly on IPv4 (proto 89) and OSPFv3 on IPv6 (next-header 89).
+# Both follow the routing never-raise contract established by GRE: a truncated
+# or unparsable packet sets ``malformed`` and keeps the exact parsed bytes in
+# ``_raw`` so it re-serializes to what came in, and every LSA/TLV region is
+# bounds-checked before it is read.
+#
+# Field names and the enum text below are the Wireshark packet-ospf.c
+# abbreviations and value_string renderings, so a display-filter name used in
+# Wireshark resolves through get_field_val() unchanged.
+
+# value_string tables copied verbatim from packet-ospf.c so enum fields render
+# exactly as Wireshark shows them; an unknown wire value renders "Unknown (N)".
+cdef dict _OSPF_PT_VALS = {
+    1: 'Hello Packet', 2: 'DB Description', 3: 'LS Request',
+    4: 'LS Update', 5: 'LS Acknowledge'}
+cdef dict _OSPF_AUTH_VALS = {
+    0: 'Null', 1: 'Simple password', 2: 'Cryptographic'}
+cdef dict _OSPF_LS_TYPE_VALS = {
+    1: 'Router-LSA', 2: 'Network-LSA', 3: 'Summary-LSA (IP network)',
+    4: 'Summary-LSA (ASBR)', 5: 'AS-External-LSA (ASBR)',
+    6: 'Group Membership LSA', 7: 'NSSA AS-External-LSA',
+    8: 'External Attributes LSA', 9: 'Opaque LSA, Link-local scope',
+    10: 'Opaque LSA, Area-local scope', 11: 'Opaque LSA, AS-local scope'}
+cdef dict _OSPF_V3_LS_TYPE_VALS = {
+    1: 'Router-LSA', 2: 'Network-LSA', 3: 'Inter-Area-Prefix-LSA',
+    4: 'Inter-Area-Router-LSA', 5: 'AS-External-LSA',
+    6: 'Group-Membership-LSA', 7: 'NSSA-LSA', 8: 'Link-LSA',
+    9: 'Intra-Area-Prefix-LSA', 10: 'Intra-Area-TE-LSA', 11: 'GRACE-LSA',
+    12: 'Router Information Opaque-LSA', 13: 'Inter-AS-TE-V3 LSA',
+    14: 'OSPFv3 L1VPN LSA', 15: 'OSPFv3 Autoconfiguration LSA',
+    16: 'OSPFv3 Dynamic Flooding LSA'}
+cdef dict _OSPF_V3_LINK_TYPE_VALS = {
+    1: 'Point-to-point connection to another router',
+    2: 'Connection to a transit network',
+    3: 'Connection to a stub network', 4: 'Virtual link'}
+
+
+cdef inline str _ospf_vs(dict table, object key):
+    """Render an enum value as Wireshark does: its string, else 'Unknown (N)'."""
+    cdef object txt = table.get(key)
+    if txt is None:
+        return 'Unknown (%d)' % key
+    return txt
+
+
+cdef inline void w_take_into(PktWriter w, bytes v, Py_ssize_t k):
+    """Append exactly k bytes of v, zero-padded/truncated to k."""
+    cdef Py_ssize_t n = 0
+    if v is not None:
+        n = PyBytes_GET_SIZE(v)
+    if n > k:
+        n = k
+    if n:
+        w_raw(w, <const unsigned char*>PyBytes_AS_STRING(v), n)
+    if n < k:
+        w_zeros(w, k - n)
+
+
+cdef inline void w_take_restore(PktWriter w, Py_ssize_t off, bytes v,
+                                Py_ssize_t k):
+    """Restore k bytes of v back into the buffer at off (after checksumming)."""
+    cdef Py_ssize_t n = 0, i
+    if v is not None:
+        n = PyBytes_GET_SIZE(v)
+    if n > k:
+        n = k
+    for i in range(n):
+        w.b[off + i] = (<const unsigned char*>PyBytes_AS_STRING(v))[i]
+
+
+@cython.final
+cdef class OSPFLSA(PKT):
+    """A single Link State Advertisement, OSPFv2 (RFC 2328) or OSPFv3
+    (RFC 5340).
+
+    The 20-byte LSA header is always decoded. The body is decoded to the depth
+    Wireshark's packet-ospf.c shows for the common LSA types and, whatever the
+    type, kept whole in ``_raw`` so the LSA re-serializes byte for byte. Body
+    fields land in ``fields`` keyed by their Wireshark ``ospf.*`` name.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._base_l7(kwargs)
+        self.pkt_name = 'OSPFLSA'
+        self.pq_type = PQ_OSPF
+        self.query_fields = ()
+        self.malformed = 0
+        self._raw = kwargs.get('data', b'') or b''
+        self.fields = {}
+        self.payload = NullPkt(b'')
+
+    property ls_id:
+        """Link State ID, as a dotted quad (Wireshark ospf.lsa.id)."""
+        def __get__(self):
+            return _fmt_ipv4(self._ls_id) if self._ls_id else None
+        def __set__(self, str val):
+            self._ls_id = pack_ipv4(val)
+
+    property advrouter:
+        """Advertising Router, as a dotted quad (Wireshark ospf.advrouter)."""
+        def __get__(self):
+            return _fmt_ipv4(self._advrouter) if self._advrouter else None
+        def __set__(self, str val):
+            self._advrouter = pack_ipv4(val)
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Network-order bytes of just this LSA (header + body)."""
+        return self._raw if self._raw is not None else b''
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        if self._raw is not None:
+            w_bytes(w, self._raw)
+        return 0
+
+    cpdef object get_field_val(self, str field):
+        """Resolve a single LSA-scoped Wireshark field name."""
+        if field == 'ospf.lsa.age':
+            return self.ls_age
+        elif field == 'ospf.lsa.do_not_age' or field == 'ospf.lsa.donotage':
+            return 1 if (self.ls_age & 0x8000) else 0
+        elif field == 'ospf.lsa.type' or field == 'ospf.v3.lsa.type':
+            if self._v3:
+                return _ospf_vs(_OSPF_V3_LS_TYPE_VALS,
+                                self.ls_type & 0x1fff)
+            return _ospf_vs(_OSPF_LS_TYPE_VALS, self.ls_type)
+        elif field == 'ospf.lsa.type_int':
+            return self.ls_type
+        elif field == 'ospf.options':
+            return self.options if not self._v3 else None
+        elif field == 'ospf.link_state_id' or field == 'ospf.lsa.id':
+            return self.ls_id
+        elif field == 'ospf.advrouter':
+            return self.advrouter
+        elif field == 'ospf.lsa.seqnum':
+            return self.seqnum
+        elif field == 'ospf.lsa.chksum':
+            return self.chksum
+        elif field == 'ospf.lsa.length':
+            return self.length
+        elif field in self.fields:
+            return self.fields[field]
+        return None
+
+
+cdef dict _ospf_v2_lsa_body(unsigned char ls_type, const unsigned char[:] mv,
+                            Py_ssize_t bstart, Py_ssize_t bend):
+    """Decode an OSPFv2 LSA body to Wireshark depth; never raises.
+
+    Returns a dict keyed by Wireshark ospf.* field names. Regions past the
+    end of the buffer are simply left out, so a truncated LSA yields whatever
+    fields fit.
+    """
+    cdef:
+        dict f = {}
+        Py_ssize_t o = bstart
+        uint16_t nlinks, i
+        list links, attached, routers
+    if ls_type == 1:
+        # Router-LSA: flags, 0, #links, then each link.
+        if _have_range(o, bend, 4):
+            f['ospf.lsa.router.flags'] = mv[o]
+            nlinks = rd_u16(mv, o + 2)
+            f['ospf.lsa.number_of_links'] = nlinks
+            o += 4
+            links = []
+            for i in range(nlinks):
+                if not _have_range(o, bend, 12):
+                    break
+                links.append({
+                    'ospf.lsa.router.linkid': _fmt_ipv4_buf(&mv[o]),
+                    'ospf.lsa.router.linkdata': _fmt_ipv4_buf(&mv[o + 4]),
+                    'ospf.lsa.router.linktype': mv[o + 8],
+                    'ospf.lsa.router.nummetrics': mv[o + 9],
+                    'ospf.lsa.router.metric0': rd_u16(mv, o + 10)})
+                o += 12 + 4 * mv[o + 9]
+            if links:
+                f['ospf.lsa.router.linktype'] = links[0][
+                    'ospf.lsa.router.linktype']
+                f['ospf.lsa.router.linkid'] = links[0][
+                    'ospf.lsa.router.linkid']
+                f['ospf.lsa.router.linkdata'] = links[0][
+                    'ospf.lsa.router.linkdata']
+                f['ospf.lsa.router.metric0'] = links[0][
+                    'ospf.lsa.router.metric0']
+                f['ospf.lsa.router.links'] = links
+    elif ls_type == 2:
+        # Network-LSA: netmask, then attached routers.
+        if _have_range(o, bend, 4):
+            f['ospf.lsa.network.netmask'] = _fmt_ipv4_buf(&mv[o])
+            o += 4
+            attached = []
+            while _have_range(o, bend, 4):
+                attached.append(_fmt_ipv4_buf(&mv[o]))
+                o += 4
+            if attached:
+                f['ospf.lsa.network.attachrtr'] = attached[0]
+                f['ospf.lsa.network.attached_routers'] = attached
+    elif ls_type == 3 or ls_type == 4:
+        # Summary-LSA / ASBR-Summary: netmask, then TOS/metric triples.
+        if _have_range(o, bend, 4):
+            f['ospf.lsa.asbr.netmask'] = _fmt_ipv4_buf(&mv[o])
+            f['ospf.lsa.summary.netmask'] = f['ospf.lsa.asbr.netmask']
+            o += 4
+            if _have_range(o, bend, 4):
+                f['ospf.lsa.tos'] = mv[o]
+                f['ospf.lsa.summary.metric'] = (
+                    (<uint32_t>mv[o + 1] << 16) |
+                    (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+    elif ls_type == 5 or ls_type == 7:
+        # AS-External / NSSA: netmask, then E/TOS, metric, fwd addr, tag.
+        if _have_range(o, bend, 4):
+            f['ospf.lsa.asext.netmask'] = _fmt_ipv4_buf(&mv[o])
+            o += 4
+            if _have_range(o, bend, 12):
+                f['ospf.lsa.asext.type'] = 2 if (mv[o] & 0x80) else 1
+                f['ospf.lsa.asext.metric'] = (
+                    (<uint32_t>mv[o + 1] << 16) |
+                    (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+                f['ospf.lsa.asext.fwdaddr'] = _fmt_ipv4_buf(&mv[o + 4])
+                f['ospf.lsa.asext.extrttag'] = rd_u32(mv, o + 8)
+    elif ls_type >= 9 and ls_type <= 11:
+        # Opaque LSA: opaque type (from high byte of the Link State ID) and
+        # the opaque body is kept whole (round-trippable) rather than decoded.
+        f['ospf.lsa.opaque'] = rd_bytes(mv, bstart, bend)
+    return f
+
+
+cdef OSPFLSA _decode_one_lsa_v2(bytes owner, const unsigned char[:] mv,
+                                Py_ssize_t start, Py_ssize_t end,
+                                Py_ssize_t *consumed):
+    """Decode one OSPFv2 LSA starting at ``start``; never raises.
+
+    Sets ``consumed`` to the number of bytes this LSA occupied so the caller
+    can advance. A truncated LSA header yields a malformed LSA that keeps the
+    remaining bytes whole.
+    """
+    cdef:
+        OSPFLSA lsa = OSPFLSA.__new__(OSPFLSA)
+        Py_ssize_t lsa_len
+        Py_ssize_t body_end
+    lsa.pkt_name = 'OSPFLSA'
+    lsa.pq_type = PQ_OSPF
+    lsa.query_fields = ()
+    lsa.malformed = 0
+    lsa._v3 = 0
+    lsa.fields = {}
+    lsa.payload = NullPkt(b'')
+    if not _have_range(start, end, 20):
+        lsa.malformed = 1
+        lsa._raw = rd_bytes(mv, start, end)
+        consumed[0] = end - start
+        return lsa
+    lsa.ls_age = rd_u16(mv, start)
+    lsa.options = mv[start + 2]
+    lsa.ls_type = mv[start + 3]
+    lsa._ls_id = rd_bytes(mv, start + 4, start + 8)
+    lsa._advrouter = rd_bytes(mv, start + 8, start + 12)
+    lsa.seqnum = rd_u32(mv, start + 12)
+    lsa.chksum = rd_u16(mv, start + 16)
+    lsa.length = rd_u16(mv, start + 18)
+    lsa_len = lsa.length
+    if lsa_len < 20 or start + lsa_len > end:
+        # Bogus/truncated length: keep whatever is here, stop the walk.
+        lsa.malformed = 1
+        lsa._raw = rd_bytes(mv, start, end)
+        consumed[0] = end - start
+        return lsa
+    body_end = start + lsa_len
+    lsa._raw = rd_bytes(mv, start, body_end)
+    lsa.fields = _ospf_v2_lsa_body(lsa.ls_type, mv, start + 20, body_end)
+    consumed[0] = lsa_len
+    return lsa
+
+
+@cython.final
+cdef class OSPFv2(PKT):
+    """OSPF version 2 (RFC 2328), carried directly over IPv4 (protocol 89).
+
+    The 24-byte common header (version, type, packet length, source router,
+    area id, checksum, auth type and the 64-bit authentication field) is
+    decoded, then the body according to the message type: Hello, Database
+    Description, Link State Request, Link State Update (which carries LSAs,
+    decoded into ``lsas``) and Link State Acknowledgment.
+
+    Parsing follows the routing never-raise contract: a truncated or
+    unparsable packet sets ``malformed`` and keeps its exact bytes in ``_raw``.
+    Serialization re-emits those bytes verbatim, so a parsed packet round-trips
+    exactly; the header length/checksum and any crypto digest are rebuilt only
+    when pkt2net is called with ``update`` set, mirroring GRE's csum gating.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize an OSPFv2 object.
+
+        Args:
+            :args (list): optional one-element list of network-order bytes.
+            :data (bytes): optional network-order bytes of an OSPFv2 packet.
+            :version (unsigned char): OSPF version, default 2.
+            :type (unsigned char): message type 1..5.
+            :srcrouter (str): source router id, dotted quad.
+            :area_id (str): area id, dotted quad.
+            :auth_type (uint16_t): authentication type (0/1/2).
+            :auth_data (bytes): the 64-bit authentication field, verbatim.
+            :body (bytes): the type-specific body bytes after the header.
+        """
+        self._base_l7(kwargs)
+        self.pkt_name = 'OSPFv2'
+        self.pq_type, self.query_fields = _QI_OSPF
+        cdef:
+            bytes owner
+            const unsigned char[:] mv
+        owner = _owned_buffer(args, kwargs)
+        if owner is not None:
+            mv = owner
+            _decode_ospfv2(self, owner, mv, 0, len(owner), self._l7_ports)
+            return
+
+        # Keyword construction.
+        self._raw = None
+        self.malformed = 0
+        self.version = kwargs.get('version', 2)
+        self.type = kwargs.get('type', 0)
+        self._srcrouter = pack_ipv4(kwargs.get('srcrouter', '0.0.0.0'))
+        self._area_id = pack_ipv4(kwargs.get('area_id', '0.0.0.0'))
+        self.checksum = kwargs.get('checksum', 0)
+        self.auth_type = kwargs.get('auth_type', 0)
+        self.auth_crypt_seq = kwargs.get('auth_crypt_seq', 0)
+        self.auth_key_id = kwargs.get('auth_key_id', 0)
+        self.auth_data_len = kwargs.get('auth_data_len', 0)
+        self._auth = kwargs.get('auth_data', b'\x00' * 8)
+        if self._auth is None:
+            self._auth = b'\x00' * 8
+        self.body = {}
+        self.lsas = []
+        self._body = kwargs.get('body', b'') or b''
+        self.length = 24 + len(self._body)
+        if 'payload' in kwargs and isinstance(kwargs['payload'], PKT):
+            self.payload = kwargs['payload']
+        else:
+            self.payload = NullPkt(b'')
+
+    property srcrouter:
+        """Source OSPF Router ID, dotted quad (Wireshark ospf.srcrouter)."""
+        def __get__(self):
+            return _fmt_ipv4(self._srcrouter) if self._srcrouter else None
+        def __set__(self, str val):
+            self._srcrouter = pack_ipv4(val)
+
+    property area_id:
+        """Area ID, dotted quad (Wireshark ospf.area_id)."""
+        def __get__(self):
+            return _fmt_ipv4(self._area_id) if self._area_id else None
+        def __set__(self, str val):
+            self._area_id = pack_ipv4(val)
+
+    property auth_data:
+        """The 64-bit authentication field, as raw bytes."""
+        def __get__(self):
+            return self._auth
+        def __set__(self, bytes val):
+            self._auth = val
+
+    @classmethod
+    def query_info(cls):
+        """pcap_query field names (Wireshark packet-ospf.c) and PQ type."""
+        return (PQ_OSPF,
+                ('ospf.version', 'ospf.msg', 'ospf.packet_length',
+                 'ospf.srcrouter', 'ospf.area_id', 'ospf.checksum',
+                 'ospf.auth.type', 'ospf.auth.crypt.key_id',
+                 'ospf.auth.crypt.data_length', 'ospf.auth.crypt.seq_nbr',
+                 'ospf.hello.network_mask', 'ospf.hello.hello_interval',
+                 'ospf.hello.router_priority',
+                 'ospf.hello.router_dead_interval',
+                 'ospf.hello.designated_router',
+                 'ospf.hello.backup_designated_router',
+                 'ospf.hello.active_neighbor',
+                 'ospf.db.interface_mtu', 'ospf.db.dd_sequence',
+                 'ospf.dbd.ms', 'ospf.dbd.m', 'ospf.dbd.i',
+                 'ospf.lsa.age', 'ospf.lsa.type', 'ospf.lsa.id',
+                 'ospf.link_state_id',
+                 'ospf.advrouter', 'ospf.lsa.seqnum', 'ospf.lsa.chksum',
+                 'ospf.lsa.length', 'ospf.lsa.number_of_links',
+                 'ospf.lsa.router.linktype', 'ospf.lsa.router.linkid',
+                 'ospf.lsa.router.linkdata', 'ospf.lsa.router.metric0',
+                 'ospf.lsa.network.netmask', 'ospf.lsa.network.attachrtr',
+                 'ospf.lsa.asext.netmask', 'ospf.lsa.asext.type',
+                 'ospf.lsa.asext.fwdaddr', 'ospf.lsa.asext.extrttag'))
+
+    cpdef object get_field_val(self, str field):
+        """Return the value of a Wireshark-format field name, else None.
+
+        Enum fields (ospf.msg, ospf.auth.type, ospf.lsa.type) render the
+        Wireshark value_string text. Fields that do not apply to the current
+        message type return None. LSA-scoped fields resolve against the first
+        LSA that carries them.
+        """
+        cdef OSPFLSA lsa
+        cdef object v
+        if field == 'ospf.version':
+            return self.version
+        elif field == 'ospf.msg':
+            return _ospf_vs(_OSPF_PT_VALS, self.type)
+        elif field == 'ospf.packet_length':
+            return self.length
+        elif field == 'ospf.srcrouter':
+            return self.srcrouter
+        elif field == 'ospf.area_id':
+            return self.area_id
+        elif field == 'ospf.checksum':
+            return self.checksum
+        elif field == 'ospf.auth.type':
+            return _ospf_vs(_OSPF_AUTH_VALS, self.auth_type)
+        elif field == 'ospf.auth.crypt.key_id':
+            return self.auth_key_id if self.auth_type == 2 else None
+        elif field == 'ospf.auth.crypt.data_length':
+            return self.auth_data_len if self.auth_type == 2 else None
+        elif field == 'ospf.auth.crypt.seq_nbr':
+            return self.auth_crypt_seq if self.auth_type == 2 else None
+        elif field.startswith('ospf.hello.'):
+            return self.body.get(field) if self.type == 1 else None
+        elif field.startswith('ospf.db.') or field.startswith('ospf.dbd.'):
+            return self.body.get(field) if self.type == 2 else None
+        elif (field.startswith('ospf.lsa.') or field == 'ospf.advrouter' or
+              field == 'ospf.link_state_id'):
+            for lsa in self.lsas:
+                v = lsa.get_field_val(field)
+                if v is not None:
+                    return v
+            return None
+        elif isinstance(self.payload, PKT):
+            return self.payload.get_field_val(field)
+        return None
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Export this OSPFv2 packet in network order.
+
+        By default a parsed packet is emitted exactly as it arrived. With
+        ``update`` set the common-header packet length and checksum are
+        rebuilt (the 64-bit auth field is excluded from the checksum, per
+        RFC 2328) and, for AuType 2, left to the caller's supplied digest.
+        """
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        cdef:
+            bint update
+            Py_ssize_t start = w.n
+            Py_ssize_t i
+            uint16_t plen
+        update = kwargs.get('update', 0)
+        # Default: re-emit the exact parsed bytes so a parsed packet
+        # round-trips and any digest is preserved verbatim.
+        if self._raw is not None and not update:
+            w_bytes(w, self._raw)
+            return 0
+        # Rebuild from fields. Common 24-byte header first.
+        w_u8(w, self.version)
+        w_u8(w, self.type)
+        w_u16(w, self.length)               # patched below
+        w_raw(w, <const unsigned char*>PyBytes_AS_STRING(self._srcrouter), 4)
+        w_raw(w, <const unsigned char*>PyBytes_AS_STRING(self._area_id), 4)
+        w_u16(w, self.checksum)             # patched below when updating
+        w_u16(w, self.auth_type)
+        w_take_into(w, self._auth, 8)
+        # Body.
+        w_bytes(w, self._body)
+        plen = <uint16_t>(w.n - start)
+        w_set_u16(w, start + 2, plen)
+        self.length = plen
+        if update and self.auth_type != 2:
+            # Standard IP checksum over the packet with the 64-bit auth field
+            # (offset 16..24) and the checksum field (offset 12) zeroed.
+            w_set_u16(w, start + 12, 0)
+            for i in range(8):
+                w.b[start + 16 + i] = 0
+            self.checksum = w_cksum(w, start, 0)
+            w_set_u16(w, start + 12, self.checksum)
+            w_take_restore(w, start + 16, self._auth, 8)
+        return 0
+
+
+cdef int _decode_ospfv2(OSPFv2 pkt, bytes owner, const unsigned char[:] mv,
+                        Py_ssize_t start, Py_ssize_t end,
+                        dict l7_ports) except -1:
+    cdef:
+        Py_ssize_t off, body_start, body_end, consumed
+        uint16_t plen
+        OSPFLSA lsa
+        list neighbors
+    pkt.malformed = 0
+    pkt._raw = None
+    pkt.version = 0
+    pkt.type = 0
+    pkt.length = 0
+    pkt._srcrouter = b'\x00\x00\x00\x00'
+    pkt._area_id = b'\x00\x00\x00\x00'
+    pkt.checksum = 0
+    pkt.auth_type = 0
+    pkt.auth_crypt_seq = 0
+    pkt.auth_key_id = 0
+    pkt.auth_data_len = 0
+    pkt._auth = b'\x00' * 8
+    pkt.body = {}
+    pkt.lsas = []
+    pkt._body = b''
+    pkt.payload = NullPkt(b'')
+
+    if not _have_range(start, end, 24):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        pkt.payload = _null_range(owner, start, end, l7_ports)
+        return 0
+    pkt.version = mv[start]
+    pkt.type = mv[start + 1]
+    pkt.length = rd_u16(mv, start + 2)
+    pkt._srcrouter = rd_bytes(mv, start + 4, start + 8)
+    pkt._area_id = rd_bytes(mv, start + 8, start + 12)
+    pkt.checksum = rd_u16(mv, start + 12)
+    pkt.auth_type = rd_u16(mv, start + 14)
+    pkt._auth = rd_bytes(mv, start + 16, start + 24)
+    if pkt.auth_type == 2:
+        # RFC 2328 crypto auth: the 64-bit field is reserved(2)/keyid(1)/
+        # auth-data-len(1)/crypto-seq(4).
+        pkt.auth_key_id = mv[start + 18]
+        pkt.auth_data_len = mv[start + 19]
+        pkt.auth_crypt_seq = rd_u32(mv, start + 20)
+
+    # The packet length names where the OSPF packet ends. Anything past it is
+    # trailing (e.g. an appended crypto digest for AuType 2, or padding) and
+    # kept as the payload so it round-trips.
+    plen = pkt.length
+    body_end = end
+    if plen >= 24 and start + plen <= end:
+        body_end = start + plen
+    off = start + 24
+    pkt._raw = rd_bytes(mv, start, end)
+    pkt._body = rd_bytes(mv, off, body_end)
+    if body_end < end:
+        pkt.payload = _null_range(owner, body_end, end, l7_ports)
+
+    # Type-specific body. Every read is bounds-checked; a short body simply
+    # yields fewer fields and never raises.
+    if pkt.type == 1:
+        # Hello.
+        if _have_range(off, body_end, 20):
+            pkt.body['ospf.hello.network_mask'] = _fmt_ipv4_buf(&mv[off])
+            pkt.body['ospf.hello.hello_interval'] = rd_u16(mv, off + 4)
+            pkt.body['ospf.hello.options'] = mv[off + 6]
+            pkt.body['ospf.hello.router_priority'] = mv[off + 7]
+            pkt.body['ospf.hello.router_dead_interval'] = rd_u32(mv, off + 8)
+            pkt.body['ospf.hello.designated_router'] = \
+                _fmt_ipv4_buf(&mv[off + 12])
+            pkt.body['ospf.hello.backup_designated_router'] = \
+                _fmt_ipv4_buf(&mv[off + 16])
+            neighbors = []
+            off += 20
+            while _have_range(off, body_end, 4):
+                neighbors.append(_fmt_ipv4_buf(&mv[off]))
+                off += 4
+            if neighbors:
+                pkt.body['ospf.hello.active_neighbor'] = neighbors[0]
+                pkt.body['ospf.hello.active_neighbors'] = neighbors
+    elif pkt.type == 2:
+        # Database Description.
+        if _have_range(off, body_end, 8):
+            pkt.body['ospf.db.interface_mtu'] = rd_u16(mv, off)
+            pkt.body['ospf.db.options'] = mv[off + 2]
+            pkt.body['ospf.dbd.ms'] = mv[off + 3] & 0x01
+            pkt.body['ospf.dbd.m'] = 1 if (mv[off + 3] & 0x02) else 0
+            pkt.body['ospf.dbd.i'] = 1 if (mv[off + 3] & 0x04) else 0
+            pkt.body['ospf.db.dd_sequence'] = rd_u32(mv, off + 4)
+            off += 8
+            # Remaining bytes are LSA headers (20 bytes each, no body).
+            while _have_range(off, body_end, 20):
+                consumed = 0
+                lsa = _decode_one_lsa_v2(owner, mv, off,
+                                         off + 20 if off + 20 <= body_end
+                                         else body_end, &consumed)
+                pkt.lsas.append(lsa)
+                if consumed <= 0:
+                    break
+                off += 20
+    elif pkt.type == 3:
+        # Link State Request: 12-byte entries (ls_type, ls_id, adv_router).
+        while _have_range(off, body_end, 12):
+            pkt.lsas.append(_lsr_entry(mv, off))
+            off += 12
+    elif pkt.type == 4:
+        # Link State Update: 4-byte LSA count, then the LSAs.
+        if _have_range(off, body_end, 4):
+            pkt.body['ospf.lsa.number_of_lsas'] = rd_u32(mv, off)
+            off += 4
+            while off < body_end:
+                consumed = 0
+                lsa = _decode_one_lsa_v2(owner, mv, off, body_end, &consumed)
+                pkt.lsas.append(lsa)
+                if consumed <= 0:
+                    break
+                off += consumed
+    elif pkt.type == 5:
+        # Link State Acknowledgment: a list of 20-byte LSA headers.
+        while _have_range(off, body_end, 20):
+            consumed = 0
+            lsa = _decode_one_lsa_v2(owner, mv, off, off + 20, &consumed)
+            pkt.lsas.append(lsa)
+            if consumed <= 0:
+                break
+            off += 20
+    return 0
+
+
+cdef OSPFLSA _lsr_entry(const unsigned char[:] mv, Py_ssize_t off):
+    """Build a lightweight LSA object for one LS Request entry (12 bytes)."""
+    cdef OSPFLSA lsa = OSPFLSA.__new__(OSPFLSA)
+    lsa.pkt_name = 'OSPFLSA'
+    lsa.pq_type = PQ_OSPF
+    lsa.query_fields = ()
+    lsa.malformed = 0
+    lsa._v3 = 0
+    lsa.fields = {}
+    lsa.payload = NullPkt(b'')
+    lsa.ls_type = rd_u32(mv, off) & 0xff
+    lsa._ls_id = rd_bytes(mv, off + 4, off + 8)
+    lsa._advrouter = rd_bytes(mv, off + 8, off + 12)
+    lsa.length = 12
+    lsa._raw = rd_bytes(mv, off, off + 12)
+    return lsa
+
+
+# --- OSPFv3 (RFC 5340) ------------------------------------------------------
+
+cdef dict _ospf_v3_lsa_body(uint16_t ls_type, const unsigned char[:] mv,
+                            Py_ssize_t bstart, Py_ssize_t bend):
+    """Decode an OSPFv3 LSA body to Wireshark depth; never raises.
+
+    ls_type is the raw 16-bit field; the function code (low 13 bits) selects
+    the body shape. Only the principal fields are pulled out for query; the
+    whole body is preserved by the caller in the LSA's _raw for round-trip.
+    """
+    cdef:
+        dict f = {}
+        Py_ssize_t o = bstart
+        uint16_t code = ls_type & 0x1fff
+        uint16_t nrtr
+        list attached
+    if code == 1:
+        # Router-LSA: flags(1), options(3).
+        if _have_range(o, bend, 4):
+            f['ospf.v3.router.flags'] = mv[o]
+            f['ospf.v3.options'] = ((<uint32_t>mv[o + 1] << 16) |
+                                    (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+    elif code == 2:
+        # Network-LSA: 0(1), options(3), then attached routers (4 each).
+        if _have_range(o, bend, 4):
+            f['ospf.v3.options'] = ((<uint32_t>mv[o + 1] << 16) |
+                                    (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+            o += 4
+            attached = []
+            while _have_range(o, bend, 4):
+                attached.append(_fmt_ipv4_buf(&mv[o]))
+                o += 4
+            if attached:
+                f['ospf.v3.lsa.attached_router'] = attached[0]
+                f['ospf.v3.lsa.attached_routers'] = attached
+    elif code == 3:
+        # Inter-Area-Prefix-LSA: 0(1), metric(3), then prefix.
+        if _have_range(o, bend, 4):
+            f['ospf.v3.lsa.metric'] = ((<uint32_t>mv[o + 1] << 16) |
+                                       (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+    elif code == 4:
+        # Inter-Area-Router-LSA: 0(1), options(3), 0(1), metric(3),
+        # then destination router id(4).
+        if _have_range(o, bend, 12):
+            f['ospf.v3.options'] = ((<uint32_t>mv[o + 1] << 16) |
+                                    (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+            f['ospf.v3.lsa.metric'] = ((<uint32_t>mv[o + 5] << 16) |
+                                       (<uint32_t>mv[o + 6] << 8) | mv[o + 7])
+            f['ospf.v3.lsa.destination_router_id'] = _fmt_ipv4_buf(&mv[o + 8])
+    elif code == 5 or code == 7:
+        # AS-External / NSSA: flags(1), metric(3).
+        if _have_range(o, bend, 4):
+            f['ospf.v3.as.external.flags'] = mv[o]
+            f['ospf.v3.lsa.metric'] = ((<uint32_t>mv[o + 1] << 16) |
+                                       (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+    elif code == 8:
+        # Link-LSA: rtr-priority(1), options(3), link-local address(16),
+        # number of prefixes(4).
+        if _have_range(o, bend, 24):
+            f['ospf.v3.lsa.router_priority'] = mv[o]
+            f['ospf.v3.options'] = ((<uint32_t>mv[o + 1] << 16) |
+                                    (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
+            f['ospf.v3.lsa.link_local_interface_address'] = \
+                _fmt_ipv6(rd_bytes(mv, o + 4, o + 20))
+            f['ospf.v3.lsa.num_prefixes'] = rd_u32(mv, o + 20)
+    elif code == 9:
+        # Intra-Area-Prefix-LSA: #prefixes(2), ref-lstype(2), ref-lsid(4),
+        # ref-advrouter(4).
+        if _have_range(o, bend, 12):
+            f['ospf.v3.lsa.num_prefixes'] = rd_u16(mv, o)
+            f['ospf.v3.lsa.referenced_ls_type'] = rd_u16(mv, o + 2)
+            f['ospf.v3.lsa.referenced_link_state_id'] = \
+                _fmt_ipv4_buf(&mv[o + 4])
+            f['ospf.v3.lsa.referenced_advertising_router'] = \
+                _fmt_ipv4_buf(&mv[o + 8])
+    return f
+
+
+cdef OSPFLSA _decode_one_lsa_v3(bytes owner, const unsigned char[:] mv,
+                                Py_ssize_t start, Py_ssize_t end,
+                                Py_ssize_t *consumed):
+    """Decode one OSPFv3 LSA (20-byte header); never raises."""
+    cdef:
+        OSPFLSA lsa = OSPFLSA.__new__(OSPFLSA)
+        Py_ssize_t lsa_len, body_end
+    lsa.pkt_name = 'OSPFLSA'
+    lsa.pq_type = PQ_OSPFV3
+    lsa.query_fields = ()
+    lsa.malformed = 0
+    lsa._v3 = 1
+    lsa.options = 0
+    lsa.fields = {}
+    lsa.payload = NullPkt(b'')
+    if not _have_range(start, end, 20):
+        lsa.malformed = 1
+        lsa._raw = rd_bytes(mv, start, end)
+        consumed[0] = end - start
+        return lsa
+    lsa.ls_age = rd_u16(mv, start)
+    lsa.ls_type = rd_u16(mv, start + 2)
+    lsa._ls_id = rd_bytes(mv, start + 4, start + 8)
+    lsa._advrouter = rd_bytes(mv, start + 8, start + 12)
+    lsa.seqnum = rd_u32(mv, start + 12)
+    lsa.chksum = rd_u16(mv, start + 16)
+    lsa.length = rd_u16(mv, start + 18)
+    lsa_len = lsa.length
+    if lsa_len < 20 or start + lsa_len > end:
+        lsa.malformed = 1
+        lsa._raw = rd_bytes(mv, start, end)
+        consumed[0] = end - start
+        return lsa
+    body_end = start + lsa_len
+    lsa._raw = rd_bytes(mv, start, body_end)
+    lsa.fields = _ospf_v3_lsa_body(lsa.ls_type, mv, start + 20, body_end)
+    consumed[0] = lsa_len
+    return lsa
+
+
+@cython.final
+cdef class OSPFv3(PKT):
+    """OSPF version 3 (RFC 5340), carried directly over IPv6 (next-header 89).
+
+    The 16-byte v3 common header (version, type, packet length, source router
+    id, area id, checksum, instance id, reserved) is decoded, then the body by
+    message type. Unlike v2 there are no per-packet authentication fields; the
+    24-bit Options live in the Hello/DB-Description bodies and in Router/Network
+    LSAs. RFC 7166 defines an Authentication Trailer appended after the packet
+    (not counted in the packet length); when present it is decoded into the
+    ospf.at.* fields and kept whole for round-trip. IPsec AH/ESP protection
+    (RFC 4552) is an IP-layer concern and out of scope: such packets simply
+    decode as far as they can and never raise.
+
+    Serialization mirrors OSPFv2: a parsed packet re-emits its exact bytes, and
+    the header length/checksum are rebuilt only under a pkt2net ``update``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize an OSPFv3 object.
+
+        Args:
+            :args (list): optional one-element list of network-order bytes.
+            :data (bytes): optional network-order bytes of an OSPFv3 packet.
+            :version (unsigned char): OSPF version, default 3.
+            :type (unsigned char): message type 1..5.
+            :srcrouter (str): source router id, dotted quad.
+            :area_id (str): area id, dotted quad.
+            :instance_id (unsigned char): OSPFv3 instance id.
+            :body (bytes): the type-specific body bytes after the header.
+        """
+        self._base_l7(kwargs)
+        self.pkt_name = 'OSPFv3'
+        self.pq_type, self.query_fields = _QI_OSPFV3
+        cdef:
+            bytes owner
+            const unsigned char[:] mv
+        owner = _owned_buffer(args, kwargs)
+        if owner is not None:
+            mv = owner
+            _decode_ospfv3(self, owner, mv, 0, len(owner), self._l7_ports)
+            return
+
+        # Keyword construction.
+        self._raw = None
+        self.malformed = 0
+        self.version = kwargs.get('version', 3)
+        self.type = kwargs.get('type', 0)
+        self._srcrouter = pack_ipv4(kwargs.get('srcrouter', '0.0.0.0'))
+        self._area_id = pack_ipv4(kwargs.get('area_id', '0.0.0.0'))
+        self.checksum = kwargs.get('checksum', 0)
+        self.instance_id = kwargs.get('instance_id', 0)
+        self.options = 0
+        self.body = {}
+        self.lsas = []
+        self._body = kwargs.get('body', b'') or b''
+        self.length = 16 + len(self._body)
+        if 'payload' in kwargs and isinstance(kwargs['payload'], PKT):
+            self.payload = kwargs['payload']
+        else:
+            self.payload = NullPkt(b'')
+
+    property srcrouter:
+        """Source OSPF Router ID, dotted quad (Wireshark ospf.srcrouter)."""
+        def __get__(self):
+            return _fmt_ipv4(self._srcrouter) if self._srcrouter else None
+        def __set__(self, str val):
+            self._srcrouter = pack_ipv4(val)
+
+    property area_id:
+        """Area ID, dotted quad (Wireshark ospf.area_id)."""
+        def __get__(self):
+            return _fmt_ipv4(self._area_id) if self._area_id else None
+        def __set__(self, str val):
+            self._area_id = pack_ipv4(val)
+
+    @classmethod
+    def query_info(cls):
+        """pcap_query field names (Wireshark packet-ospf.c) and PQ type."""
+        return (PQ_OSPFV3,
+                ('ospf.version', 'ospf.msg', 'ospf.packet_length',
+                 'ospf.srcrouter', 'ospf.area_id', 'ospf.checksum',
+                 'ospf.instance_id',
+                 'ospf.hello.interface_id', 'ospf.hello.router_priority',
+                 'ospf.hello.hello_interval',
+                 'ospf.hello.router_dead_interval',
+                 'ospf.hello.designated_router',
+                 'ospf.hello.backup_designated_router',
+                 'ospf.hello.active_neighbor',
+                 'ospf.db.interface_mtu', 'ospf.db.dd_sequence',
+                 'ospf.dbd.ms', 'ospf.dbd.m', 'ospf.dbd.i',
+                 'ospf.v3.lsa.type', 'ospf.lsa.id', 'ospf.link_state_id',
+                 'ospf.advrouter',
+                 'ospf.lsa.seqnum', 'ospf.lsa.chksum', 'ospf.lsa.length',
+                 'ospf.v3.options', 'ospf.v3.lsa.metric',
+                 'ospf.v3.lsa.attached_router', 'ospf.v3.lsa.num_prefixes',
+                 'ospf.at.auth_type', 'ospf.at.auth_data_len',
+                 'ospf.at.crypto_seq_nbr', 'ospf.at.sa_id'))
+
+    cpdef object get_field_val(self, str field):
+        """Return the value of a Wireshark-format field name, else None."""
+        cdef OSPFLSA lsa
+        cdef object v
+        if field == 'ospf.version':
+            return self.version
+        elif field == 'ospf.msg':
+            return _ospf_vs(_OSPF_PT_VALS, self.type)
+        elif field == 'ospf.packet_length':
+            return self.length
+        elif field == 'ospf.srcrouter':
+            return self.srcrouter
+        elif field == 'ospf.area_id':
+            return self.area_id
+        elif field == 'ospf.checksum':
+            return self.checksum
+        elif field == 'ospf.instance_id' or field == 'ospf.v3.instance_id':
+            return self.instance_id
+        elif field.startswith('ospf.at.'):
+            return self.body.get(field)
+        elif field.startswith('ospf.hello.'):
+            return self.body.get(field) if self.type == 1 else None
+        elif field.startswith('ospf.db.') or field.startswith('ospf.dbd.'):
+            return self.body.get(field) if self.type == 2 else None
+        elif field in self.body:
+            # Packet-scoped v3 fields (e.g. the 24-bit ospf.v3.options carried
+            # in a Hello or DB Description body).
+            return self.body[field]
+        elif (field.startswith('ospf.lsa.') or field.startswith('ospf.v3.') or
+              field == 'ospf.advrouter' or field == 'ospf.link_state_id'):
+            for lsa in self.lsas:
+                v = lsa.get_field_val(field)
+                if v is not None:
+                    return v
+            return None
+        elif isinstance(self.payload, PKT):
+            return self.payload.get_field_val(field)
+        return None
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Export this OSPFv3 packet in network order.
+
+        A parsed packet is emitted exactly as it arrived (including any RFC
+        7166 auth trailer). With ``update`` set the packet length and checksum
+        are rebuilt from the header fields and body.
+        """
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        cdef:
+            bint update
+            Py_ssize_t start = w.n
+            uint16_t plen
+        update = kwargs.get('update', 0)
+        if self._raw is not None and not update:
+            w_bytes(w, self._raw)
+            return 0
+        w_u8(w, self.version)
+        w_u8(w, self.type)
+        w_u16(w, self.length)               # patched below
+        w_raw(w, <const unsigned char*>PyBytes_AS_STRING(self._srcrouter), 4)
+        w_raw(w, <const unsigned char*>PyBytes_AS_STRING(self._area_id), 4)
+        w_u16(w, self.checksum)             # patched below when updating
+        w_u8(w, self.instance_id)
+        w_u8(w, 0)
+        w_bytes(w, self._body)
+        plen = <uint16_t>(w.n - start)
+        w_set_u16(w, start + 2, plen)
+        self.length = plen
+        if update:
+            w_set_u16(w, start + 12, 0)
+            self.checksum = w_cksum(w, start, 0)
+            w_set_u16(w, start + 12, self.checksum)
+        return 0
+
+
+cdef int _decode_ospfv3(OSPFv3 pkt, bytes owner, const unsigned char[:] mv,
+                        Py_ssize_t start, Py_ssize_t end,
+                        dict l7_ports) except -1:
+    cdef:
+        Py_ssize_t off, body_end, consumed, at_off
+        uint16_t plen
+        OSPFLSA lsa
+        list neighbors
+    pkt.malformed = 0
+    pkt._raw = None
+    pkt.version = 0
+    pkt.type = 0
+    pkt.length = 0
+    pkt._srcrouter = b'\x00\x00\x00\x00'
+    pkt._area_id = b'\x00\x00\x00\x00'
+    pkt.checksum = 0
+    pkt.instance_id = 0
+    pkt.options = 0
+    pkt.body = {}
+    pkt.lsas = []
+    pkt._body = b''
+    pkt.payload = NullPkt(b'')
+
+    if not _have_range(start, end, 16):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        pkt.payload = _null_range(owner, start, end, l7_ports)
+        return 0
+    pkt.version = mv[start]
+    pkt.type = mv[start + 1]
+    pkt.length = rd_u16(mv, start + 2)
+    pkt._srcrouter = rd_bytes(mv, start + 4, start + 8)
+    pkt._area_id = rd_bytes(mv, start + 8, start + 12)
+    pkt.checksum = rd_u16(mv, start + 12)
+    pkt.instance_id = mv[start + 14]
+
+    plen = pkt.length
+    body_end = end
+    if plen >= 16 and start + plen <= end:
+        body_end = start + plen
+    off = start + 16
+    pkt._raw = rd_bytes(mv, start, end)
+    pkt._body = rd_bytes(mv, off, body_end)
+
+    # Anything past the packet length is an RFC 7166 Authentication Trailer
+    # (it is not counted in the OSPF packet length). Decode it into ospf.at.*
+    # and keep it whole as the payload for round-trip. IPsec AH/ESP protected
+    # packets simply leave trailing bytes that are not an AT and are preserved
+    # as the payload without raising.
+    if body_end < end:
+        _decode_ospf_at(pkt, mv, body_end, end)
+        pkt.payload = _null_range(owner, body_end, end, l7_ports)
+
+    if pkt.type == 1:
+        # Hello (v3): interface_id(4), rtr_priority(1), options(3),
+        # hello_interval(2), dead_interval(2), DR(4), BDR(4), neighbors.
+        if _have_range(off, body_end, 20):
+            pkt.body['ospf.hello.interface_id'] = rd_u32(mv, off)
+            pkt.body['ospf.hello.router_priority'] = mv[off + 4]
+            pkt.options = ((<uint32_t>mv[off + 5] << 16) |
+                           (<uint32_t>mv[off + 6] << 8) | mv[off + 7])
+            pkt.body['ospf.v3.options'] = pkt.options
+            pkt.body['ospf.hello.hello_interval'] = rd_u16(mv, off + 8)
+            pkt.body['ospf.hello.router_dead_interval'] = rd_u16(mv, off + 10)
+            pkt.body['ospf.hello.designated_router'] = \
+                _fmt_ipv4_buf(&mv[off + 12])
+            pkt.body['ospf.hello.backup_designated_router'] = \
+                _fmt_ipv4_buf(&mv[off + 16])
+            neighbors = []
+            off += 20
+            while _have_range(off, body_end, 4):
+                neighbors.append(_fmt_ipv4_buf(&mv[off]))
+                off += 4
+            if neighbors:
+                pkt.body['ospf.hello.active_neighbor'] = neighbors[0]
+                pkt.body['ospf.hello.active_neighbors'] = neighbors
+    elif pkt.type == 2:
+        # Database Description (v3): 0(1), options(3), interface_mtu(2),
+        # 0(1), flags(1), dd_sequence(4), then LSA headers.
+        if _have_range(off, body_end, 12):
+            pkt.options = ((<uint32_t>mv[off + 1] << 16) |
+                           (<uint32_t>mv[off + 2] << 8) | mv[off + 3])
+            pkt.body['ospf.v3.options'] = pkt.options
+            pkt.body['ospf.db.interface_mtu'] = rd_u16(mv, off + 4)
+            pkt.body['ospf.dbd.ms'] = mv[off + 7] & 0x01
+            pkt.body['ospf.dbd.m'] = 1 if (mv[off + 7] & 0x02) else 0
+            pkt.body['ospf.dbd.i'] = 1 if (mv[off + 7] & 0x04) else 0
+            pkt.body['ospf.db.dd_sequence'] = rd_u32(mv, off + 8)
+            off += 12
+            while _have_range(off, body_end, 20):
+                consumed = 0
+                lsa = _decode_one_lsa_v3(owner, mv, off, off + 20, &consumed)
+                pkt.lsas.append(lsa)
+                if consumed <= 0:
+                    break
+                off += 20
+    elif pkt.type == 3:
+        # Link State Request (v3): 0(2), LS type(2), LS id(4), adv router(4).
+        while _have_range(off, body_end, 12):
+            pkt.lsas.append(_lsr_entry_v3(mv, off))
+            off += 12
+    elif pkt.type == 4:
+        # Link State Update (v3): #LSAs(4), then the LSAs.
+        if _have_range(off, body_end, 4):
+            pkt.body['ospf.lsa.number_of_lsas'] = rd_u32(mv, off)
+            off += 4
+            while off < body_end:
+                consumed = 0
+                lsa = _decode_one_lsa_v3(owner, mv, off, body_end, &consumed)
+                pkt.lsas.append(lsa)
+                if consumed <= 0:
+                    break
+                off += consumed
+    elif pkt.type == 5:
+        # Link State Acknowledgment (v3): 20-byte LSA headers.
+        while _have_range(off, body_end, 20):
+            consumed = 0
+            lsa = _decode_one_lsa_v3(owner, mv, off, off + 20, &consumed)
+            pkt.lsas.append(lsa)
+            if consumed <= 0:
+                break
+            off += 20
+    return 0
+
+
+cdef void _decode_ospf_at(OSPFv3 pkt, const unsigned char[:] mv,
+                          Py_ssize_t start, Py_ssize_t end):
+    """Decode an RFC 7166 Authentication Trailer into pkt.body; never raises.
+
+    Format: Auth Type(2), Auth Data Len(2), Reserved(2), SA ID(2), Crypto
+    Sequence Number(8), Authentication Data (variable).
+    """
+    if not _have_range(start, end, 16):
+        return
+    pkt.body['ospf.at.auth_type'] = rd_u16(mv, start)
+    pkt.body['ospf.at.auth_data_len'] = rd_u16(mv, start + 2)
+    pkt.body['ospf.at.reserved'] = rd_u16(mv, start + 4)
+    pkt.body['ospf.at.sa_id'] = rd_u16(mv, start + 6)
+    pkt.body['ospf.at.crypto_seq_nbr'] = (
+        (<object>rd_u32(mv, start + 8) << 32) | rd_u32(mv, start + 12))
+    pkt.body['ospf.at.auth_data'] = rd_bytes(mv, start + 16, end)
+
+
+cdef OSPFLSA _lsr_entry_v3(const unsigned char[:] mv, Py_ssize_t off):
+    """Build a lightweight LSA object for one OSPFv3 LS Request entry."""
+    cdef OSPFLSA lsa = OSPFLSA.__new__(OSPFLSA)
+    lsa.pkt_name = 'OSPFLSA'
+    lsa.pq_type = PQ_OSPFV3
+    lsa.query_fields = ()
+    lsa.malformed = 0
+    lsa._v3 = 1
+    lsa.options = 0
+    lsa.fields = {}
+    lsa.payload = NullPkt(b'')
+    lsa.ls_type = rd_u16(mv, off + 2)
+    lsa._ls_id = rd_bytes(mv, off + 4, off + 8)
+    lsa._advrouter = rd_bytes(mv, off + 8, off + 12)
+    lsa.length = 12
+    lsa._raw = rd_bytes(mv, off, off + 12)
+    return lsa
+
+
 cdef bytes _owned_buffer(tuple args, dict kwargs):
     """Return the public parse input as one immutable owner, or None."""
     cdef object value
@@ -6504,6 +7597,7 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         ICMP icmp
         IGMP igmp
         GRE gre
+        OSPFv2 ospf2
     _need_range(start, end, 20, 'IP')
     pkt.ipv4_pheader = Ip4Ph()
     pkt.options = b''
@@ -6593,6 +7687,13 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         gre.pq_type, gre.query_fields = _QI_GRE
         _decode_gre(gre, owner, mv, payload_start, end, l7_ports)
         pkt.payload = gre
+    elif pkt.proto == PROTO_OSPF:
+        ospf2 = OSPFv2.__new__(OSPFv2)
+        ospf2._l7_ports = l7_ports
+        ospf2.pkt_name = 'OSPFv2'
+        ospf2.pq_type, ospf2.query_fields = _QI_OSPF
+        _decode_ospfv2(ospf2, owner, mv, payload_start, end, l7_ports)
+        pkt.payload = ospf2
     else:
         pkt.payload = _null_range(owner, payload_start, end, l7_ports)
     return 0
@@ -6661,6 +7762,7 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
         TCP tcp
         ICMP6 icmp6
         GRE gre
+        OSPFv3 ospf3
     _need_range(start, end, IPV6_HDR_LEN, 'IP6')
     pkt.ipv6_pheader = Ip6Ph()
     pkt._ext_hdrs = b''
@@ -6734,6 +7836,13 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
         gre.pq_type, gre.query_fields = _QI_GRE
         _decode_gre(gre, owner, mv, payload_start, end, l7_ports)
         pkt.payload = gre
+    elif pkt._upper_proto == PROTO_OSPF:
+        ospf3 = OSPFv3.__new__(OSPFv3)
+        ospf3._l7_ports = l7_ports
+        ospf3.pkt_name = 'OSPFv3'
+        ospf3.pq_type, ospf3.query_fields = _QI_OSPFV3
+        _decode_ospfv3(ospf3, owner, mv, payload_start, end, l7_ports)
+        pkt.payload = ospf3
     else:
         pkt.payload = _null_range(owner, payload_start, end, l7_ports)
     return 0
@@ -7191,3 +8300,5 @@ _QI_MLDv2AddressRecord = MLDv2AddressRecord.query_info()
 _QI_MPLS = MPLS.query_info()
 _QI_ETH = Ethernet.query_info()
 _QI_GRE = GRE.query_info()
+_QI_OSPF = OSPFv2.query_info()
+_QI_OSPFV3 = OSPFv3.query_info()

@@ -321,6 +321,7 @@ cdef:
     unsigned char PROTO_TCP
     unsigned char PROTO_UDP
     unsigned char PROTO_GRE
+    unsigned char PROTO_OSPF
     unsigned char PROTO_ICMPV6
     unsigned char IPV6_HDR_LEN
     # ICMPv6 message types (RFC 4443, RFC 4861, RFC 2710, RFC 3810)
@@ -360,9 +361,11 @@ cdef:
     uint16_t PQ_ARP
     uint16_t PQ_MPLS
     unsigned char PQ_GRE
+    unsigned char PQ_OSPF
     uint16_t PQ_NETFLOW_SIMPLE
     uint16_t PQ_ICMP6OPT
     uint16_t PQ_MLDV2_ADDRESS_RECORD
+    uint16_t PQ_OSPFV3
     uint16_t PQ_NULLPKT
     unsigned char PTR_VAL
     object offset_re
@@ -476,6 +479,7 @@ cdef class IP_CONST:
         readonly unsigned char PROTO_TCP
         readonly unsigned char PROTO_UDP
         readonly unsigned char PROTO_GRE
+        readonly unsigned char PROTO_OSPF
         readonly unsigned char PROTO_ICMPV6
         readonly unsigned char IPV6_HDR_LEN
         readonly unsigned char ICMP6_DST_UNREACH
@@ -512,9 +516,11 @@ cdef class IP_CONST:
         readonly uint16_t PQ_ARP
         readonly uint16_t PQ_MPLS
         readonly unsigned char PQ_GRE
+        readonly unsigned char PQ_OSPF
         readonly uint16_t PQ_NETFLOW_SIMPLE
         readonly uint16_t PQ_ICMP6OPT
         readonly uint16_t PQ_MLDV2_ADDRESS_RECORD
+        readonly uint16_t PQ_OSPFV3
         readonly uint16_t PQ_NULLPKT
 
 cdef class PKT:
@@ -883,6 +889,77 @@ cdef class GRE(PKT):
     cpdef object get_field_val(self, str field)
 
 
+cdef class OSPFLSA(PKT):
+    # One class for OSPFv2 and OSPFv3 LSAs. The 20-byte header is decoded; the
+    # body is decoded to Wireshark depth into ``fields`` and kept whole in
+    # ``_raw`` so the LSA re-serializes byte for byte. ``_v3`` selects the
+    # OSPFv3 header shape and value_string table.
+    cdef:
+        bytes _raw
+        bytes _ls_id, _advrouter
+        bint _v3
+        readonly bint malformed
+        public uint16_t ls_age
+        public unsigned char options
+        public uint16_t ls_type
+        public uint32_t seqnum
+        public uint16_t chksum
+        public uint16_t length
+        public dict fields
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
+cdef class OSPFv2(PKT):
+    # OSPFv2 (RFC 2328) over IPv4 proto 89. Follows the GRE never-raise/_raw
+    # contract: a parsed packet keeps its exact bytes and re-serializes them
+    # verbatim, rebuilding length/checksum only under a pkt2net ``update``.
+    cdef:
+        bytes _raw
+        bytes _srcrouter, _area_id, _auth, _body
+        readonly bint malformed
+        public unsigned char version, type
+        public uint16_t length, checksum, auth_type
+        public uint32_t auth_crypt_seq
+        public unsigned char auth_key_id, auth_data_len
+        public dict body
+        public list lsas
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
+cdef class OSPFv3(PKT):
+    # OSPFv3 (RFC 5340) over IPv6 next-header 89. No per-packet auth fields;
+    # the 24-bit options live in the bodies. RFC 7166 auth trailer (when past
+    # the packet length) is decoded into ospf.at.* and preserved for round-trip.
+    cdef:
+        bytes _raw
+        bytes _srcrouter, _area_id, _body
+        readonly bint malformed
+        public unsigned char version, type, instance_id
+        public uint16_t length, checksum
+        public uint32_t options
+        public dict body
+        public list lsas
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
 # Private owner/range parser entry points.  Public constructors use these
 # after normalizing bytes/array input to one immutable bytes owner.
 cdef bytes _owned_buffer(tuple args, dict kwargs)
@@ -938,6 +1015,12 @@ cdef int _decode_mpls(MPLS pkt, bytes owner, const unsigned char[:] mv,
 cdef int _decode_gre(GRE pkt, bytes owner, const unsigned char[:] mv,
                      Py_ssize_t start, Py_ssize_t end,
                      dict l7_ports) except -1
+cdef int _decode_ospfv2(OSPFv2 pkt, bytes owner, const unsigned char[:] mv,
+                        Py_ssize_t start, Py_ssize_t end,
+                        dict l7_ports) except -1
+cdef int _decode_ospfv3(OSPFv3 pkt, bytes owner, const unsigned char[:] mv,
+                        Py_ssize_t start, Py_ssize_t end,
+                        dict l7_ports) except -1
 cdef int _decode_ethernet(Ethernet pkt, bytes owner,
                           const unsigned char[:] mv,
                           Py_ssize_t start, Py_ssize_t end,
