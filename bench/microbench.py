@@ -62,6 +62,13 @@ try:
     from packets.core.inetpkt import BGP
 except ImportError:
     BGP = None
+try:
+    # RIP ships with the Stage 4 routing codecs; import optionally so the
+    # harness still runs against a pre-Stage-4 baseline (the RIP row is
+    # skipped). RIP stands in for the RIP/RIPng/HSRP parse path.
+    from packets.core.inetpkt import RIP
+except ImportError:
+    RIP = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_CNAME, RCLASS_IN
 
@@ -213,6 +220,15 @@ def make_layer_corpus():
         _bgp_body = (b'\x00\x00' + bytes([0, len(_bgp_attrs)]) + _bgp_attrs +
                      bytes([8, 10]))
         corpus['bgp'] = BGP(type=2, body=_bgp_body).pkt2net({'update': 1})
+    if RIP is not None:
+        # A RIPv2 Response with one route entry, so the parse row walks the
+        # 4-byte header and the 20-byte entry loop. Built from a keyword body
+        # so no capture file is needed on the appliance.
+        _rip_body = (bytes([0, 2, 0, 0]) + bytes([192, 168, 1, 0]) +
+                     bytes([255, 255, 255, 0]) + bytes([0, 0, 0, 0]) +
+                     bytes([0, 0, 0, 1]))
+        corpus['rip'] = RIP(command=2, version=2,
+                            body=_rip_body).pkt2net({'update': 1})
     return corpus
 
 
@@ -500,6 +516,9 @@ def main():
               iterations, repeats)
     if BGP is not None:
         bench('parse_bgp', lambda: BGP(corpus['bgp']),
+              iterations, repeats)
+    if RIP is not None:
+        bench('parse_rip', lambda: RIP(corpus['rip']),
               iterations, repeats)
     bench('parse_netflow', lambda: NetflowSimple(corpus['netflow']),
           iterations, repeats)

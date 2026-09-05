@@ -25,7 +25,7 @@ unlike the one used for the rest of the comparison) is not comparable.
 | `pcap_dispatch_bench.pyx` + `setup_dispatch.py` | the libpcap C-level ceiling (`pcap_open_offline` + `pcap_dispatch`) that `compare_libs.py --libs libpcap` measures. |
 | `make_corpus.py` | generate the reproducible frames, NetFlow v9, and full-L7 protocol captures the streaming benchmarks need. |
 | `regression.py` | build a baseline git tag and the working tree in isolation and diff timings + behavior. |
-| `correctness.py` | deterministic golden JSON of parsed/serialized values; the behavior oracle `regression.py` diffs. Covers GRE, OSPFv2/v3 (Hello, LS Update with LSAs, v3 Hello) and BGP (OPEN with capabilities, UPDATE with path attributes) alongside the L2–L4/DNS corpus. |
+| `correctness.py` | deterministic golden JSON of parsed/serialized values; the behavior oracle `regression.py` diffs. Covers GRE, OSPFv2/v3 (Hello, LS Update with LSAs, v3 Hello), BGP (OPEN with capabilities, UPDATE with path attributes) and RIP/RIPng/HSRP (RIPv2 Response with auth, RIPng Response, HSRPv1 Hello, HSRPv2 Group-State TLV) alongside the L2–L4/DNS corpus. |
 | `proto_address_bench.py`, `query_*_bench.py`, `pcap_info_bench.py`, `reader_gil_bench.py`, `allocation_bench.py`, `example_protocols_bench.py` | focused micro-benchmarks for specific paths. |
 
 ## End-to-end workflow (on the appliance)
@@ -112,12 +112,13 @@ scapy all decode; impacket has no GRE decoder and the libpcap ceiling is only a
 frame counter, so both are recorded as `unsupported`. Timing is in-memory like
 the L7 rows. The point of the GRE row is **regression detection** — catching
 the packets GRE decode path drifting toward the pure-Python libraries early —
-not proving a win. As the remaining routing protocols (RIP, HSRP) land in
-packets, they extend this comparison the same way. OSPFv2/v3 and BGP already
-ship: they are exercised by the `correctness.py` golden corpus (`ospf2_hello`,
-`ospf2_lsupdate`, `ospf3_hello`, `bgp_open`, `bgp_update`) and by the
-`microbench.py` `parse_ospf` and `parse_bgp` rows; cross-library `--ospf-pcap`
-and `--bgp-pcap` comparisons can be added here later the same way GRE's was.
+not proving a win. The remaining routing protocols now all ship. OSPFv2/v3,
+BGP and RIP/RIPng/HSRP are exercised by the `correctness.py` golden corpus
+(`ospf2_hello`, `ospf2_lsupdate`, `ospf3_hello`, `bgp_open`, `bgp_update`,
+`rip_response`, `ripng_response`, `hsrp_v1_hello`, `hsrp_v2_group_state`) and by
+the `microbench.py` `parse_ospf`, `parse_bgp` and `parse_rip` rows; cross-library
+`--ospf-pcap`, `--bgp-pcap` and `--rip-pcap` comparisons can be added here later
+the same way GRE's was.
 
 ### 4. Version-over-version regression
 

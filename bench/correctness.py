@@ -43,6 +43,15 @@ try:
     from packets.core.inetpkt import BGP
 except ImportError:
     BGP = None
+try:
+    # RIP/RIPng/HSRP ship with the Stage 4 routing codecs. Import optionally
+    # so the harness still runs against a pre-Stage-4 baseline (those golden
+    # records are simply absent from the emitted JSON there).
+    from packets.core.inetpkt import RIP, RIPng, HSRP
+except ImportError:
+    RIP = None
+    RIPng = None
+    HSRP = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_AAAA, DNSTYPE_CNAME, DNSTYPE_NS, DNSTYPE_PTR, \
     DNSTYPE_SOA, DNSTYPE_TXT, RCLASS_IN
@@ -142,6 +151,8 @@ def corpus():
         out.update(ospf_corpus())
     if BGP is not None:
         out.update(bgp_corpus())
+    if RIP is not None:
+        out.update(rip_corpus())
     return out
 
 
@@ -408,6 +419,117 @@ def bgp_corpus():
     out = {}
     record_bgp('bgp_open', _bgp_open_bytes(), out)
     record_bgp('bgp_update', _bgp_update_bytes(), out)
+    return out
+
+
+# --- RIP / RIPng / HSRP golden corpus ---------------------------------------
+# Each message rides on a UDP port (RIP 520, RIPng 521, HSRP 1985), so wrapping
+# it in an Ethernet/IP(6)/UDP frame and reparsing with l7_ports walks the UDP
+# L7 dispatch, the header, the entries/TLVs the reader recovered and the full
+# wire hash -- so the golden diff catches any change to a layout, an enum
+# rendering or the never-raise/round-trip contract.
+
+def _rip_route_bytes(af, tag, ip, mask, nh, metric):
+    import struct as _s
+    return (_s.pack('!HH', af, tag) + _ip4b(ip) + _ip4b(mask) + _ip4b(nh) +
+            _s.pack('!I', metric))
+
+
+def _rip_response_bytes():
+    import struct as _s
+    body = _s.pack('!HH', 0xFFFF, 2) + (b'secret' + b'\x00' * 16)[:16]  # auth
+    body += _rip_route_bytes(2, 0, '192.168.1.0', '255.255.255.0',
+                             '0.0.0.0', 1)
+    return bytes([2, 2, 0, 0]) + body
+
+
+def _ripng_response_bytes():
+    import struct as _s
+    import socket as _sock
+    rte = (_sock.inet_pton(_sock.AF_INET6, '2001:db8::') +
+           _s.pack('!HBB', 0, 64, 1))
+    nh = (_sock.inet_pton(_sock.AF_INET6, '::') + _s.pack('!HBB', 0, 0, 255))
+    return bytes([2, 1, 0, 0]) + rte + nh
+
+
+def _hsrpv1_hello_bytes():
+    return (bytes([0, 0, 8, 3, 10, 120, 1, 0]) + b'cisco\x00\x00\x00' +
+            _ip4b('10.0.0.1'))
+
+
+def _hsrp2_group_state_bytes():
+    import struct as _s
+    value = (bytes([2, 0, 6, 4]) + _s.pack('!H', 1) +
+             bytes.fromhex('00000c070ac0') +
+             _s.pack('!III', 120, 3000, 10000) + _ip4b('192.168.0.1') +
+             b'\x00' * 12)
+    return bytes([1, len(value)]) + value
+
+
+def record_rip(name, raw, cls, pq_type, port, out, v6=False):
+    """Wrap a RIP/RIPng/HSRP message in Ethernet/IP(6)/UDP, serialize with
+    update, and reparse with l7_ports so the UDP L7 dispatch surfaces the
+    routing layer; capture representative fields and the wire hash.
+    """
+    eth = Ethernet(dst_mac='02:00:00:00:00:02', src_mac='02:00:00:00:00:01')
+    udp = UDP(sport=port, dport=port, payload=raw)
+    if v6:
+        eth.type = 0x86dd
+        eth.payload = IP6(next_header=C.PROTO_UDP, src='2001:db8::1',
+                          dst='ff02::9', payload=udp)
+    else:
+        eth.payload = IP(proto=C.PROTO_UDP, src='10.0.0.1', dst='224.0.0.9',
+                         payload=udp)
+    wire = eth.pkt2net({'csum': 1, 'update': 1})
+    p = Ethernet(wire, l7_ports={port: cls}).get_layer_by_type(pq_type)
+    rec = {
+        'wire_len': len(wire),
+        'wire_sha1': hashlib.sha1(wire).hexdigest(),
+        'pkt_name': p.pkt_name,
+        'malformed': p.malformed,
+    }
+    if pq_type == C.PQ_RIP:
+        rec['rip.command'] = p.get_field_val('rip.command')
+        rec['rip.version'] = p.get_field_val('rip.version')
+        rec['rip.auth.type'] = p.get_field_val('rip.auth.type')
+        rec['rip.auth.passwd'] = p.get_field_val('rip.auth.passwd')
+        rec['rip.ip'] = p.get_field_val('rip.ip')
+        rec['rip.netmask'] = p.get_field_val('rip.netmask')
+        rec['rip.metric'] = p.get_field_val('rip.metric')
+        rec['rip.entries'] = len(p.entries)
+    elif pq_type == C.PQ_RIPNG:
+        rec['ripng.cmd'] = p.get_field_val('ripng.cmd')
+        rec['ripng.rte.ipv6_prefix'] = \
+            p.get_field_val('ripng.rte.ipv6_prefix')
+        rec['ripng.rte.prefix_length'] = \
+            p.get_field_val('ripng.rte.prefix_length')
+        rec['ripng.rte.metric'] = p.get_field_val('ripng.rte.metric')
+        rec['ripng.rtes'] = len(p.rtes)
+    else:                       # HSRP
+        rec['hsrp.opcode'] = p.get_field_val('hsrp.opcode')
+        rec['hsrp.state'] = p.get_field_val('hsrp.state')
+        rec['hsrp.virt_ip'] = p.get_field_val('hsrp.virt_ip')
+        rec['hsrp2.opcode'] = p.get_field_val('hsrp2.opcode')
+        rec['hsrp2.state'] = p.get_field_val('hsrp2.state')
+        rec['hsrp2.virt_ip'] = p.get_field_val('hsrp2.virt_ip')
+        rec['hsrp.is_v2'] = p.is_v2
+    out[name] = rec
+
+
+def rip_corpus():
+    """RIP/RIPng/HSRP read/write coverage: a RIPv2 Response with a simple-
+    password auth entry and a route, a RIPng Response with a route and a
+    next-hop RTE, an HSRPv1 Hello, and an HSRPv2 Group-State TLV -- each
+    dispatched via its UDP port.
+    """
+    out = {}
+    record_rip('rip_response', _rip_response_bytes(), RIP, C.PQ_RIP, 520, out)
+    record_rip('ripng_response', _ripng_response_bytes(), RIPng, C.PQ_RIPNG,
+               521, out, v6=True)
+    record_rip('hsrp_v1_hello', _hsrpv1_hello_bytes(), HSRP, C.PQ_HSRP, 1985,
+               out)
+    record_rip('hsrp_v2_group_state', _hsrp2_group_state_bytes(), HSRP,
+               C.PQ_HSRP, 1985, out)
     return out
 
 

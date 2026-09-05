@@ -1,6 +1,38 @@
 CHANGELOG
 ---------
 
+[2.1.11]
+ * **RIP, RIPng, and HSRP are decoded, queried, and re-serialized as
+   first-class layers, carried over their well-known UDP ports.** UDP payloads
+   on ports 520 (RIP), 521 (RIPng), and 1985 (HSRP) previously stopped at a raw
+   `data` blob, so nothing inside these routing/redundancy messages could be
+   inspected. New `RIP`, `RIPng`, and `HSRP` classes in `packets.core.inetpkt`
+   decode each protocol to the depth Wireshark shows. `RIP` (RFC 1058 / 2453)
+   parses the header (command, version, routing domain) and the 20-byte route
+   entries (address family, route tag, IP, netmask, next hop, metric), plus the
+   RIPv2 authentication entry - both a Simple Password and a Keyed Message
+   Digest (RFC 2082 / 4822) with its trailing MD5 digest. `RIPng` (RFC 2080)
+   parses the header and the 20-byte IPv6 route table entries (128-bit prefix,
+   route tag, prefix length, metric). `HSRP` handles both HSRPv1 (RFC 2281) -
+   the fixed 20-byte Hello/Coup/Resign and the Cisco Advertise message - and
+   HSRPv2, walked as a sequence of TLVs (Group State, Interface State, Text
+   Authentication, and MD5 Authentication); the two versions are told apart by
+   the leading byte, and any unknown HSRPv2 TLV is preserved whole so it
+   round-trips. All three are dispatched over UDP through the existing
+   `l7_ports` mechanism (pass `pkt_classes=[RIP, RIPng, HSRP]` to `pcap_query`,
+   or `l7_ports={520: RIP, 521: RIPng, 1985: HSRP}` when parsing directly), and
+   each class's `default_ports()` returns its port. New `PQ_RIP`, `PQ_RIPNG`,
+   and `PQ_HSRP` packet-query types expose the header, entry, TLV, and
+   authentication fields under their Wireshark `rip.*`, `ripng.*`, `hsrp.*` and
+   `hsrp2.*` names, with enumerations rendered using Wireshark's own
+   value-string text; a single `PQ_HSRP` type serves both HSRP versions because
+   their field namespaces are disjoint. Authentication material is
+   human-readable both ways and emitted verbatim; a RIPv2 Keyed-MD5 digest is
+   recomputed only when serialized with the `update` flag and a `key`
+   (mirroring the GRE/OSPF gating). Malformed or truncated messages - at any
+   header, entry, or TLV boundary - decode into whatever is present rather than
+   raising, so partial captures still parse.
+
 [2.1.10]
  * **BGP is decoded, queried, and re-serialized as a first-class layer
    (RFC 4271 and its extensions), carried over TCP port 179.** TCP payloads on

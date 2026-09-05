@@ -13,7 +13,8 @@ import unittest
 from array import array
 
 from packets.core.inetpkt import IP_CONST, GRE, IP, IP6, ICMP, ICMP6, \
-    MPLS, Ethernet, NullPkt, OSPFv2, OSPFv3, OSPFLSA, TCP, BGP, BGPParam
+    MPLS, Ethernet, NullPkt, OSPFv2, OSPFv3, OSPFLSA, TCP, UDP, BGP, \
+    BGPParam, RIP, RIPng, HSRP, RtParam
 
 C = IP_CONST()
 
@@ -966,6 +967,420 @@ class BGPDispatchTestCase(unittest.TestCase):
         self.assertIsInstance(bgp, BGP)
         self.assertEqual(bgp.get_field_val(
             'bgp.update.path_attribute.origin'), 'IGP')
+
+
+# ---------------------------------------------------------------------------
+# Stage 4a/4b: RIP / RIPng / HSRP
+# ---------------------------------------------------------------------------
+
+RIP_PORT = 520
+RIPNG_PORT = 521
+HSRP_PORT = 1985
+
+
+def _ip4(dotted):
+    return bytes(int(x) for x in dotted.split('.'))
+
+
+def _rip_route(af=2, tag=0, ip='192.168.1.0', mask='255.255.255.0',
+               nh='0.0.0.0', metric=1):
+    return (struct.pack('!HH', af, tag) + _ip4(ip) + _ip4(mask) + _ip4(nh) +
+            struct.pack('!I', metric))
+
+
+def _rip(command=2, version=2, routing_domain=0, entries=b''):
+    return bytes([command, version]) + struct.pack('!H', routing_domain) + \
+        entries
+
+
+def _rip_simple_auth(passwd=b'secret'):
+    return struct.pack('!HH', 0xFFFF, 2) + (passwd + b'\x00' * 16)[:16]
+
+
+def _ripng_rte(prefix='2001:db8::', tag=0, plen=64, metric=1):
+    import socket
+    return (socket.inet_pton(socket.AF_INET6, prefix) +
+            struct.pack('!HBB', tag, plen, metric))
+
+
+def _ripng(command=2, version=1, rtes=b''):
+    return bytes([command, version, 0, 0]) + rtes
+
+
+def _hsrpv1(version=0, opcode=0, state=8, hellotime=3, holdtime=10,
+            priority=120, group=1, auth=b'cisco', vip='10.0.0.1'):
+    return (bytes([version, opcode, state, hellotime, holdtime, priority,
+                   group, 0]) + (auth + b'\x00' * 8)[:8] + _ip4(vip))
+
+
+def _hsrp2_group_state(opcode=0, state=6, ipver=4, group=1,
+                       identifier='00:00:0c:07:0a:c0', priority=120,
+                       hello=3000, hold=10000, vip='192.168.0.1'):
+    mac = bytes(int(x, 16) for x in identifier.split(':'))
+    value = (bytes([2, opcode, state, ipver]) + struct.pack('!H', group) +
+             mac + struct.pack('!III', priority, hello, hold) +
+             _ip4(vip) + b'\x00' * 12)
+    return bytes([1, len(value)]) + value
+
+
+class RIPConstructionTestCase(unittest.TestCase):
+
+    def test_ripv2_response_roundtrip_and_fields(self):
+        raw = _rip(entries=_rip_route())
+        r = RIP(raw)
+        self.assertEqual(r.get_field_val('rip.command'), 'Response')
+        self.assertEqual(r.get_field_val('rip.version'), 'RIPv2')
+        self.assertEqual(r.get_field_val('rip.routing_domain'), 0)
+        self.assertEqual(r.get_field_val('rip.family'), 'IP')
+        self.assertEqual(r.get_field_val('rip.ip'), '192.168.1.0')
+        self.assertEqual(r.get_field_val('rip.netmask'), '255.255.255.0')
+        self.assertEqual(r.get_field_val('rip.next_hop'), '0.0.0.0')
+        self.assertEqual(r.get_field_val('rip.metric'), 1)
+        self.assertEqual(len(r.entries), 1)
+        self.assertFalse(r.malformed)
+        self.assertEqual(r.pkt2net({}), raw)
+        self.assertEqual(RIP(r.pkt2net({})).pkt2net({}), raw)
+
+    def test_ripv1_request_omits_v2_only_fields(self):
+        raw = _rip(command=1, version=1, entries=_rip_route(mask='0.0.0.0'))
+        r = RIP(raw)
+        self.assertEqual(r.get_field_val('rip.command'), 'Request')
+        self.assertEqual(r.get_field_val('rip.version'), 'RIPv1')
+        self.assertEqual(r.get_field_val('rip.ip'), '192.168.1.0')
+        # RIPv1 carries no route tag / netmask / next hop.
+        self.assertIsNone(r.get_field_val('rip.route_tag'))
+        self.assertIsNone(r.get_field_val('rip.netmask'))
+        self.assertIsNone(r.get_field_val('rip.next_hop'))
+        self.assertEqual(r.pkt2net({}), raw)
+
+    def test_multiple_routes(self):
+        raw = _rip(entries=_rip_route(ip='10.0.0.0', mask='255.0.0.0') +
+                   _rip_route(ip='172.16.0.0', mask='255.255.0.0', metric=2))
+        r = RIP(raw)
+        self.assertEqual(len(r.entries), 2)
+        self.assertEqual(r.get_field_val('rip.ip'), '10.0.0.0')
+        self.assertEqual(r.pkt2net({}), raw)
+
+    def test_keyword_build_roundtrip(self):
+        r = RIP(command=2, version=2, body=_rip_route())
+        self.assertEqual(r.pkt2net({}), _rip(entries=_rip_route()))
+
+
+class RIPAuthTestCase(unittest.TestCase):
+
+    def test_simple_password(self):
+        raw = _rip(entries=_rip_simple_auth(b'secret') + _rip_route())
+        r = RIP(raw)
+        self.assertEqual(r.get_field_val('rip.auth.type'), 'Simple Password')
+        self.assertEqual(r.get_field_val('rip.auth.passwd'), 'secret')
+        # The route after the auth entry still resolves.
+        self.assertEqual(r.get_field_val('rip.ip'), '192.168.1.0')
+        self.assertEqual(r.pkt2net({}), raw)
+
+    def test_keyed_md5_fields_and_verbatim_roundtrip(self):
+        dpos = 4 + 20 + 20               # header + auth entry + one route
+        auth = (struct.pack('!HH', 0xFFFF, 3) + struct.pack('!H', dpos) +
+                bytes([1, 20]) + struct.pack('!I', 42) + b'\x00' * 8)
+        trailer = struct.pack('!HH', 0xFFFF, 1) + b'\x11' * 16
+        raw = _rip(entries=auth + _rip_route(ip='172.16.0.0',
+                                             mask='255.255.0.0') + trailer)
+        r = RIP(raw)
+        self.assertEqual(r.get_field_val('rip.auth.type'),
+                         'Keyed Message Digest')
+        self.assertEqual(r.get_field_val('rip.digest_offset'), dpos)
+        self.assertEqual(r.get_field_val('rip.key_id'), 1)
+        self.assertEqual(r.get_field_val('rip.auth_data_len'), 20)
+        self.assertEqual(r.get_field_val('rip.seq_num'), 42)
+        self.assertEqual(r.get_field_val('rip.authentication_data'),
+                         '11' * 16)
+        # No key -> stored digest emitted verbatim.
+        self.assertEqual(r.pkt2net({}), raw)
+        self.assertEqual(r.pkt2net({'update': 1}), raw)
+
+    def test_keyed_md5_recompute_with_key(self):
+        import hashlib
+        dpos = 4 + 20 + 20
+        auth = (struct.pack('!HH', 0xFFFF, 3) + struct.pack('!H', dpos) +
+                bytes([1, 20]) + struct.pack('!I', 42) + b'\x00' * 8)
+        trailer = struct.pack('!HH', 0xFFFF, 1) + b'\x00' * 16
+        raw = _rip(entries=auth + _rip_route() + trailer)
+        r = RIP(raw)
+        out = r.pkt2net({'update': 1, 'key': 'mykey'})
+        self.assertEqual(len(out), len(raw))
+        k16 = (b'mykey' + b'\x00' * 16)[:16]
+        expect = hashlib.md5(raw[:dpos + 4] + k16 + raw[dpos + 20:]).digest()
+        self.assertEqual(out[dpos + 4:dpos + 20], expect)
+        # Re-parsing the recomputed message exposes the new digest.
+        self.assertEqual(RIP(out).get_field_val('rip.authentication_data'),
+                         expect.hex())
+
+
+class RIPContractTestCase(unittest.TestCase):
+
+    def test_default_ports(self):
+        self.assertEqual(RIP.default_ports(), [520])
+
+    def test_every_advertised_field_resolves_or_none(self):
+        _, fields = RIP.query_info()
+        r = RIP(_rip(entries=_rip_simple_auth() + _rip_route()))
+        for f in fields:
+            r.get_field_val(f)
+
+    def test_truncation_never_raises(self):
+        raw = _rip(entries=_rip_route())
+        for n in range(0, len(raw)):
+            parsed = RIP(raw[:n])
+            self.assertIsInstance(parsed, RIP)
+            self.assertEqual(parsed.pkt2net({}), raw[:n],
+                             'round-trip failed at %d bytes' % n)
+
+    def test_short_header_marked_malformed(self):
+        r = RIP(b'\x02')
+        self.assertTrue(r.malformed)
+        self.assertEqual(r.pkt2net({}), b'\x02')
+
+    def test_ip_udp_dispatch(self):
+        raw = _rip(entries=_rip_route())
+        outer = IP(src='10.0.0.1', dst='224.0.0.9', proto=C.PQ_UDP,
+                   payload=UDP(sport=RIP_PORT, dport=RIP_PORT, payload=raw))
+        wire = outer.pkt2net({'update': 1, 'csum': 1})
+        r = IP(wire, l7_ports={RIP_PORT: RIP}).get_layer_by_type(C.PQ_RIP)
+        self.assertIsInstance(r, RIP)
+        self.assertEqual(r.get_field_val('rip.ip'), '192.168.1.0')
+        self.assertEqual(r.pkt2net({}), raw)
+
+
+class RIPngTestCase(unittest.TestCase):
+
+    def test_response_roundtrip_and_fields(self):
+        raw = _ripng(rtes=_ripng_rte() + _ripng_rte(prefix='::', plen=0,
+                                                    metric=255))
+        r = RIPng(raw)
+        self.assertEqual(r.get_field_val('ripng.cmd'), 'Response')
+        self.assertEqual(r.get_field_val('ripng.version'), 1)
+        self.assertEqual(r.get_field_val('ripng.rte.ipv6_prefix'),
+                         '2001:db8::')
+        self.assertEqual(r.get_field_val('ripng.rte.prefix_length'), 64)
+        self.assertEqual(r.get_field_val('ripng.rte.metric'), 1)
+        self.assertEqual(len(r.rtes), 2)
+        # The next-hop RTE (metric 255) is the second entry.
+        self.assertEqual(r.rtes[1].get_field_val('ripng.rte.metric'), 255)
+        self.assertFalse(r.malformed)
+        self.assertEqual(r.pkt2net({}), raw)
+        self.assertEqual(RIPng(r.pkt2net({})).pkt2net({}), raw)
+
+    def test_default_ports(self):
+        self.assertEqual(RIPng.default_ports(), [521])
+
+    def test_keyword_build_roundtrip(self):
+        r = RIPng(command=1, version=1, body=_ripng_rte())
+        self.assertEqual(r.pkt2net({}), _ripng(command=1, rtes=_ripng_rte()))
+
+    def test_every_advertised_field_resolves_or_none(self):
+        _, fields = RIPng.query_info()
+        r = RIPng(_ripng(rtes=_ripng_rte()))
+        for f in fields:
+            r.get_field_val(f)
+
+    def test_truncation_never_raises(self):
+        raw = _ripng(rtes=_ripng_rte())
+        for n in range(0, len(raw)):
+            parsed = RIPng(raw[:n])
+            self.assertIsInstance(parsed, RIPng)
+            self.assertEqual(parsed.pkt2net({}), raw[:n],
+                             'round-trip failed at %d bytes' % n)
+
+    def test_ip6_udp_dispatch(self):
+        raw = _ripng(rtes=_ripng_rte())
+        outer = IP6(src='2001:db8::1', dst='ff02::9',
+                    next_header=C.PQ_UDP,
+                    payload=UDP(sport=RIPNG_PORT, dport=RIPNG_PORT,
+                                payload=raw))
+        wire = outer.pkt2net({'update': 1, 'csum': 1})
+        r = IP6(wire, l7_ports={RIPNG_PORT: RIPng}).get_layer_by_type(
+            C.PQ_RIPNG)
+        self.assertIsInstance(r, RIPng)
+        self.assertEqual(r.get_field_val('ripng.rte.ipv6_prefix'),
+                         '2001:db8::')
+
+
+class HSRPv1TestCase(unittest.TestCase):
+
+    def test_hello_roundtrip_and_fields(self):
+        raw = _hsrpv1(opcode=0, state=8, priority=120, group=1,
+                      auth=b'cisco', vip='10.0.0.1')
+        h = HSRP(raw)
+        self.assertFalse(h.is_v2)
+        self.assertEqual(h.get_field_val('hsrp.version'), 0)
+        self.assertEqual(h.get_field_val('hsrp.opcode'), 'Hello')
+        self.assertEqual(h.get_field_val('hsrp.state'), 'Standby')
+        self.assertEqual(h.get_field_val('hsrp.hellotime'), 3)
+        self.assertEqual(h.get_field_val('hsrp.holdtime'), 10)
+        self.assertEqual(h.get_field_val('hsrp.priority'), 120)
+        self.assertEqual(h.get_field_val('hsrp.group'), 1)
+        self.assertEqual(h.get_field_val('hsrp.auth_data'), 'cisco')
+        self.assertEqual(h.get_field_val('hsrp.virt_ip'), '10.0.0.1')
+        self.assertFalse(h.malformed)
+        self.assertEqual(h.pkt2net({}), raw)
+        self.assertEqual(HSRP(h.pkt2net({})).pkt2net({}), raw)
+
+    def test_state_enum_values(self):
+        for code, txt in ((0, 'Initial'), (1, 'Learn'), (2, 'Listen'),
+                          (4, 'Speak'), (8, 'Standby'), (16, 'Active')):
+            h = HSRP(_hsrpv1(state=code))
+            self.assertEqual(h.get_field_val('hsrp.state'), txt)
+
+    def test_coup_and_resign_opcodes(self):
+        self.assertEqual(HSRP(_hsrpv1(opcode=1)).get_field_val('hsrp.opcode'),
+                         'Coup')
+        self.assertEqual(HSRP(_hsrpv1(opcode=2)).get_field_val('hsrp.opcode'),
+                         'Resign')
+
+    def test_advertise_tlv(self):
+        raw = (bytes([0, 3]) + struct.pack('!HH', 1, 10) + bytes([3, 0]) +
+               struct.pack('!HH', 2, 1) + struct.pack('!I', 0))
+        h = HSRP(raw)
+        self.assertEqual(h.get_field_val('hsrp.opcode'), 'Advertise')
+        self.assertEqual(h.get_field_val('hsrp.adv.tlvtype'),
+                         'HSRP interface state')
+        self.assertEqual(h.get_field_val('hsrp.adv.state'), 'Active')
+        self.assertEqual(h.get_field_val('hsrp.adv.activegrp'), 2)
+        self.assertEqual(h.get_field_val('hsrp.adv.passivegrp'), 1)
+        self.assertEqual(h.pkt2net({}), raw)
+
+    def test_keyword_build_roundtrip(self):
+        h = HSRP(opcode=0, state=16, priority=100, group=2, auth=b'pass',
+                 virt_ip='192.168.1.1')
+        parsed = HSRP(h.pkt2net({}))
+        self.assertEqual(parsed.get_field_val('hsrp.state'), 'Active')
+        self.assertEqual(parsed.get_field_val('hsrp.group'), 2)
+        self.assertEqual(parsed.get_field_val('hsrp.virt_ip'), '192.168.1.1')
+
+    def test_v1_with_trailing_md5_tlv(self):
+        md5 = (bytes([4, 28, 1, 0]) + struct.pack('!H', 0) + _ip4('10.0.0.1') +
+               struct.pack('!I', 7) + b'\x22' * 16)
+        raw = _hsrpv1() + md5
+        h = HSRP(raw)
+        self.assertFalse(h.is_v2)
+        self.assertEqual(h.get_field_val('hsrp.opcode'), 'Hello')
+        self.assertEqual(h.get_field_val('hsrp2.md5_algorithm'), 'MD5')
+        self.assertEqual(h.get_field_val('hsrp.md5_ip_address'), '10.0.0.1')
+        self.assertEqual(h.get_field_val('hsrp2.md5_key_id'), 7)
+        self.assertEqual(h.get_field_val('hsrp2.md5_auth_data'), '22' * 16)
+        self.assertEqual(h.pkt2net({}), raw)
+
+
+class HSRPv2TestCase(unittest.TestCase):
+
+    def test_group_state_ipv4(self):
+        raw = _hsrp2_group_state(opcode=0, state=6, ipver=4, group=1,
+                                 priority=120, vip='192.168.0.1')
+        h = HSRP(raw)
+        self.assertTrue(h.is_v2)
+        self.assertEqual(h.version, 2)
+        self.assertEqual(h.get_field_val('hsrp2.opcode'), 'Hello')
+        self.assertEqual(h.get_field_val('hsrp2.state'), 'Active')
+        self.assertEqual(h.get_field_val('hsrp2.ipversion'), 'IPv4')
+        self.assertEqual(h.get_field_val('hsrp2.group'), 1)
+        self.assertEqual(h.get_field_val('hsrp2.identifier'),
+                         '00:00:0c:07:0a:c0')
+        self.assertEqual(h.get_field_val('hsrp2.priority'), 120)
+        self.assertEqual(h.get_field_val('hsrp2.hellotime'), 3000)
+        self.assertEqual(h.get_field_val('hsrp2.holdtime'), 10000)
+        self.assertEqual(h.get_field_val('hsrp2.virt_ip'), '192.168.0.1')
+        self.assertFalse(h.malformed)
+        self.assertEqual(h.pkt2net({}), raw)
+        self.assertEqual(HSRP(h.pkt2net({})).pkt2net({}), raw)
+
+    def test_group_state_ipv6(self):
+        import socket
+        v6 = socket.inet_pton(socket.AF_INET6, '2001:db8::1')
+        value = (bytes([2, 0, 6, 6]) + struct.pack('!H', 5) +
+                 bytes.fromhex('00000c070ac0') +
+                 struct.pack('!III', 120, 3000, 10000) + v6)
+        raw = bytes([1, len(value)]) + value
+        h = HSRP(raw)
+        self.assertEqual(h.get_field_val('hsrp2.ipversion'), 'IPv6')
+        self.assertEqual(h.get_field_val('hsrp2.virt_ip_v6'), '2001:db8::1')
+        self.assertIsNone(h.get_field_val('hsrp2.virt_ip'))
+        self.assertEqual(h.pkt2net({}), raw)
+
+    def test_state_enum_contiguous(self):
+        for code, txt in ((1, 'Init'), (2, 'Learn'), (3, 'Listen'),
+                          (4, 'Speak'), (5, 'Standby'), (6, 'Active')):
+            h = HSRP(_hsrp2_group_state(state=code))
+            self.assertEqual(h.get_field_val('hsrp2.state'), txt)
+
+    def test_interface_and_text_auth_tlvs(self):
+        gs = _hsrp2_group_state()
+        iface = bytes([2, 4]) + struct.pack('!HH', 3, 1)
+        text = bytes([3, 8]) + (b'cisco' + b'\x00' * 8)[:8]
+        raw = gs + iface + text
+        h = HSRP(raw)
+        self.assertEqual(len(h.tlvs), 3)
+        self.assertEqual(h.get_field_val('hsrp2.active_groups'), 3)
+        self.assertEqual(h.get_field_val('hsrp2.passive_groups'), 1)
+        self.assertEqual(h.get_field_val('hsrp2.auth_data'), 'cisco')
+        self.assertEqual(h.pkt2net({}), raw)
+
+    def test_md5_auth_tlv(self):
+        gs = _hsrp2_group_state()
+        md5 = (bytes([4, 28, 1, 0]) + struct.pack('!H', 0) + _ip4('10.0.0.9') +
+               struct.pack('!I', 99) + b'\x33' * 16)
+        raw = gs + md5
+        h = HSRP(raw)
+        self.assertEqual(h.get_field_val('hsrp2.md5_algorithm'), 'MD5')
+        self.assertEqual(h.get_field_val('hsrp.md5_ip_address'), '10.0.0.9')
+        self.assertEqual(h.get_field_val('hsrp2.md5_key_id'), 99)
+        self.assertEqual(h.get_field_val('hsrp2.md5_auth_data'), '33' * 16)
+        self.assertEqual(h.pkt2net({}), raw)
+
+    def test_unknown_tlv_preserved(self):
+        gs = _hsrp2_group_state()
+        unknown = bytes([200, 4]) + b'\xde\xad\xbe\xef'
+        raw = gs + unknown
+        h = HSRP(raw)
+        self.assertEqual(len(h.tlvs), 2)
+        self.assertEqual(h.pkt2net({}), raw)
+
+
+class HSRPContractTestCase(unittest.TestCase):
+
+    def test_default_ports(self):
+        self.assertEqual(HSRP.default_ports(), [1985])
+
+    def test_one_pq_type_both_versions_disjoint(self):
+        # v1 fields resolve on a v1 packet; v2 fields are None, and vice versa.
+        v1 = HSRP(_hsrpv1(opcode=0))
+        self.assertIsNotNone(v1.get_field_val('hsrp.opcode'))
+        self.assertIsNone(v1.get_field_val('hsrp2.opcode'))
+        v2 = HSRP(_hsrp2_group_state())
+        self.assertIsNotNone(v2.get_field_val('hsrp2.opcode'))
+        self.assertIsNone(v2.get_field_val('hsrp.opcode'))
+
+    def test_every_advertised_field_resolves_or_none(self):
+        _, fields = HSRP.query_info()
+        for raw in (_hsrpv1(), _hsrp2_group_state()):
+            h = HSRP(raw)
+            for f in fields:
+                h.get_field_val(f)
+
+    def test_truncation_never_raises(self):
+        for raw in (_hsrpv1(), _hsrp2_group_state()):
+            for n in range(0, len(raw)):
+                parsed = HSRP(raw[:n])
+                self.assertIsInstance(parsed, HSRP)
+                self.assertEqual(parsed.pkt2net({}), raw[:n],
+                                 'round-trip failed at %d bytes' % n)
+
+    def test_ip_udp_dispatch(self):
+        raw = _hsrpv1(opcode=0)
+        outer = IP(src='10.0.0.1', dst='224.0.0.2', proto=C.PQ_UDP,
+                   payload=UDP(sport=HSRP_PORT, dport=HSRP_PORT, payload=raw))
+        wire = outer.pkt2net({'update': 1, 'csum': 1})
+        h = IP(wire, l7_ports={HSRP_PORT: HSRP}).get_layer_by_type(C.PQ_HSRP)
+        self.assertIsInstance(h, HSRP)
+        self.assertEqual(h.get_field_val('hsrp.opcode'), 'Hello')
 
 
 if __name__ == '__main__':

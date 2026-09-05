@@ -367,6 +367,9 @@ cdef:
     uint16_t PQ_MLDV2_ADDRESS_RECORD
     uint16_t PQ_OSPFV3
     unsigned char PQ_BGP
+    uint16_t PQ_RIP
+    uint16_t PQ_RIPNG
+    uint16_t PQ_HSRP
     uint16_t PQ_NULLPKT
     unsigned char PTR_VAL
     object offset_re
@@ -523,6 +526,9 @@ cdef class IP_CONST:
         readonly uint16_t PQ_MLDV2_ADDRESS_RECORD
         readonly uint16_t PQ_OSPFV3
         readonly unsigned char PQ_BGP
+        readonly uint16_t PQ_RIP
+        readonly uint16_t PQ_RIPNG
+        readonly uint16_t PQ_HSRP
         readonly uint16_t PQ_NULLPKT
 
 cdef class PKT:
@@ -1004,6 +1010,87 @@ cdef class BGP(PKT):
     cpdef object get_field_val(self, str field)
 
 
+cdef class RtParam(PKT):
+    # One decoded routing sub-structure shared by RIP/RIPng/HSRP: a RIP route
+    # or authentication entry, a RIPng route table entry, or an HSRPv2 TLV.
+    # The bytes are kept whole in ``_raw`` so the parent message re-serializes
+    # byte for byte; decoded fields land in ``fields`` keyed by their Wireshark
+    # name. Mirrors BGPParam.
+    cdef:
+        bytes _raw
+        readonly bint malformed
+        public dict fields
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
+cdef class RIP(PKT):
+    # RIP (RFC 1058 / 2453) over UDP 520, dispatched via l7_ports. Never-raise
+    # / _raw contract; re-serializes verbatim and rebuilds from fields (plus an
+    # optional Keyed-MD5 digest recompute) only under a pkt2net ``update``.
+    cdef:
+        bytes _raw, _body
+        Py_ssize_t _digest_pos
+        readonly bint malformed
+        public unsigned char command, version
+        public uint16_t routing_domain
+        public dict fields
+        public list entries
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
+cdef class RIPng(PKT):
+    # RIPng (RFC 2080) over UDP 521, dispatched via l7_ports. Never-raise /
+    # _raw contract; re-serializes verbatim and rebuilds from fields only under
+    # a pkt2net ``update``.
+    cdef:
+        bytes _raw, _body
+        readonly bint malformed
+        public unsigned char command, version
+        public bytes reserved
+        public dict fields
+        public list rtes
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
+cdef class HSRP(PKT):
+    # HSRP v1 (RFC 2281) and v2 over UDP 1985, dispatched via l7_ports. One
+    # class, both versions: byte 0 selects the fixed v1 layout (0x00) or the v2
+    # TLV sequence (per scapy). One PQ_HSRP serves both, with disjoint hsrp.*
+    # and hsrp2.* field namespaces. Never-raise / _raw verbatim round-trip.
+    cdef:
+        bytes _raw, _body
+        readonly bint malformed
+        public bint is_v2
+        public unsigned char version
+        public dict fields
+        public list tlvs
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
 # Private owner/range parser entry points.  Public constructors use these
 # after normalizing bytes/array input to one immutable bytes owner.
 cdef bytes _owned_buffer(tuple args, dict kwargs)
@@ -1068,6 +1155,15 @@ cdef int _decode_ospfv3(OSPFv3 pkt, bytes owner, const unsigned char[:] mv,
 cdef int _decode_bgp(BGP pkt, bytes owner, const unsigned char[:] mv,
                      Py_ssize_t start, Py_ssize_t end,
                      dict l7_ports) except -1
+cdef int _decode_rip(RIP pkt, bytes owner, const unsigned char[:] mv,
+                     Py_ssize_t start, Py_ssize_t end,
+                     dict l7_ports) except -1
+cdef int _decode_ripng(RIPng pkt, bytes owner, const unsigned char[:] mv,
+                       Py_ssize_t start, Py_ssize_t end,
+                       dict l7_ports) except -1
+cdef int _decode_hsrp(HSRP pkt, bytes owner, const unsigned char[:] mv,
+                      Py_ssize_t start, Py_ssize_t end,
+                      dict l7_ports) except -1
 cdef int _decode_ethernet(Ethernet pkt, bytes owner,
                           const unsigned char[:] mv,
                           Py_ssize_t start, Py_ssize_t end,

@@ -161,6 +161,9 @@ PQ_ICMP6OPT = 2006
 PQ_MLDV2_ADDRESS_RECORD = 2007
 PQ_OSPFV3 = 2008
 PQ_BGP = 179
+PQ_RIP = 520
+PQ_RIPNG = 521
+PQ_HSRP = 1985
 PQ_NULLPKT = 0xffff
 NOT_FOUND = -1
 
@@ -192,6 +195,9 @@ cdef tuple _QI_GRE
 cdef tuple _QI_OSPF
 cdef tuple _QI_OSPFV3
 cdef tuple _QI_BGP
+cdef tuple _QI_RIP
+cdef tuple _QI_RIPNG
+cdef tuple _QI_HSRP
 
 # Address conversion entry points, bound once at import. These sit on the
 # construction path (every src/dst set) and on the parse path (every address
@@ -335,6 +341,9 @@ cdef class IP_CONST:
         self.PQ_OSPF = PQ_OSPF
         self.PQ_OSPFV3 = PQ_OSPFV3
         self.PQ_BGP = PQ_BGP
+        self.PQ_RIP = PQ_RIP
+        self.PQ_RIPNG = PQ_RIPNG
+        self.PQ_HSRP = PQ_HSRP
         self.PQ_NETFLOW_SIMPLE = PQ_NETFLOW_SIMPLE
         self.PQ_NULLPKT = PQ_NULLPKT
 
@@ -7762,6 +7771,805 @@ cdef int _decode_bgp(BGP pkt, bytes owner, const unsigned char[:] mv,
     return 0
 
 
+# --- RIP / RIPng / HSRP (Stage 4) -------------------------------------------
+# These three are UDP layer-7 protocols dispatched through the l7_ports
+# mechanism (like BGP over TCP): RIP on UDP 520, RIPng on UDP 521, HSRP on
+# UDP 1985. Each class advertises those via default_ports(), so handing
+# pcap_query ``pkt_classes=[RIP, RIPng, HSRP]`` both registers the query
+# fields and wires the ports; parsing bytes directly takes
+# ``l7_ports={520: RIP, 521: RIPng, 1985: HSRP}``. There is no hardcoded IP
+# branch -- none of these is an IP-protocol-number protocol.
+#
+# All three follow the routing never-raise contract established in Stage 1:
+# a truncated or unparsable message sets ``malformed`` and keeps its exact
+# bytes in ``_raw`` so it re-serializes to what came in; unknown sub-types
+# (RIP address families, HSRPv2 TLV types) are preserved as generic bytes.
+# Field names and enum render strings are the Wireshark packet-rip.c /
+# packet-ripng.c / packet-hsrp.c abbreviations and value_string text, so a
+# Wireshark display-filter name resolves through get_field_val() unchanged.
+#
+# get_field_val rendering contract (Answer 8): commands/opcodes/states/family/
+# auth-type render the Wireshark value_string string (unknown wire values ->
+# "Unknown (N)"); addresses render dotted-quad (IPv4) or RFC 5952 colon form
+# (IPv6); the HSRPv2 identifier renders as a colon MAC; digests render as a
+# lowercase hex string; everything else is the plain integer/bytes.
+
+# value_string tables copied from the Wireshark dissectors so enum fields
+# render exactly as Wireshark shows them.
+cdef dict _RIP_CMD_VALS = {
+    1: 'Request', 2: 'Response', 3: 'Traceon', 4: 'Traceoff',
+    5: 'Vendor specific (Sun)'}
+cdef dict _RIP_VERSION_VALS = {1: 'RIPv1', 2: 'RIPv2'}
+cdef dict _RIP_FAMILY_VALS = {0: 'Unspecified', 2: 'IP'}
+cdef dict _RIP_AUTH_TYPE_VALS = {
+    1: 'IP Route', 2: 'Simple Password', 3: 'Keyed Message Digest'}
+cdef dict _RIPNG_CMD_VALS = {1: 'Request', 2: 'Response'}
+# HSRPv1 (packet-hsrp.c hsrp_*_vals) and HSRPv2 (hsrp2_*_vals). Note the two
+# versions use different, incompatible state encodings: v1 is a bit-style
+# non-contiguous set {0,1,2,4,8,16}, v2 is contiguous {1..6}. Wireshark's text
+# is the source of truth for the render strings (Q10) even though the wire
+# layout follows scapy (Answer 5).
+cdef dict _HSRP_OPCODE_VALS = {
+    0: 'Hello', 1: 'Coup', 2: 'Resign', 3: 'Advertise'}
+cdef dict _HSRP_STATE_VALS = {
+    0: 'Initial', 1: 'Learn', 2: 'Listen', 4: 'Speak', 8: 'Standby',
+    16: 'Active'}
+cdef dict _HSRP_ADV_TYPE_VALS = {1: 'HSRP interface state', 2: 'IP redundancy'}
+cdef dict _HSRP_ADV_STATE_VALS = {1: 'Dormant', 2: 'Passive', 3: 'Active'}
+cdef dict _HSRP2_OPCODE_VALS = {0: 'Hello', 1: 'Coup', 2: 'Resign'}
+cdef dict _HSRP2_STATE_VALS = {
+    1: 'Init', 2: 'Learn', 3: 'Listen', 4: 'Speak', 5: 'Standby', 6: 'Active'}
+cdef dict _HSRP2_IPVER_VALS = {4: 'IPv4', 6: 'IPv6'}
+cdef dict _HSRP2_MD5_ALGO_VALS = {1: 'MD5'}
+
+
+cdef inline str _rt_vs(dict table, object key):
+    """Render an enum value as Wireshark does: its string, else 'Unknown (N)'."""
+    cdef object txt = table.get(key)
+    if txt is None:
+        return 'Unknown (%d)' % key
+    return txt
+
+
+cdef inline str _rt_text(bytes b):
+    """A fixed-length text/password field as a str, trimmed at the first NUL.
+
+    Wireshark reads these as FT_STRING; latin-1 decodes any byte so this never
+    raises, matching the never-raise contract.
+    """
+    cdef Py_ssize_t i = b.find(b'\x00')
+    if i >= 0:
+        b = b[:i]
+    return b.decode('latin-1')
+
+
+cdef bytes _rip_apply_md5(bytes msg, Py_ssize_t dpos, object key):
+    """Recompute a RIPv2 Keyed-MD5 (RFC 2082 / 4822) authentication digest.
+
+    The 16-byte digest field at ``dpos`` is first filled with the key (a
+    passphrase or raw bytes, NUL-padded / truncated to 16), the whole message
+    is hashed, and the result replaces the digest field. Used only on the
+    ``pkt2net({'update': 1, 'key': ...})`` path; without a key the stored
+    digest is emitted verbatim.
+    """
+    import hashlib
+    cdef bytes k
+    if isinstance(key, str):
+        k = key.encode('latin-1')
+    else:
+        k = bytes(key)
+    k = (k + b'\x00' * 16)[:16]
+    if dpos < 0 or dpos + 16 > len(msg):
+        return msg
+    return (msg[:dpos] +
+            hashlib.md5(msg[:dpos] + k + msg[dpos + 16:]).digest() +
+            msg[dpos + 16:])
+
+
+cdef bytes _hsrpv1_build(dict kwargs):
+    """Assemble a fixed 20-byte HSRPv1 (RFC 2281) message from keywords."""
+    cdef object auth = kwargs.get('auth_data', b'cisco\x00\x00\x00')
+    cdef bytes ab
+    cdef str vip
+    cdef bytes vipb
+    if isinstance(auth, str):
+        ab = auth.encode('latin-1')
+    else:
+        ab = bytes(auth)
+    ab = (ab + b'\x00' * 8)[:8]
+    vip = kwargs.get('virt_ip', '0.0.0.0')
+    vipb = pack_ipv4(vip)
+    if vipb is None:
+        vipb = b'\x00\x00\x00\x00'
+    return bytes([kwargs.get('version', 0) & 0xff,
+                  kwargs.get('opcode', 0) & 0xff,
+                  kwargs.get('state', 0) & 0xff,
+                  kwargs.get('hellotime', 3) & 0xff,
+                  kwargs.get('holdtime', 10) & 0xff,
+                  kwargs.get('priority', 0) & 0xff,
+                  kwargs.get('group', 0) & 0xff,
+                  kwargs.get('reserved', 0) & 0xff]) + ab + vipb
+
+
+@cython.final
+cdef class RtParam(PKT):
+    """One decoded routing sub-structure: a RIP route/auth entry, a RIPng
+    route table entry, or an HSRPv2 TLV.
+
+    The bytes are kept whole in ``_raw`` so the parent message re-serializes
+    byte for byte; the decoded fields land in ``fields`` keyed by their
+    Wireshark name. Mirrors BGPParam.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._base_l7(kwargs)
+        self.pkt_name = kwargs.get('pkt_name', 'RtParam')
+        self.pq_type = kwargs.get('pq_type', PQ_PKT)
+        self.query_fields = ()
+        self.malformed = 0
+        self._raw = kwargs.get('data', b'') or b''
+        self.fields = {}
+        self.payload = NullPkt(b'')
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Network-order bytes of just this entry/TLV."""
+        return self._raw if self._raw is not None else b''
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        if self._raw is not None:
+            w_bytes(w, self._raw)
+        return 0
+
+    cpdef object get_field_val(self, str field):
+        """Resolve a single entry/TLV-scoped Wireshark field name, else None."""
+        if field in self.fields:
+            return self.fields[field]
+        return None
+
+
+cdef inline RtParam _new_rt_param(str name, uint16_t pq,
+                                  const unsigned char[:] mv,
+                                  Py_ssize_t s, Py_ssize_t e):
+    """Allocate an RtParam holding the raw bytes [s, e) with empty fields."""
+    cdef RtParam p = RtParam.__new__(RtParam)
+    p.pkt_name = name
+    p.pq_type = pq
+    p.query_fields = ()
+    p.malformed = 0
+    p.fields = {}
+    p.payload = NullPkt(b'')
+    p._raw = rd_bytes(mv, s, e)
+    return p
+
+
+@cython.final
+cdef class RIP(PKT):
+    """RIP (RFC 1058 / 2453), carried over UDP port 520.
+
+    Decodes the 4-byte header (command, version, routing domain) and the
+    20-byte route entries, plus the RIPv2 authentication entry -- Simple
+    Password (AuType 2) and Keyed Message Digest (AuType 3, RFC 2082/4822)
+    with its trailing MD5 digest. Field names are the packet-rip.c ``rip.*``
+    abbreviations; command/version/family/auth-type render Wireshark
+    value_string text, addresses render dotted-quad, the digest as hex.
+    Parsing never raises; a parsed message re-serializes verbatim, and
+    ``pkt2net({'update': 1, 'key': <passphrase>})`` recomputes a Keyed-MD5
+    digest (else the stored digest is emitted as-is).
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize a RIP object.
+
+        Args:
+            :args (list): optional one-element list of network-order bytes.
+            :data (bytes): optional network-order bytes starting at the header.
+            :command (unsigned char): 1 Request .. 5 (default 1).
+            :version (unsigned char): 1 or 2 (default 2).
+            :routing_domain (uint16_t): the header's third field (default 0).
+            :body (bytes): the entry bytes after the 4-byte header.
+            :key: passphrase/bytes used to recompute a Keyed-MD5 digest under
+                ``pkt2net({'update': 1, 'key': ...})``.
+            :payload (PKT): trailing payload, when building by hand.
+        """
+        self._base_l7(kwargs)
+        self.pkt_name = 'RIP'
+        self.pq_type, self.query_fields = _QI_RIP
+        cdef:
+            bytes owner
+            const unsigned char[:] mv
+        owner = _owned_buffer(args, kwargs)
+        if owner is not None:
+            mv = owner
+            _decode_rip(self, owner, mv, 0, len(owner), self._l7_ports)
+            return
+        self._raw = None
+        self.malformed = 0
+        self.command = kwargs.get('command', 1)
+        self.version = kwargs.get('version', 2)
+        self.routing_domain = kwargs.get('routing_domain', 0)
+        self.fields = {}
+        self.entries = []
+        self._body = kwargs.get('body', b'') or b''
+        self._digest_pos = -1
+        if 'payload' in kwargs and isinstance(kwargs['payload'], PKT):
+            self.payload = kwargs['payload']
+        else:
+            self.payload = NullPkt(b'')
+
+    @classmethod
+    def query_info(cls):
+        """pcap_query field names (Wireshark packet-rip.c) and PQ type."""
+        return (PQ_RIP,
+                ('rip.command', 'rip.version', 'rip.routing_domain',
+                 'rip.family', 'rip.route_tag', 'rip.ip', 'rip.netmask',
+                 'rip.next_hop', 'rip.metric', 'rip.auth.type',
+                 'rip.auth.passwd', 'rip.digest_offset', 'rip.key_id',
+                 'rip.auth_data_len', 'rip.seq_num', 'rip.zero_padding',
+                 'rip.authentication_data'))
+
+    @classmethod
+    def default_ports(cls):
+        """RIP listens on UDP port 520."""
+        return [520]
+
+    cpdef object get_field_val(self, str field):
+        """Return the value of a Wireshark ``rip.*`` field name, else None.
+
+        Header fields resolve on the message; entry-scoped fields resolve
+        against the first entry that carries them, mirroring BGP.
+        """
+        cdef RtParam e
+        cdef object v
+        if field == 'rip.command':
+            return _rt_vs(_RIP_CMD_VALS, self.command)
+        elif field == 'rip.command_int':
+            return self.command
+        elif field == 'rip.version':
+            return _rt_vs(_RIP_VERSION_VALS, self.version)
+        elif field == 'rip.version_int':
+            return self.version
+        elif field == 'rip.routing_domain':
+            return self.routing_domain
+        elif field.startswith('rip.'):
+            for e in self.entries:
+                v = e.get_field_val(field)
+                if v is not None:
+                    return v
+            return None
+        elif isinstance(self.payload, PKT):
+            return self.payload.get_field_val(field)
+        return None
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Export this RIP message in network order.
+
+        A parsed message is emitted exactly as it arrived. With ``update`` set
+        it is rebuilt from the header fields and stored body (RIP carries no
+        length or checksum); with an additional ``key`` a Keyed-MD5 digest is
+        recomputed.
+        """
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        cdef:
+            bint update
+            bytes msg
+            object key
+        update = kwargs.get('update', 0)
+        if self.malformed and self._raw is not None:
+            w_bytes(w, self._raw)
+            return 0
+        if self._raw is not None and not update:
+            w_bytes(w, self._raw)
+            if isinstance(self.payload, PKT):
+                (<PKT>self.payload)._write(w, kwargs)
+            return 0
+        msg = (bytes([self.command & 0xff, self.version & 0xff]) +
+               pack('!H', self.routing_domain) +
+               (self._body if self._body is not None else b''))
+        key = kwargs.get('key')
+        if update and key is not None and self._digest_pos >= 0:
+            msg = _rip_apply_md5(msg, self._digest_pos, key)
+        w_bytes(w, msg)
+        if isinstance(self.payload, PKT):
+            (<PKT>self.payload)._write(w, kwargs)
+        return 0
+
+
+@cython.final
+cdef class RIPng(PKT):
+    """RIPng (RFC 2080), carried over UDP port 521.
+
+    Decodes the 4-byte header (command, version, reserved) and the 20-byte
+    IPv6 route table entries (128-bit prefix, route tag, prefix length,
+    metric). Field names are the packet-ripng.c ``ripng.*`` abbreviations;
+    the command renders Wireshark value_string text and the prefix renders in
+    RFC 5952 colon form. RIPng carries no authentication in the RIP layer
+    (RFC 4302 IPsec is an IP-layer concern, out of scope). Parsing never
+    raises and a parsed message re-serializes verbatim.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize a RIPng object.
+
+        Args:
+            :args/:data: optional network-order bytes starting at the header.
+            :command (unsigned char): 1 Request / 2 Response (default 1).
+            :version (unsigned char): default 1.
+            :reserved (bytes): the header's 2 reserved bytes (default zero).
+            :body (bytes): the RTE bytes after the 4-byte header.
+            :payload (PKT): trailing payload, when building by hand.
+        """
+        self._base_l7(kwargs)
+        self.pkt_name = 'RIPng'
+        self.pq_type, self.query_fields = _QI_RIPNG
+        cdef:
+            bytes owner
+            const unsigned char[:] mv
+        owner = _owned_buffer(args, kwargs)
+        if owner is not None:
+            mv = owner
+            _decode_ripng(self, owner, mv, 0, len(owner), self._l7_ports)
+            return
+        self._raw = None
+        self.malformed = 0
+        self.command = kwargs.get('command', 1)
+        self.version = kwargs.get('version', 1)
+        self.reserved = kwargs.get('reserved', b'\x00\x00') or b'\x00\x00'
+        self.fields = {}
+        self.rtes = []
+        self._body = kwargs.get('body', b'') or b''
+        if 'payload' in kwargs and isinstance(kwargs['payload'], PKT):
+            self.payload = kwargs['payload']
+        else:
+            self.payload = NullPkt(b'')
+
+    @classmethod
+    def query_info(cls):
+        """pcap_query field names (Wireshark packet-ripng.c) and PQ type."""
+        return (PQ_RIPNG,
+                ('ripng.cmd', 'ripng.version', 'ripng.reserved',
+                 'ripng.rte.ipv6_prefix', 'ripng.rte.route_tag',
+                 'ripng.rte.prefix_length', 'ripng.rte.metric'))
+
+    @classmethod
+    def default_ports(cls):
+        """RIPng listens on UDP port 521."""
+        return [521]
+
+    cpdef object get_field_val(self, str field):
+        """Return the value of a Wireshark ``ripng.*`` field name, else None."""
+        cdef RtParam e
+        cdef object v
+        if field == 'ripng.cmd':
+            return _rt_vs(_RIPNG_CMD_VALS, self.command)
+        elif field == 'ripng.cmd_int':
+            return self.command
+        elif field == 'ripng.version':
+            return self.version
+        elif field == 'ripng.reserved':
+            return self.reserved
+        elif field.startswith('ripng.'):
+            for e in self.rtes:
+                v = e.get_field_val(field)
+                if v is not None:
+                    return v
+            return None
+        elif isinstance(self.payload, PKT):
+            return self.payload.get_field_val(field)
+        return None
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Export this RIPng message in network order (verbatim, or rebuilt
+        from fields when ``update`` is set)."""
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        cdef:
+            bint update
+            bytes rsv
+        update = kwargs.get('update', 0)
+        if self.malformed and self._raw is not None:
+            w_bytes(w, self._raw)
+            return 0
+        if self._raw is not None and not update:
+            w_bytes(w, self._raw)
+            if isinstance(self.payload, PKT):
+                (<PKT>self.payload)._write(w, kwargs)
+            return 0
+        rsv = self.reserved if self.reserved is not None else b'\x00\x00'
+        rsv = (rsv + b'\x00\x00')[:2]
+        w_u8(w, self.command)
+        w_u8(w, self.version)
+        w_bytes(w, rsv)
+        w_bytes(w, self._body if self._body is not None else b'')
+        if isinstance(self.payload, PKT):
+            (<PKT>self.payload)._write(w, kwargs)
+        return 0
+
+
+@cython.final
+cdef class HSRP(PKT):
+    """HSRP v1 (RFC 2281) and v2 (no RFC), carried over UDP port 1985.
+
+    A single class serves both versions. Version discrimination follows scapy
+    (the preferred behavioral reference, Answer 5): byte 0 of the payload is
+    0x00 for HSRPv1's version field, so a leading zero selects the fixed
+    20-byte v1 layout (opcode at byte 1 selects Hello/Coup/Resign or, for
+    opcode 3, the Cisco Advertise TLV); any other leading byte is an HSRPv2
+    TLV type, so the payload is walked as a TLV sequence. (Wireshark instead
+    keys off the destination multicast address 224.0.0.2 vs 224.0.0.102, which
+    a UDP-dispatched codec does not see; the first-byte method is equivalent
+    for well-formed traffic.)
+
+    One PQ type ``PQ_HSRP`` serves both versions (IMPORTANT-2): v1 exposes
+    ``hsrp.*`` fields and v2 exposes ``hsrp2.*`` fields -- Wireshark itself
+    uses distinct abbreviation namespaces, so the two field sets never collide
+    and a single query type resolves both, with fields of the absent version
+    simply returning None. Enum fields render Wireshark value_string text;
+    the wire layout of the v2 Group-State TLV follows scapy. Parsing never
+    raises; unknown TLV types are preserved as generic bytes; a parsed message
+    re-serializes verbatim.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize an HSRP object.
+
+        Args:
+            :args/:data: optional network-order bytes of the UDP payload.
+            :body (bytes): the whole message bytes, when building by hand.
+            :version/:opcode/:state/:hellotime/:holdtime/:priority/:group/
+             :reserved/:auth_data/:virt_ip: fields for a keyword-built v1
+                (RFC 2281) message when no ``body`` is given.
+            :payload (PKT): trailing payload, when building by hand.
+        """
+        self._base_l7(kwargs)
+        self.pkt_name = 'HSRP'
+        self.pq_type, self.query_fields = _QI_HSRP
+        cdef:
+            bytes owner
+            const unsigned char[:] mv
+        owner = _owned_buffer(args, kwargs)
+        if owner is not None:
+            mv = owner
+            _decode_hsrp(self, owner, mv, 0, len(owner), self._l7_ports)
+            return
+        self._raw = None
+        self.malformed = 0
+        self.fields = {}
+        self.tlvs = []
+        self.is_v2 = 0
+        self.version = kwargs.get('version', 0)
+        if 'body' in kwargs and isinstance(kwargs['body'], bytes):
+            self._body = kwargs['body']
+        else:
+            self._body = _hsrpv1_build(kwargs)
+        if 'payload' in kwargs and isinstance(kwargs['payload'], PKT):
+            self.payload = kwargs['payload']
+        else:
+            self.payload = NullPkt(b'')
+
+    @classmethod
+    def query_info(cls):
+        """pcap_query field names (Wireshark packet-hsrp.c) and PQ type.
+
+        The union of the HSRPv1 ``hsrp.*`` and HSRPv2 ``hsrp2.*`` field sets;
+        the two namespaces are disjoint so one PQ type serves both versions.
+        """
+        return (PQ_HSRP,
+                ('hsrp.version', 'hsrp.opcode', 'hsrp.state', 'hsrp.hellotime',
+                 'hsrp.holdtime', 'hsrp.priority', 'hsrp.group',
+                 'hsrp.reserved', 'hsrp.auth_data', 'hsrp.virt_ip',
+                 'hsrp.adv.tlvtype', 'hsrp.adv.tlvlength', 'hsrp.adv.state',
+                 'hsrp.adv.reserved1', 'hsrp.adv.activegrp',
+                 'hsrp.adv.passivegrp', 'hsrp.adv.reserved2',
+                 'hsrp2.version', 'hsrp2.opcode', 'hsrp2.state',
+                 'hsrp2.ipversion', 'hsrp2.group', 'hsrp2.identifier',
+                 'hsrp2.hellotime', 'hsrp2.holdtime', 'hsrp2.priority',
+                 'hsrp2.auth_data', 'hsrp2.virt_ip', 'hsrp2.virt_ip_v6',
+                 'hsrp2.active_groups', 'hsrp2.passive_groups',
+                 'hsrp2.md5_algorithm', 'hsrp2.md5_padding', 'hsrp2.md5_flags',
+                 'hsrp.md5_ip_address', 'hsrp2.md5_key_id',
+                 'hsrp2.md5_auth_data'))
+
+    @classmethod
+    def default_ports(cls):
+        """HSRP v1/v2 listen on UDP port 1985."""
+        return [1985]
+
+    cpdef object get_field_val(self, str field):
+        """Return the value of a Wireshark ``hsrp.*`` / ``hsrp2.*`` field name,
+        else None. Header (v1) fields resolve on the message; v2 TLV fields
+        resolve against the first TLV that carries them."""
+        cdef RtParam t
+        cdef object v
+        if field in self.fields:
+            return self.fields[field]
+        for t in self.tlvs:
+            v = t.get_field_val(field)
+            if v is not None:
+                return v
+        if isinstance(self.payload, PKT):
+            return self.payload.get_field_val(field)
+        return None
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Export this HSRP message in network order (verbatim once parsed;
+        the keyword-built message otherwise)."""
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        cdef bint update = kwargs.get('update', 0)
+        if self.malformed and self._raw is not None:
+            w_bytes(w, self._raw)
+            return 0
+        if self._raw is not None and not update:
+            w_bytes(w, self._raw)
+            if isinstance(self.payload, PKT):
+                (<PKT>self.payload)._write(w, kwargs)
+            return 0
+        w_bytes(w, self._body if self._body is not None else b'')
+        if isinstance(self.payload, PKT):
+            (<PKT>self.payload)._write(w, kwargs)
+        return 0
+
+
+cdef int _decode_rip(RIP pkt, bytes owner, const unsigned char[:] mv,
+                     Py_ssize_t start, Py_ssize_t end,
+                     dict l7_ports) except -1:
+    cdef:
+        Py_ssize_t o, dpos
+        uint16_t fam, atype
+        RtParam e
+    pkt.malformed = 0
+    pkt._raw = None
+    pkt.command = 0
+    pkt.version = 0
+    pkt.routing_domain = 0
+    pkt.fields = {}
+    pkt.entries = []
+    pkt._body = b''
+    pkt._digest_pos = -1
+    pkt.payload = NullPkt(b'')
+
+    if not _have_range(start, end, 4):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        return 0
+    pkt.command = mv[start]
+    pkt.version = mv[start + 1]
+    pkt.routing_domain = rd_u16(mv, start + 2)
+    pkt._raw = rd_bytes(mv, start, end)
+    pkt._body = rd_bytes(mv, start + 4, end)
+
+    o = start + 4
+    while _have_range(o, end, 20):
+        fam = rd_u16(mv, o)
+        if fam == 0xFFFF and o == start + 4:
+            # RIPv2 authentication entry (must be the first entry).
+            e = _new_rt_param('RIPEntry', PQ_RIP, mv, o, o + 20)
+            atype = rd_u16(mv, o + 2)
+            e.fields['rip.auth.type'] = _rt_vs(_RIP_AUTH_TYPE_VALS, atype)
+            if atype == 2:
+                e.fields['rip.auth.passwd'] = \
+                    _rt_text(rd_bytes(mv, o + 4, o + 20))
+                pkt.entries.append(e)
+                o += 20
+                continue
+            elif atype == 3:
+                dpos = rd_u16(mv, o + 4)
+                e.fields['rip.digest_offset'] = dpos
+                e.fields['rip.key_id'] = mv[o + 6]
+                e.fields['rip.auth_data_len'] = mv[o + 7]
+                e.fields['rip.seq_num'] = rd_u32(mv, o + 8)
+                e.fields['rip.zero_padding'] = rd_bytes(mv, o + 12, o + 20)
+                # The keyed digest trailer sits at dpos+4 from message start.
+                pkt._digest_pos = dpos + 4
+                if _have_range(start + dpos + 4, end, 16):
+                    e.fields['rip.authentication_data'] = binascii.hexlify(
+                        rd_bytes(mv, start + dpos + 4,
+                                 start + dpos + 20)).decode('ascii')
+                pkt.entries.append(e)
+                # The trailer follows and is preserved verbatim in _raw/_body;
+                # stop the entry walk here (matches packet-rip.c).
+                break
+            else:
+                pkt.entries.append(e)
+                o += 20
+                continue
+        # IP route / unspecified entry (20 bytes).
+        e = _new_rt_param('RIPEntry', PQ_RIP, mv, o, o + 20)
+        e.fields['rip.family'] = _rt_vs(_RIP_FAMILY_VALS, fam)
+        if pkt.version == 2:
+            e.fields['rip.route_tag'] = rd_u16(mv, o + 2)
+        e.fields['rip.ip'] = _fmt_ipv4_buf(&mv[o + 4])
+        if pkt.version == 2:
+            e.fields['rip.netmask'] = _fmt_ipv4_buf(&mv[o + 8])
+            e.fields['rip.next_hop'] = _fmt_ipv4_buf(&mv[o + 12])
+        e.fields['rip.metric'] = rd_u32(mv, o + 16)
+        pkt.entries.append(e)
+        o += 20
+    return 0
+
+
+cdef int _decode_ripng(RIPng pkt, bytes owner, const unsigned char[:] mv,
+                       Py_ssize_t start, Py_ssize_t end,
+                       dict l7_ports) except -1:
+    cdef:
+        Py_ssize_t o
+        RtParam e
+    pkt.malformed = 0
+    pkt._raw = None
+    pkt.command = 0
+    pkt.version = 0
+    pkt.reserved = b'\x00\x00'
+    pkt.fields = {}
+    pkt.rtes = []
+    pkt._body = b''
+    pkt.payload = NullPkt(b'')
+
+    if not _have_range(start, end, 4):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        return 0
+    pkt.command = mv[start]
+    pkt.version = mv[start + 1]
+    pkt.reserved = rd_bytes(mv, start + 2, start + 4)
+    pkt._raw = rd_bytes(mv, start, end)
+    pkt._body = rd_bytes(mv, start + 4, end)
+
+    o = start + 4
+    while _have_range(o, end, 20):
+        e = _new_rt_param('RIPngRTE', PQ_RIPNG, mv, o, o + 20)
+        e.fields['ripng.rte.ipv6_prefix'] = _fmt_ipv6(rd_bytes(mv, o, o + 16))
+        e.fields['ripng.rte.route_tag'] = rd_u16(mv, o + 16)
+        e.fields['ripng.rte.prefix_length'] = mv[o + 18]
+        e.fields['ripng.rte.metric'] = mv[o + 19]
+        pkt.rtes.append(e)
+        o += 20
+    return 0
+
+
+cdef void _decode_hsrp2_tlv(RtParam t, unsigned char ttype,
+                            const unsigned char[:] mv,
+                            Py_ssize_t o, Py_ssize_t end):
+    """Decode one HSRPv2 TLV value into ``t.fields``; never raises.
+
+    Unknown TLV types leave ``fields`` empty; the raw bytes remain in
+    ``t._raw`` so the message round-trips.
+    """
+    cdef unsigned char ipver
+    if ttype == 1:                       # Group State TLV
+        if _have_range(o, end, 40):
+            t.fields['hsrp2.version'] = mv[o]
+            t.fields['hsrp2.opcode'] = _rt_vs(_HSRP2_OPCODE_VALS, mv[o + 1])
+            t.fields['hsrp2.state'] = _rt_vs(_HSRP2_STATE_VALS, mv[o + 2])
+            ipver = mv[o + 3]
+            t.fields['hsrp2.ipversion'] = _rt_vs(_HSRP2_IPVER_VALS, ipver)
+            t.fields['hsrp2.group'] = rd_u16(mv, o + 4)
+            t.fields['hsrp2.identifier'] = _fmt_mac_buf(&mv[o + 6])
+            t.fields['hsrp2.priority'] = rd_u32(mv, o + 12)
+            t.fields['hsrp2.hellotime'] = rd_u32(mv, o + 16)
+            t.fields['hsrp2.holdtime'] = rd_u32(mv, o + 20)
+            if ipver == 6:
+                t.fields['hsrp2.virt_ip_v6'] = \
+                    _fmt_ipv6(rd_bytes(mv, o + 24, o + 40))
+            else:
+                t.fields['hsrp2.virt_ip'] = _fmt_ipv4_buf(&mv[o + 24])
+    elif ttype == 2:                     # Interface State TLV
+        if _have_range(o, end, 4):
+            t.fields['hsrp2.active_groups'] = rd_u16(mv, o)
+            t.fields['hsrp2.passive_groups'] = rd_u16(mv, o + 2)
+    elif ttype == 3:                     # Text Authentication TLV
+        if _have_range(o, end, 1):
+            t.fields['hsrp2.auth_data'] = _rt_text(rd_bytes(mv, o, end))
+    elif ttype == 4:                     # MD5 Authentication TLV
+        if _have_range(o, end, 28):
+            t.fields['hsrp2.md5_algorithm'] = \
+                _rt_vs(_HSRP2_MD5_ALGO_VALS, mv[o])
+            t.fields['hsrp2.md5_padding'] = mv[o + 1]
+            t.fields['hsrp2.md5_flags'] = rd_u16(mv, o + 2)
+            t.fields['hsrp.md5_ip_address'] = _fmt_ipv4_buf(&mv[o + 4])
+            t.fields['hsrp2.md5_key_id'] = rd_u32(mv, o + 8)
+            t.fields['hsrp2.md5_auth_data'] = binascii.hexlify(
+                rd_bytes(mv, o + 12, o + 28)).decode('ascii')
+
+
+cdef void _decode_hsrp_tlvs(HSRP pkt, const unsigned char[:] mv,
+                            Py_ssize_t o, Py_ssize_t end):
+    """Walk a run of HSRPv2-style TLVs into pkt.tlvs; never raises."""
+    cdef:
+        unsigned char ttype, tlen
+        Py_ssize_t tlv_end
+        RtParam t
+    while _have_range(o, end, 2):
+        ttype = mv[o]
+        tlen = mv[o + 1]
+        tlv_end = o + 2 + tlen
+        if tlv_end > end:
+            tlv_end = end
+        t = _new_rt_param('HSRPTlv', PQ_HSRP, mv, o, tlv_end)
+        _decode_hsrp2_tlv(t, ttype, mv, o + 2, tlv_end)
+        pkt.tlvs.append(t)
+        if tlv_end <= o:
+            break
+        o = tlv_end
+
+
+cdef void _decode_hsrpv1(HSRP pkt, const unsigned char[:] mv,
+                         Py_ssize_t start, Py_ssize_t end):
+    """Decode a fixed-format HSRPv1 (RFC 2281) message; never raises."""
+    cdef unsigned char op
+    if not _have_range(start, end, 2):
+        pkt.malformed = 1
+        return
+    pkt.fields['hsrp.version'] = mv[start]
+    op = mv[start + 1]
+    pkt.fields['hsrp.opcode'] = _rt_vs(_HSRP_OPCODE_VALS, op)
+    if op == 3:
+        # Cisco Advertise TLV.
+        if _have_range(start, end, 16):
+            pkt.fields['hsrp.adv.tlvtype'] = \
+                _rt_vs(_HSRP_ADV_TYPE_VALS, rd_u16(mv, start + 2))
+            pkt.fields['hsrp.adv.tlvlength'] = rd_u16(mv, start + 4)
+            pkt.fields['hsrp.adv.state'] = \
+                _rt_vs(_HSRP_ADV_STATE_VALS, mv[start + 6])
+            pkt.fields['hsrp.adv.reserved1'] = mv[start + 7]
+            pkt.fields['hsrp.adv.activegrp'] = rd_u16(mv, start + 8)
+            pkt.fields['hsrp.adv.passivegrp'] = rd_u16(mv, start + 10)
+            pkt.fields['hsrp.adv.reserved2'] = rd_u32(mv, start + 12)
+        else:
+            pkt.malformed = 1
+        return
+    # Hello / Coup / Resign fixed 20-byte layout.
+    if _have_range(start, end, 20):
+        pkt.fields['hsrp.state'] = _rt_vs(_HSRP_STATE_VALS, mv[start + 2])
+        pkt.fields['hsrp.hellotime'] = mv[start + 3]
+        pkt.fields['hsrp.holdtime'] = mv[start + 4]
+        pkt.fields['hsrp.priority'] = mv[start + 5]
+        pkt.fields['hsrp.group'] = mv[start + 6]
+        pkt.fields['hsrp.reserved'] = mv[start + 7]
+        pkt.fields['hsrp.auth_data'] = _rt_text(rd_bytes(mv, start + 8,
+                                                         start + 16))
+        pkt.fields['hsrp.virt_ip'] = _fmt_ipv4_buf(&mv[start + 16])
+        # Trailing TLV(s), e.g. HSRPv1 with an MD5 auth TLV (total len 50).
+        _decode_hsrp_tlvs(pkt, mv, start + 20, end)
+    else:
+        pkt.malformed = 1
+
+
+cdef int _decode_hsrp(HSRP pkt, bytes owner, const unsigned char[:] mv,
+                      Py_ssize_t start, Py_ssize_t end,
+                      dict l7_ports) except -1:
+    cdef unsigned char first
+    pkt.malformed = 0
+    pkt._raw = None
+    pkt.version = 0
+    pkt.is_v2 = 0
+    pkt.fields = {}
+    pkt.tlvs = []
+    pkt._body = b''
+    pkt.payload = NullPkt(b'')
+
+    if not _have_range(start, end, 1):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        return 0
+    pkt._raw = rd_bytes(mv, start, end)
+    pkt._body = pkt._raw
+    first = mv[start]
+    if first == 0:
+        pkt.version = 0
+        pkt.is_v2 = 0
+        _decode_hsrpv1(pkt, mv, start, end)
+    else:
+        # Leading byte is an HSRPv2 TLV type; walk the TLV sequence.
+        pkt.version = 2
+        pkt.is_v2 = 1
+        _decode_hsrp_tlvs(pkt, mv, start, end)
+    return 0
+
+
 cdef bytes _owned_buffer(tuple args, dict kwargs):
     """Return the public parse input as one immutable owner, or None."""
     cdef object value
@@ -9083,3 +9891,6 @@ _QI_GRE = GRE.query_info()
 _QI_OSPF = OSPFv2.query_info()
 _QI_OSPFV3 = OSPFv3.query_info()
 _QI_BGP = BGP.query_info()
+_QI_RIP = RIP.query_info()
+_QI_RIPNG = RIPng.query_info()
+_QI_HSRP = HSRP.query_info()
