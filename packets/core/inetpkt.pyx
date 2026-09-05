@@ -116,6 +116,7 @@ PROTO_ICMP = 1
 PROTO_IGMP = 2
 PROTO_TCP = 6
 PROTO_UDP = 17
+PROTO_GRE = 47
 PROTO_ICMPV6 = 58
 IPV6_HDR_LEN = 40
 ICMP6_DST_UNREACH = 1
@@ -152,6 +153,7 @@ PQ_UDP = 17
 PQ_ICMPV6 = 58
 PQ_ARP = 0x0806
 PQ_MPLS = 0x8847
+PQ_GRE = 47
 PQ_NETFLOW_SIMPLE = 2005
 PQ_ICMP6OPT = 2006
 PQ_MLDV2_ADDRESS_RECORD = 2007
@@ -182,6 +184,7 @@ cdef tuple _QI_ICMP6Opt
 cdef tuple _QI_MLDv2AddressRecord
 cdef tuple _QI_MPLS
 cdef tuple _QI_ETH
+cdef tuple _QI_GRE
 
 # Address conversion entry points, bound once at import. These sit on the
 # construction path (every src/dst set) and on the parse path (every address
@@ -284,6 +287,7 @@ cdef class IP_CONST:
         self.PROTO_IGMP = PROTO_IGMP
         self.PROTO_TCP = PROTO_TCP
         self.PROTO_UDP = PROTO_UDP
+        self.PROTO_GRE = PROTO_GRE
         self.PROTO_ICMPV6 = PROTO_ICMPV6
         self.IPV6_HDR_LEN = IPV6_HDR_LEN
         self.ICMP6_DST_UNREACH = ICMP6_DST_UNREACH
@@ -319,6 +323,7 @@ cdef class IP_CONST:
         self.PQ_ICMPV6 = PQ_ICMPV6
         self.PQ_ARP = PQ_ARP
         self.PQ_MPLS = PQ_MPLS
+        self.PQ_GRE = PQ_GRE
         self.PQ_NETFLOW_SIMPLE = PQ_NETFLOW_SIMPLE
         self.PQ_NULLPKT = PQ_NULLPKT
 
@@ -5452,6 +5457,438 @@ cdef inline Py_ssize_t _declared_end(Py_ssize_t start, Py_ssize_t end,
     return end
 
 
+# --- Routing protocols: malformed-input contract ----------------------------
+# The routing-protocol codecs added below (GRE now; OSPF, BGP, RIP and HSRP in
+# later stages) follow a strict never-raise contract that is deliberately
+# stronger than the raise-on-truncation behaviour of need_bytes/_need_range
+# used by the older layers:
+#
+#   1. Truncated input (fewer bytes than a fixed header or a declared length)
+#      is parsed as far as it goes. The codec sets its readonly ``malformed``
+#      flag and preserves every remaining byte as a trailing NullPkt so the
+#      packet still re-serializes to what came in. It does NOT raise.
+#   2. Unknown or reserved codes (ethertypes, flag combinations, versions) are
+#      kept as-is and remain round-trippable rather than becoming parse errors.
+#   3. Invalid field values (reserved bits, checksum mismatches) are exposed
+#      verbatim; validation is the caller's job.
+#   4. The zero-exception rule: parsing never raises on malformed input. Only
+#      MemoryError-class system failures may propagate. This matches the master
+#      plan (IMPORTANT-1) and Answers 6 and 7, which require GRE-in-UDP and
+#      IPsec-wrapped payloads to parse without raising.
+#
+# The soft-bounds helper below is what keeps these codecs off the raising path:
+# it reports whether a range holds a given number of bytes instead of raising
+# when it does not. Existing protocols and their raising helpers are unchanged.
+
+
+cdef inline bint _have_range(Py_ssize_t start, Py_ssize_t end,
+                             Py_ssize_t least):
+    """Soft bounds check for the never-raise routing codecs.
+
+    The routing analogue of _need_range: it returns whether at least ``least``
+    bytes are available in ``[start, end)`` rather than raising when they are
+    not, so a codec can stop cleanly on a short header, flag itself malformed,
+    and preserve the remainder instead of aborting the whole parse.
+
+    :param start: first readable offset.
+    :param end: one past the last readable offset.
+    :param least: minimum number of bytes the caller is about to read.
+    :return: 1 when the bytes are present, 0 otherwise.
+    """
+    return start >= 0 and (end - start) >= least
+
+
+@cython.final
+cdef class GRE(PKT):
+    """GRE (RFC 2784) with the key/sequence extensions (RFC 2890), PPTP
+    enhanced GRE (RFC 2637), NVGRE (RFC 7637) and Transparent Ethernet
+    Bridging.
+
+    One class covers every variant because they differ only in which optional
+    header words are present, and the flag bits in the first two bytes decide
+    that:
+
+      C -> a 16-bit checksum and 16 bits of reserved1 follow the base header.
+      K -> a 32-bit key follows. NVGRE reuses it as a 24-bit Virtual Subnet Id
+           and an 8-bit FlowID, exposed as gre.key.vsid / gre.key.flowid.
+      S -> a 32-bit sequence number follows.
+      A -> (enhanced GRE, Ver == 1) a 32-bit acknowledgment number follows.
+
+    The 16-bit Protocol Type selects the inner payload the way an EtherType
+    does: 0x0800 -> IP, 0x86DD -> IP6, 0x8847/0x8848 -> MPLS, 0x6558 ->
+    Ethernet (TEB / NVGRE). Anything else is kept as a NullPkt so an unknown
+    protocol still re-serializes to the bytes it came from.
+
+    Parsing follows the routing never-raise contract documented above: a
+    truncated header sets ``malformed`` and keeps the remainder as a trailing
+    NullPkt rather than raising. The checksum is recomputed only when
+    pkt2net is called with ``csum`` set, like the other checksummed layers.
+    """
+
+    def __init__(self, *args, **kwargs):
+        """Initialize a GRE object.
+
+        Args:
+            :args (list): optional one-element list of network-order bytes.
+            :data (bytes): optional network-order bytes of a GRE packet.
+            :proto (uint16_t): inner protocol type (EtherType). Derived from
+                the payload class on serialization when a known PKT payload is
+                set.
+            :checksum (uint16_t): header/payload checksum. Supplying it sets
+                the C bit; the value is recomputed on pkt2net({'csum': 1}).
+            :reserved1 (uint16_t): the 16 bits following the checksum.
+            :key (uint32_t): 32-bit key. Supplying it sets the K bit.
+            :vsid (uint32_t) / :flowid (unsigned char): NVGRE key parts, an
+                alternative to key; supplying either sets the K bit.
+            :sequence_number (uint32_t): sequence number. Supplying it sets S.
+            :ack_number (uint32_t): enhanced-GRE acknowledgment number.
+                Supplying it sets the A bit; use version=1 for enhanced GRE.
+            :version (unsigned char): 3-bit version. 0 standard, 1 enhanced.
+            :c/:k/:s/:a (0 or 1): force a flag bit on with no field value so a
+                reserved-but-empty option still round-trips.
+            :payload (PKT or bytes): the encapsulated packet.
+            :l7_ports (dict): passed on to inner layers unchanged.
+        """
+        self._base_l7(kwargs)
+        self.pkt_name = 'GRE'
+        self.pq_type, self.query_fields = _QI_GRE
+        cdef:
+            bytes owner
+            const unsigned char[:] mv
+            uint16_t flags = 0
+        owner = _owned_buffer(args, kwargs)
+        if owner is not None:
+            mv = owner
+            _decode_gre(self, owner, mv, 0, len(owner), self._l7_ports)
+            return
+
+        # Keyword construction.
+        self._raw = None
+        self.malformed = 0
+        self.checksum = kwargs.get('checksum', 0)
+        self._reserved1 = kwargs.get('reserved1', 0)
+        self.sequence = kwargs.get('sequence_number', 0)
+        self.ack = kwargs.get('ack_number', 0)
+        if 'key' in kwargs:
+            self.key = kwargs['key']
+        elif 'vsid' in kwargs or 'flowid' in kwargs:
+            self.key = (((<uint32_t>kwargs.get('vsid', 0) & 0xffffff) << 8) |
+                        (<uint32_t>kwargs.get('flowid', 0) & 0xff))
+        else:
+            self.key = 0
+        self.vsid = self.key >> 8
+        self.flowid = self.key & 0xff
+
+        # Flag/version word. Presence is inferred from the fields supplied and
+        # can be forced with the c/k/s/a keywords.
+        flags |= (<uint16_t>kwargs.get('version', 0) & 0x0007)
+        if kwargs.get('c', 1 if 'checksum' in kwargs else 0):
+            flags |= 0x8000
+        if kwargs.get('k', 1 if ('key' in kwargs or 'vsid' in kwargs or
+                                 'flowid' in kwargs) else 0):
+            flags |= 0x2000
+        if kwargs.get('s', 1 if 'sequence_number' in kwargs else 0):
+            flags |= 0x1000
+        if kwargs.get('a', 1 if 'ack_number' in kwargs else 0):
+            flags |= 0x0080
+        self._flags = flags
+
+        if 'payload' in kwargs and isinstance(kwargs['payload'], PKT):
+            self.payload = kwargs['payload']
+        elif ('payload' in kwargs and
+              isinstance(kwargs['payload'], (str, bytes, array))):
+            self.payload = NullPkt(kwargs['payload'])
+        else:
+            self.payload = NullPkt(b'')
+
+        # Settle the protocol type from a known payload so a keyword-built
+        # packet reports gre.proto before it is ever serialized.
+        if 'proto' in kwargs:
+            self.proto = kwargs['proto']
+        elif isinstance(self.payload, IP):
+            self.proto = 0x0800
+        elif isinstance(self.payload, IP6):
+            self.proto = 0x86dd
+        elif isinstance(self.payload, MPLS):
+            self.proto = 0x8847
+        elif isinstance(self.payload, Ethernet):
+            self.proto = 0x6558
+        else:
+            self.proto = 0
+
+    @classmethod
+    def query_info(cls):
+        """Provides pcap_query with the query fields GRE supports and GRE's
+        PKT type ID.
+
+        The field names are Wireshark packet-gre.c abbreviations. The NVGRE
+        key parts render as gre.key.vsid (24-bit) and gre.key.flowid (8-bit).
+
+        Returns:
+            :tuple: PQ_GRE and a tuple of the supported field names.
+        """
+        return (PQ_GRE,
+                ('gre.proto', 'gre.checksum', 'gre.key',
+                 'gre.key.vsid', 'gre.key.flowid',
+                 'gre.sequence_number', 'gre.ack_number',
+                 'gre.flags.k', 'gre.flags.s', 'gre.flags.c'))
+
+    cpdef object get_field_val(self, str field):
+        """Return the value of a Wireshark-format field name.
+
+        Optional fields report None when their presence bit is clear, so a
+        caller can tell an absent key or sequence number from a zero one.
+        Unrecognized names fall through to the payload, matching the other
+        container layers.
+        """
+        if field == 'gre.proto':
+            return self.proto
+        elif field == 'gre.checksum':
+            return self.checksum if (self._flags & 0x8000) else None
+        elif field == 'gre.key':
+            return self.key if (self._flags & 0x2000) else None
+        elif field == 'gre.key.vsid':
+            return self.vsid if (self._flags & 0x2000) else None
+        elif field == 'gre.key.flowid':
+            return self.flowid if (self._flags & 0x2000) else None
+        elif field == 'gre.sequence_number':
+            return self.sequence if (self._flags & 0x1000) else None
+        elif field == 'gre.ack_number':
+            if (self._flags & 0x0007) == 1 and (self._flags & 0x0080):
+                return self.ack
+            return None
+        elif field == 'gre.flags.k':
+            return 1 if (self._flags & 0x2000) else 0
+        elif field == 'gre.flags.s':
+            return 1 if (self._flags & 0x1000) else 0
+        elif field == 'gre.flags.c':
+            return 1 if (self._flags & 0x8000) else 0
+        elif isinstance(self.payload, PKT):
+            return self.payload.get_field_val(field)
+        else:
+            return None
+
+    property version:
+        """The 3-bit GRE version. 0 for standard GRE, 1 for enhanced GRE."""
+        def __get__(self):
+            return self._flags & 0x0007
+        def __set__(self, unsigned char val):
+            self._flags = (self._flags & ~0x0007) | (val & 0x0007)
+
+    property flag_c:
+        """Checksum-present bit."""
+        def __get__(self):
+            return 1 if (self._flags & 0x8000) else 0
+
+    property flag_k:
+        """Key-present bit."""
+        def __get__(self):
+            return 1 if (self._flags & 0x2000) else 0
+
+    property flag_s:
+        """Sequence-number-present bit."""
+        def __get__(self):
+            return 1 if (self._flags & 0x1000) else 0
+
+    property flag_a:
+        """Acknowledgment-present bit (enhanced GRE)."""
+        def __get__(self):
+            return 1 if (self._flags & 0x0080) else 0
+
+    cpdef bytes pkt2net(self, dict kwargs):
+        """Export this GRE packet in network order.
+
+        Args:
+            :kwargs (dict): passed on to the payload. GRE reads ``csum``: when
+                set and the C bit is present, the checksum is recomputed over
+                the GRE header and everything it carries.
+
+        Returns:
+            :bytes: network-order bytes for this GRE packet and its payload.
+        """
+        return _serialize(self, kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1:
+        """Append this GRE header and its payload to a shared buffer.
+
+        The protocol type is settled from the payload class first, mirroring
+        Ethernet, so a keyword-built packet whose payload was assigned after
+        construction still serializes with a matching EtherType. Only the
+        optional words whose flag bits are set are emitted, and the checksum --
+        when present and requested -- is written as a placeholder, the payload
+        is appended, and the real value is patched back in. See PKT._write.
+        """
+        cdef:
+            bint _csum
+            Py_ssize_t start = w.n
+
+        # A malformed packet keeps its exact parsed bytes and emits them
+        # verbatim: the truncated option words were never decoded, so the
+        # header cannot be faithfully rebuilt from the flag bits.
+        if self.malformed and self._raw is not None:
+            w_bytes(w, self._raw)
+            return 0
+
+        _csum = kwargs.get('csum', 0)
+        if isinstance(self.payload, IP):
+            self.proto = 0x0800
+        elif isinstance(self.payload, IP6):
+            self.proto = 0x86dd
+        elif isinstance(self.payload, MPLS):
+            if self.proto not in (0x8847, 0x8848):
+                self.proto = 0x8847
+        elif isinstance(self.payload, Ethernet):
+            self.proto = 0x6558
+
+        w_u16(w, self._flags)
+        w_u16(w, self.proto)
+        if self._flags & 0x8000:
+            w_u16(w, self.checksum)
+            w_u16(w, self._reserved1)
+        if self._flags & 0x2000:
+            w_u32(w, self.key)
+        if self._flags & 0x1000:
+            w_u32(w, self.sequence)
+        if (self._flags & 0x0007) == 1 and (self._flags & 0x0080):
+            w_u32(w, self.ack)
+
+        if isinstance(self.payload, PKT):
+            (<PKT>self.payload)._write(w, kwargs)
+
+        if _csum and (self._flags & 0x8000):
+            w_set_u16(w, start + 4, 0)
+            self.checksum = w_cksum(w, start, 0)
+            w_set_u16(w, start + 4, self.checksum)
+        return 0
+
+
+cdef int _decode_gre(GRE pkt, bytes owner, const unsigned char[:] mv,
+                     Py_ssize_t start, Py_ssize_t end,
+                     dict l7_ports) except -1:
+    cdef:
+        Py_ssize_t off = start
+        uint16_t ethertype
+        IP ip
+        IP6 ip6
+        MPLS mpls
+        Ethernet eth
+    pkt.malformed = 0
+    pkt._raw = None
+    pkt._flags = 0
+    pkt.proto = 0
+    pkt.checksum = 0
+    pkt._reserved1 = 0
+    pkt.key = 0
+    pkt.vsid = 0
+    pkt.flowid = 0
+    pkt.sequence = 0
+    pkt.ack = 0
+
+    # Base header: a 2-byte flag/version word and a 2-byte protocol type.
+    if not _have_range(off, end, 4):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        pkt.payload = _null_range(owner, off, end, l7_ports)
+        return 0
+    pkt._flags = rd_u16(mv, off)
+    pkt.proto = rd_u16(mv, off + 2)
+    off += 4
+
+    # Checksum + reserved1, present when the C bit is set (RFC 2784).
+    if pkt._flags & 0x8000:
+        if not _have_range(off, end, 4):
+            pkt.malformed = 1
+            pkt._raw = rd_bytes(mv, start, end)
+            pkt.payload = _null_range(owner, off, end, l7_ports)
+            return 0
+        pkt.checksum = rd_u16(mv, off)
+        pkt._reserved1 = rd_u16(mv, off + 2)
+        off += 4  # C word consumed
+
+    # Key, present when the K bit is set (RFC 2890). NVGRE (RFC 7637) reads the
+    # same 32 bits as a 24-bit VSID and an 8-bit FlowID.
+    if pkt._flags & 0x2000:
+        if not _have_range(off, end, 4):
+            pkt.malformed = 1
+            pkt._raw = rd_bytes(mv, start, end)
+            pkt.payload = _null_range(owner, off, end, l7_ports)
+            return 0
+        pkt.key = rd_u32(mv, off)
+        pkt.vsid = pkt.key >> 8
+        pkt.flowid = pkt.key & 0xff
+        off += 4
+
+    # Sequence number, present when the S bit is set (RFC 2890).
+    if pkt._flags & 0x1000:
+        if not _have_range(off, end, 4):
+            pkt.malformed = 1
+            pkt._raw = rd_bytes(mv, start, end)
+            pkt.payload = _null_range(owner, off, end, l7_ports)
+            return 0
+        pkt.sequence = rd_u32(mv, off)
+        off += 4
+
+    # Acknowledgment number, present in enhanced GRE (RFC 2637, Ver == 1) when
+    # the A bit is set.
+    if (pkt._flags & 0x0007) == 1 and (pkt._flags & 0x0080):
+        if not _have_range(off, end, 4):
+            pkt.malformed = 1
+            pkt._raw = rd_bytes(mv, start, end)
+            pkt.payload = _null_range(owner, off, end, l7_ports)
+            return 0
+        pkt.ack = rd_u32(mv, off)
+        off += 4
+
+    if off >= end:
+        pkt.payload = NullPkt()
+        return 0
+
+    # Inner payload dispatch by protocol type (EtherType). The inner decoders
+    # still use the raising bounds helpers, so the dispatch is wrapped: a
+    # truncated or otherwise unparsable inner payload marks GRE malformed and
+    # is kept whole as a NullPkt instead of propagating an exception, which is
+    # what the routing never-raise contract requires.
+    ethertype = pkt.proto
+    try:
+        if ethertype == 0x0800:
+            ip = IP.__new__(IP)
+            ip._l7_ports = l7_ports
+            ip.pkt_name = 'IP'
+            ip.pq_type, ip.query_fields = _QI_IP
+            _decode_ip(ip, owner, mv, off, end, l7_ports)
+            pkt.payload = ip
+        elif ethertype == 0x86dd:
+            ip6 = IP6.__new__(IP6)
+            ip6._l7_ports = l7_ports
+            ip6.pkt_name = 'IP6'
+            ip6.pq_type, ip6.query_fields = _QI_IP6
+            _decode_ip6(ip6, owner, mv, off, end, l7_ports)
+            pkt.payload = ip6
+        elif ethertype == 0x8847 or ethertype == 0x8848:
+            mpls = MPLS.__new__(MPLS)
+            mpls._l7_ports = l7_ports
+            mpls.pkt_name = 'MPLS'
+            mpls.pq_type, mpls.query_fields = _QI_MPLS
+            _decode_mpls(mpls, owner, mv, off, end, l7_ports)
+            pkt.payload = mpls
+        elif ethertype == 0x6558:
+            eth = Ethernet.__new__(Ethernet)
+            eth._l7_ports = l7_ports
+            eth.pkt_name = 'Ethernet'
+            eth.pq_type, eth.query_fields = _QI_ETH
+            eth.tpid = 0
+            eth._tci = 0
+            _decode_ethernet(eth, owner, mv, off, end, l7_ports)
+            pkt.payload = eth
+        else:
+            pkt.payload = _null_range(owner, off, end, l7_ports)
+    except (ValueError, IndexError):
+        pkt.malformed = 1
+        pkt._raw = rd_bytes(mv, start, end)
+        pkt.payload = _null_range(owner, off, end, l7_ports)
+    return 0
+
+
 cdef bytes _owned_buffer(tuple args, dict kwargs):
     """Return the public parse input as one immutable owner, or None."""
     cdef object value
@@ -6066,6 +6503,7 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         TCP tcp
         ICMP icmp
         IGMP igmp
+        GRE gre
     _need_range(start, end, 20, 'IP')
     pkt.ipv4_pheader = Ip4Ph()
     pkt.options = b''
@@ -6148,6 +6586,13 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         # version guard a real length when total_len is 0.
         _decode_igmp(igmp, owner, payload_start, end, end - payload_start)
         pkt.payload = igmp
+    elif pkt.proto == PROTO_GRE:
+        gre = GRE.__new__(GRE)
+        gre._l7_ports = l7_ports
+        gre.pkt_name = 'GRE'
+        gre.pq_type, gre.query_fields = _QI_GRE
+        _decode_gre(gre, owner, mv, payload_start, end, l7_ports)
+        pkt.payload = gre
     else:
         pkt.payload = _null_range(owner, payload_start, end, l7_ports)
     return 0
@@ -6215,6 +6660,7 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
         UDP udp
         TCP tcp
         ICMP6 icmp6
+        GRE gre
     _need_range(start, end, IPV6_HDR_LEN, 'IP6')
     pkt.ipv6_pheader = Ip6Ph()
     pkt._ext_hdrs = b''
@@ -6281,6 +6727,13 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
         icmp6.pq_type, icmp6.query_fields = _QI_ICMP6
         _decode_icmp6(icmp6, owner, payload_start, end)
         pkt.payload = icmp6
+    elif pkt._upper_proto == PROTO_GRE:
+        gre = GRE.__new__(GRE)
+        gre._l7_ports = l7_ports
+        gre.pkt_name = 'GRE'
+        gre.pq_type, gre.query_fields = _QI_GRE
+        _decode_gre(gre, owner, mv, payload_start, end, l7_ports)
+        pkt.payload = gre
     else:
         pkt.payload = _null_range(owner, payload_start, end, l7_ports)
     return 0
@@ -6737,3 +7190,4 @@ _QI_ICMP6Opt = ICMP6Opt.query_info()
 _QI_MLDv2AddressRecord = MLDv2AddressRecord.query_info()
 _QI_MPLS = MPLS.query_info()
 _QI_ETH = Ethernet.query_info()
+_QI_GRE = GRE.query_info()

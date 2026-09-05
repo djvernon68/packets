@@ -59,7 +59,8 @@ writes both captures deterministically from library code:
 python3 bench/make_corpus.py \
     --frames /tmp/frames.pcap --count 50000 \
     --netflow /tmp/netflow.pcap --netflow-records 20000 \
-    --l7 /tmp/l7.pcap --l7-count 49000
+    --l7 /tmp/l7.pcap --l7-count 49000 \
+    --gre /tmp/gre.pcap --gre-count 49000
 ```
 
 * `--frames` cycles deterministic TCP / UDP / IPv6 / 802.1Q VLAN / MPLS shapes
@@ -73,6 +74,12 @@ python3 bench/make_corpus.py \
 * `--l7` carries **valid** application-layer messages on **well-known** ports
   (DNS/53, HTTP/80, DHCP/67, DHCPv6/547, NetFlow v9/2055), so a full L7 decode
   is representative work. It is the input for the L7 comparison below.
+* `--gre` cycles the well-known GRE variants (plain, key, sequence, checksum,
+  over IPv6, and NVGRE / Transparent Ethernet Bridging), each built from
+  packets' own `GRE` constructor and carrying an inner IPv4/UDP packet. GRE is
+  dispatched from the IP protocol number (47), which packets, dpkt and scapy
+  all decode, so the standard wire bytes re-parse across every library. It is
+  the input for the GRE comparison below.
 
 ### 3. Cross-library comparison
 
@@ -97,6 +104,16 @@ scapy: all but `l7_dns_tcp`; impacket: none — no pcap reader/decoders), and a
 protocol a library cannot decode is recorded as `unsupported`. These timings are
 **in-memory** (frames are read once, then decoded from bytes), so they are a
 pure decode comparison unaffected by each library's pcap-reader speed.
+
+Add `--gre-pcap /tmp/gre.pcap` to also run the **GRE decode comparison** (one
+`gre` row: decode Ethernet/IPv4|IPv6/GRE and confirm the GRE layer resolved).
+GRE is dispatched from the IP protocol number (47), which packets, dpkt and
+scapy all decode; impacket has no GRE decoder and the libpcap ceiling is only a
+frame counter, so both are recorded as `unsupported`. Timing is in-memory like
+the L7 rows. The point of the GRE row is **regression detection** — catching
+the packets GRE decode path drifting toward the pure-Python libraries early —
+not proving a win. As the remaining routing protocols (OSPF, BGP, RIP, HSRP)
+land in packets, they extend this comparison the same way.
 
 ### 4. Version-over-version regression
 

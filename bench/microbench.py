@@ -41,6 +41,15 @@ from array import array
 from packets.core.inetpkt import IP_CONST, Ethernet, ARP, IP, IP6, UDP, TCP, \
     ICMP, ICMP6, ICMP6Opt, IGMP, IGMPGroupRecord, MLDv2AddressRecord, MPLS, \
     NetflowSimple, NullPkt
+try:
+    # GRE ships only in builds that carry the routing codecs. Importing it
+    # optionally lets this harness run unchanged against a pre-GRE baseline
+    # (regression.py measures both builds with this one current harness); the
+    # GRE rows are simply skipped for a build that has no GRE, and show up as
+    # "labels only in working-tree" in the version-over-version table.
+    from packets.core.inetpkt import GRE
+except ImportError:
+    GRE = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_CNAME, RCLASS_IN
 
@@ -65,6 +74,25 @@ def make_tcp():
         payload=IP(proto=C.PROTO_TCP, src='10.1.2.5', dst='10.5.2.1',
                    payload=TCP(sport=34567, dport=80, sequence=200, flag_syn=1,
                                  payload=NullPkt(TCP_PAYLOAD))))
+
+
+def make_eth_gre():
+    """An Ethernet/IPv4/GRE(key)/IPv4/UDP stack.
+
+    GRE is dispatched from IP proto 47, so a full Ethernet(raw) decode walks
+    the GRE header and its inner IPv4/UDP without an l7_ports map. The key bit
+    is set so the optional-word path is exercised, not just the 4-byte base
+    header.
+    """
+    return Ethernet(
+        dst_mac='02:00:00:00:08:01', src_mac='02:00:00:00:08:02',
+        payload=IP(proto=C.PROTO_GRE, src='10.8.1.1', dst='10.8.1.2',
+                   payload=GRE(key=0x11223344,
+                               payload=IP(proto=C.PROTO_UDP,
+                                          src='10.8.0.1', dst='10.8.0.2',
+                                          payload=UDP(sport=44000, dport=45000,
+                                                      payload=NullPkt(
+                                                          UDP_PAYLOAD))))))
 
 
 def make_ip6_udp(ext_headers=b'', next_header=None):
@@ -118,7 +146,7 @@ def make_layer_corpus():
     embedded = IP(proto=C.PROTO_UDP, src='10.1.2.3', dst='10.3.2.1',
                   payload=UDP(sport=34567, dport=53)).pkt2net({'csum': 1,
                                                                'update': 1})
-    return {
+    corpus = {
         'arp': ARP(operation=1,
                    sender_hw_addr='06:05:04:03:02:03',
                    sender_proto_addr='10.1.2.3',
@@ -149,6 +177,11 @@ def make_layer_corpus():
                                  payload=UDP_PAYLOAD).pkt2net({}),
         'dns': make_dns_response(),
     }
+    if GRE is not None:
+        corpus['gre'] = GRE(key=0x11223344,
+                            payload=IP(embedded)).pkt2net({'csum': 1,
+                                                           'update': 1})
+    return corpus
 
 
 def make_dns():
@@ -254,7 +287,7 @@ def make_phase_c2_corpus():
                    payload=UDP(sport=40000, dport=2055,
                                payload=NullPkt(netflow.pkt2net({})))))
     kwargs = {'csum': 1, 'update': 1}
-    return {
+    corpus = {
         'nullpkt': UDP_PAYLOAD,
         'udp_layer': udp_dns.pkt2net({'update': 1}),
         'tcp_layer': tcp_dns.pkt2net({'update': 1}),
@@ -280,6 +313,9 @@ def make_phase_c2_corpus():
         'eth_icmp6_mld': eth_icmp6_mld.pkt2net(kwargs),
         'eth_netflow': eth_netflow.pkt2net(kwargs),
     }
+    if GRE is not None:
+        corpus['eth_gre'] = make_eth_gre().pkt2net(kwargs)
+    return corpus
 
 
 # Number of untimed warm-up calls before each measurement, mirroring
@@ -358,6 +394,14 @@ def main():
           iterations, repeats)
     bench('build_tcp+csum', lambda: make_tcp().pkt2net({'csum': 1, 'update': 1}),
           iterations, repeats)
+    # GRE is an encapsulation, so its build/serialize walks two IP layers plus
+    # the GRE header -- a shape none of the other construct rows cover. It is
+    # skipped on a pre-GRE baseline so the current harness can still measure it.
+    if GRE is not None:
+        bench('construct_gre', make_eth_gre, iterations, repeats)
+        bench('build_gre+csum',
+              lambda: make_eth_gre().pkt2net({'csum': 1, 'update': 1}),
+              iterations, repeats)
     # serialize_* holds one already constructed packet and only re-emits it.
     # build_* mixes construction and serialization, so a change to pkt2net
     # alone shows up there diluted by roughly a factor of two; these rows are
@@ -372,6 +416,11 @@ def main():
           iterations, repeats)
     bench('serialize_udp_nocsum', lambda: udp_pkt.pkt2net({}),
           iterations, repeats)
+    if GRE is not None:
+        gre_pkt = make_eth_gre()
+        bench('serialize_gre',
+              lambda: gre_pkt.pkt2net({'csum': 1, 'update': 1}),
+              iterations, repeats)
     bench('parse_udp', lambda: Ethernet(udp_raw), iterations, repeats)
     bench('parse_tcp', lambda: Ethernet(tcp_raw), iterations, repeats)
 
@@ -412,6 +461,8 @@ def main():
     bench('parse_igmp_v3', lambda: IGMP(corpus['igmp_v3']),
           iterations, repeats)
     bench('parse_mpls', lambda: MPLS(corpus['mpls']), iterations, repeats)
+    if GRE is not None:
+        bench('parse_gre', lambda: GRE(corpus['gre']), iterations, repeats)
     bench('parse_netflow', lambda: NetflowSimple(corpus['netflow']),
           iterations, repeats)
     bench('parse_dns', lambda: DNS(corpus['dns']), iterations, repeats)
@@ -469,6 +520,9 @@ def main():
           lambda: Ethernet(phase_c2['eth_netflow'],
                            l7_ports={2055: NetflowSimple}),
           iterations, repeats)
+    if GRE is not None:
+        bench('parse_eth_gre', lambda: Ethernet(phase_c2['eth_gre']),
+              iterations, repeats)
 
     # Re-emit the same layers. parse_* and serialize_* together cover the
     # read and write halves of every class that is not on the Ethernet/IP/L4

@@ -1,6 +1,25 @@
 CHANGELOG
 ---------
 
+[2.1.8]
+ * **GRE tunnels are decoded, queried, and re-encapsulated as a first-class
+   layer.** IP and IPv6 payloads carrying protocol 47 previously stopped at a
+   raw `data` blob, so nothing inside a GRE tunnel could be inspected. A new
+   `GRE` class in `packets.core.inetpkt` parses the RFC 2784/2890 base header
+   (checksum, key, and sequence-number fields gated by their flag bits),
+   PPTP enhanced GRE (RFC 2637) with its acknowledgment number, and NVGRE
+   (RFC 7637), exposing the VSID and FlowID split out of the key field. The
+   `protocol_type` selects the inner layer, so a tunnel's payload decodes on
+   through to the encapsulated `IP`, `IP6`, `MPLS`, or - for Transparent
+   Ethernet Bridging (0x6558), including NVGRE - a full `Ethernet` frame.
+   `IP` and `IP6` now dispatch protocol 47 to `GRE` automatically, and the
+   layer round-trips: serialization rebuilds the flag bits and optional
+   fields from what is set and recomputes the checksum when present. A
+   `PQ_GRE` packet-query type exposes the header fields (proto, key, VSID,
+   FlowID, sequence, ack) for `pcap_query`. Malformed or truncated GRE
+   headers decode into whatever is present rather than raising, so partial
+   captures still parse.
+
 [2.1.7]
  * **Benchmark suite (`bench/`) made deliverable; no library changes.** Closed
    the operational gaps that prevented the `bench/` suite from producing

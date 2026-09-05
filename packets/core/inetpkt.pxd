@@ -320,6 +320,7 @@ cdef:
     unsigned char PROTO_ICMP
     unsigned char PROTO_TCP
     unsigned char PROTO_UDP
+    unsigned char PROTO_GRE
     unsigned char PROTO_ICMPV6
     unsigned char IPV6_HDR_LEN
     # ICMPv6 message types (RFC 4443, RFC 4861, RFC 2710, RFC 3810)
@@ -358,6 +359,7 @@ cdef:
     unsigned char PQ_ICMPV6
     uint16_t PQ_ARP
     uint16_t PQ_MPLS
+    unsigned char PQ_GRE
     uint16_t PQ_NETFLOW_SIMPLE
     uint16_t PQ_ICMP6OPT
     uint16_t PQ_MLDV2_ADDRESS_RECORD
@@ -473,6 +475,7 @@ cdef class IP_CONST:
         readonly unsigned char PROTO_IGMP
         readonly unsigned char PROTO_TCP
         readonly unsigned char PROTO_UDP
+        readonly unsigned char PROTO_GRE
         readonly unsigned char PROTO_ICMPV6
         readonly unsigned char IPV6_HDR_LEN
         readonly unsigned char ICMP6_DST_UNREACH
@@ -508,6 +511,7 @@ cdef class IP_CONST:
         readonly unsigned char PQ_ICMPV6
         readonly uint16_t PQ_ARP
         readonly uint16_t PQ_MPLS
+        readonly unsigned char PQ_GRE
         readonly uint16_t PQ_NETFLOW_SIMPLE
         readonly uint16_t PQ_ICMP6OPT
         readonly uint16_t PQ_MLDV2_ADDRESS_RECORD
@@ -844,6 +848,41 @@ cdef class Ethernet(PKT):
     cpdef object get_field_val(self, str field)
 
 
+cdef class GRE(PKT):
+    cdef:
+        # Set only on the malformed path to the exact parsed byte range, so a
+        # truncated or unparsable GRE re-serializes to what came in rather than
+        # to a reconstructed header (the option words are gone, so they cannot
+        # be rebuilt from the flag bits). Mirrors ARP._raw.
+        bytes _raw
+        # Raw first two header bytes: C|R|K|S|s|Recur|A|Flags|Ver, kept whole so
+        # reserved bits round-trip untouched. Presence bits are read from here
+        # and exposed through the c/k/s/ack/version properties.
+        uint16_t _flags
+        # 16 bits following the checksum, present only when C is set.
+        uint16_t _reserved1
+        public uint16_t proto
+        public uint16_t checksum
+        public uint32_t key
+        # NVGRE (RFC 7637) reinterpretation of the key: 24-bit VSID and 8-bit
+        # FlowID. Populated from key whenever K is set.
+        public uint32_t vsid
+        public unsigned char flowid
+        public uint32_t sequence
+        public uint32_t ack
+        # Set when a header field was truncated. Readonly from Python; the
+        # decoder writes it. This is the malformed-flag convention every later
+        # routing protocol inherits.
+        readonly bint malformed
+        public PKT payload
+
+    cpdef bytes pkt2net(self, dict kwargs)
+
+    cdef int _write(self, PktWriter w, dict kwargs) except -1
+
+    cpdef object get_field_val(self, str field)
+
+
 # Private owner/range parser entry points.  Public constructors use these
 # after normalizing bytes/array input to one immutable bytes owner.
 cdef bytes _owned_buffer(tuple args, dict kwargs)
@@ -896,6 +935,9 @@ cdef int _decode_ip6(IP6 pkt, bytes owner,
 cdef int _decode_mpls(MPLS pkt, bytes owner, const unsigned char[:] mv,
                       Py_ssize_t start, Py_ssize_t end,
                       dict l7_ports) except -1
+cdef int _decode_gre(GRE pkt, bytes owner, const unsigned char[:] mv,
+                     Py_ssize_t start, Py_ssize_t end,
+                     dict l7_ports) except -1
 cdef int _decode_ethernet(Ethernet pkt, bytes owner,
                           const unsigned char[:] mv,
                           Py_ssize_t start, Py_ssize_t end,

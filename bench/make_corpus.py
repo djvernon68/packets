@@ -30,6 +30,15 @@ external capture files are required on the appliance:
     fixed and the NetFlow frames come from the same seeded generator, so the
     file is byte-for-byte reproducible with template-before-data ordering.
 
+  * ``--gre PATH [--gre-count N]`` -- a capture of GRE (RFC 2784/2890/2637/
+    7637) frames for ``compare_libs.py --gre-pcap``. It cycles the well-known
+    GRE variants (plain, with key, with sequence number, with checksum,
+    tunnelled over IPv6, and NVGRE / Transparent Ethernet Bridging), each built
+    from packets' own ``GRE`` constructor and carrying an inner IPv4/UDP packet.
+    GRE is dispatched from the IP protocol number (47), which packets, dpkt and
+    scapy all decode, so the standard wire bytes re-parse across every library.
+    Field values are fixed, so the file is byte-for-byte reproducible.
+
 Usage (run from the packets checkout root, with the build on PYTHONPATH):
 
     python3 bench/make_corpus.py --frames frames.pcap --count 50000 \
@@ -45,7 +54,7 @@ import argparse
 import sys
 
 from packets.core.inetpkt import IP_CONST, Ethernet, IP, IP6, UDP, TCP, \
-    MPLS, NullPkt
+    MPLS, GRE, NullPkt
 from packets.core.pcap import PCAPWriter
 
 C = IP_CONST()
@@ -381,6 +390,120 @@ def write_l7(path, count):
     return count
 
 
+# --------------------------------------------------------------- GRE corpus
+# GRE (RFC 2784/2890/2637/7637) frames for the cross-library GRE comparison in
+# compare_libs.py --gre-pcap. GRE is dispatched from the IP protocol number
+# (47) by packets, by dpkt (dpkt.ip -> dpkt.gre) and by scapy (IP -> GRE), so
+# these standard frames re-parse across all three. Every frame is built from
+# packets' own GRE constructor and carries an inner IPv4/UDP packet, so the
+# capture stays self-contained and byte-for-byte reproducible. All the
+# well-known variants appear: plain, with key, with sequence number, with
+# checksum, tunnelled over IPv6, and NVGRE / Transparent Ethernet Bridging
+# (whose protocol type is TEB, so the payload is a full inner Ethernet frame).
+GRE_SPORT = 44000
+GRE_DPORT = 45000
+
+
+def _gre_inner_udp(payload, src='10.8.0.1', dst='10.8.0.2'):
+    """The encapsulated IPv4/UDP packet every GRE shape carries."""
+    return IP(proto=C.PROTO_UDP, src=src, dst=dst,
+              payload=UDP(sport=GRE_SPORT, dport=GRE_DPORT,
+                          payload=NullPkt(payload)))
+
+
+def _gre_plain_frame(payload):
+    return Ethernet(
+        dst_mac='02:00:00:00:08:01', src_mac='02:00:00:00:08:02',
+        payload=IP(proto=C.PROTO_GRE, src='10.8.1.1', dst='10.8.1.2',
+                   payload=GRE(payload=_gre_inner_udp(payload))))
+
+
+def _gre_key_frame(payload):
+    return Ethernet(
+        dst_mac='02:00:00:00:08:03', src_mac='02:00:00:00:08:04',
+        payload=IP(proto=C.PROTO_GRE, src='10.8.1.3', dst='10.8.1.4',
+                   payload=GRE(key=0x11223344,
+                               payload=_gre_inner_udp(payload))))
+
+
+def _gre_seq_frame(payload):
+    return Ethernet(
+        dst_mac='02:00:00:00:08:05', src_mac='02:00:00:00:08:06',
+        payload=IP(proto=C.PROTO_GRE, src='10.8.1.5', dst='10.8.1.6',
+                   payload=GRE(sequence_number=0x0000abcd,
+                               payload=_gre_inner_udp(payload))))
+
+
+def _gre_cksum_frame(payload):
+    # The C bit is set (a checksum keyword), so pkt2net({'csum': 1}) recomputes
+    # the GRE checksum during serialization.
+    return Ethernet(
+        dst_mac='02:00:00:00:08:07', src_mac='02:00:00:00:08:08',
+        payload=IP(proto=C.PROTO_GRE, src='10.8.1.7', dst='10.8.1.8',
+                   payload=GRE(checksum=0,
+                               payload=_gre_inner_udp(payload))))
+
+
+def _gre6_frame(payload):
+    # GRE over IPv6: the IPv6 next-header is 47, the same protocol-number
+    # dispatch every library follows.
+    return Ethernet(
+        dst_mac='02:00:00:00:08:09', src_mac='02:00:00:00:08:0a',
+        type=0x86dd,
+        payload=IP6(next_header=C.PROTO_GRE,
+                    src='2001:db8:8::1', dst='2001:db8:8::2',
+                    payload=GRE(payload=_gre_inner_udp(payload))))
+
+
+def _gre_nvgre_frame(payload):
+    # NVGRE / Transparent Ethernet Bridging: the GRE key carries a 24-bit
+    # Virtual Subnet ID and an 8-bit FlowID, and the protocol type is TEB
+    # (0x6558), so the payload is a full inner Ethernet frame.
+    inner = Ethernet(
+        dst_mac='02:00:00:00:08:cc', src_mac='02:00:00:00:08:dd',
+        payload=_gre_inner_udp(payload, src='10.8.2.1', dst='10.8.2.2'))
+    return Ethernet(
+        dst_mac='02:00:00:00:08:0b', src_mac='02:00:00:00:08:0c',
+        payload=IP(proto=C.PROTO_GRE, src='10.8.1.9', dst='10.8.1.10',
+                   payload=GRE(vsid=0x123456, flowid=0x78, payload=inner)))
+
+
+# Order matters only for reproducibility; every builder is exercised.
+GRE_SHAPES = (
+    ('gre_plain', _gre_plain_frame),
+    ('gre_key', _gre_key_frame),
+    ('gre_seq', _gre_seq_frame),
+    ('gre_cksum', _gre_cksum_frame),
+    ('gre6', _gre6_frame),
+    ('gre_nvgre', _gre_nvgre_frame),
+)
+
+
+def _build_gre_table():
+    """Serialize one GRE frame per (shape, payload size) combination."""
+    frames = []
+    for size in PAYLOAD_SIZES:
+        payload = _payload(size)
+        for _name, builder in GRE_SHAPES:
+            frames.append(builder(payload).pkt2net({'csum': 1, 'update': 1}))
+    return frames
+
+
+def write_gre(path, count):
+    """Write `count` GRE frames to `path`, cycling the GRE shape table."""
+    if count <= 0:
+        raise ValueError('--gre-count must be positive')
+    frames = _build_gre_table()
+    writer = PCAPWriter(filename=path, snaplen=65535)
+    try:
+        for packet_number in range(count):
+            frame = frames[packet_number % len(frames)]
+            writer.dump_pkt(frame, BASE_TV_SEC, packet_number)
+    finally:
+        writer.close()
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -402,10 +525,18 @@ def main():
                         type=int, default=49000,
                         help='number of L7 frames to write, cycled from the '
                              'protocol shape table (default: %(default)s)')
+    parser.add_argument('--gre', metavar='PATH',
+                        help='write the GRE capture (plain/key/seq/checksum/'
+                             'IPv6/NVGRE variants) here')
+    parser.add_argument('--gre-count', '--gre_count', dest='gre_count',
+                        type=int, default=49000,
+                        help='number of GRE frames to write, cycled from the '
+                             'GRE shape table (default: %(default)s)')
     args = parser.parse_args()
 
-    if not args.frames and not args.netflow and not args.l7:
-        parser.error('nothing to do: pass --frames, --netflow and/or --l7')
+    if not args.frames and not args.netflow and not args.l7 and not args.gre:
+        parser.error('nothing to do: pass --frames, --netflow, --l7 '
+                     'and/or --gre')
 
     if args.frames:
         n = write_frames(args.frames, args.count)
@@ -423,6 +554,12 @@ def main():
         print('l7: wrote %d packets (%d protocols) to %s'
               % (n, len(L7_SHAPES), args.l7))
         print('  compare_libs.py --l7-pcap %s' % args.l7)
+
+    if args.gre:
+        n = write_gre(args.gre, args.gre_count)
+        print('gre: wrote %d packets (%d variants) to %s'
+              % (n, len(GRE_SHAPES), args.gre))
+        print('  compare_libs.py --gre-pcap %s' % args.gre)
 
     return 0
 

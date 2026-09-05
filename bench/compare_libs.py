@@ -44,6 +44,18 @@ its bucket from bytes, so the numbers are a pure decode comparison that is not
 skewed by each library's different pcap-reader speed (read cost is already the
 ``pcaprd`` rows over ``--pcap``).
 
+``--gre-pcap`` adds a GRE decode comparison over a capture of GRE frames (build
+it with ``make_corpus.py --gre``), one row:
+
+  * gre - decode Ethernet/IPv4|IPv6/GRE and confirm the GRE layer resolved
+
+GRE is dispatched from the IP protocol number (47), which packets, dpkt and
+scapy all decode; impacket has no GRE decoder and the libpcap ceiling is only a
+frame counter, so both are recorded as ``unsupported``. Timing is in-memory,
+like the L7 rows. The point of this comparison is regression detection -- to
+catch the packets GRE path drifting toward the pure-Python libraries early --
+rather than to prove a win.
+
 Run with PYTHONPATH pointed at the packets build directory.
 
 Expect a full run to take several minutes: every pcap operation samples for at
@@ -109,6 +121,13 @@ parser.add_argument('--l7-pcap', '--l7_pcap', dest='l7_pcap',
                          'comparison runs per protocol.')
 parser.add_argument('--l7-seconds', type=float, default=1.0,
                     help='minimum duration of each L7 decode sample '
+                         '(default: %(default)s)')
+parser.add_argument('--gre-pcap', '--gre_pcap', dest='gre_pcap',
+                    help='capture of GRE frames (build it with '
+                         'make_corpus.py --gre). When given, a GRE decode '
+                         'comparison runs against dpkt and scapy.')
+parser.add_argument('--gre-seconds', type=float, default=1.0,
+                    help='minimum duration of each GRE decode sample '
                          '(default: %(default)s)')
 parser.add_argument('--iterations', type=int, default=50000)
 parser.add_argument('--repeats', type=int, default=5)
@@ -178,10 +197,15 @@ if args.l7_pcap and not os.path.isfile(args.l7_pcap):
     parser.error('no such capture file: %s' % args.l7_pcap)
 if args.l7_seconds <= 0:
     parser.error('l7-seconds must be positive')
+if args.gre_pcap and not os.path.isfile(args.gre_pcap):
+    parser.error('no such capture file: %s' % args.gre_pcap)
+if args.gre_seconds <= 0:
+    parser.error('gre-seconds must be positive')
 
 PCAP = args.pcap
 NETFLOW_PCAP = args.netflow_pcap
 L7_PCAP = args.l7_pcap
+GRE_PCAP = args.gre_pcap
 NETFLOW_PORTS = _parse_port_list(args.netflow_ports)
 PACKETS_LABEL = args.packets_label
 
@@ -201,6 +225,7 @@ N_PCAP_PASSES = args.repeats
 PCAP_SAMPLE_SECONDS = args.pcap_seconds
 NETFLOW_SAMPLE_SECONDS = args.netflow_seconds
 L7_SAMPLE_SECONDS = args.l7_seconds
+GRE_SAMPLE_SECONDS = args.gre_seconds
 
 RUN_T0 = time.perf_counter()
 
@@ -326,6 +351,8 @@ def dump_results(final=False):
         'netflow_min_seconds_per_sample': args.netflow_seconds,
         'l7_pcap': args.l7_pcap,
         'l7_min_seconds_per_sample': args.l7_seconds,
+        'gre_pcap': args.gre_pcap,
+        'gre_min_seconds_per_sample': args.gre_seconds,
         'libs': list(ENABLED_LIBS),
         'elapsed_seconds': round(time.perf_counter() - RUN_T0, 3),
     }
@@ -413,6 +440,11 @@ if L7_PCAP:
         L7_PCAP, os.path.getsize(L7_PCAP) / 1048576.0, args.l7_seconds)
 else:
     log('L7 decode comparison disabled; pass --l7-pcap to enable it')
+if GRE_PCAP:
+    log('gre-pcap=%s (%.2f MiB) gre-seconds=%.1f',
+        GRE_PCAP, os.path.getsize(GRE_PCAP) / 1048576.0, args.gre_seconds)
+else:
+    log('GRE decode comparison disabled; pass --gre-pcap to enable it')
 
 
 # ----------------------------------------------------------------- packets 2.1
@@ -1366,6 +1398,179 @@ else:
                            'DNS-over-TCP framing differs: this corpus carries '
                            'the raw message packets decodes, without the '
                            '2-byte length prefix scapy requires')
+        except Exception as e:
+            section_failed("scapy 2.5.0", e)
+
+
+# ------------------------------------------------------ GRE decode comparison
+# The --gre-pcap capture (build it with make_corpus.py --gre) carries standard
+# GRE frames -- plain, keyed, sequenced, checksummed, over IPv6, and NVGRE/TEB.
+# GRE is dispatched from the IP protocol number (47), which packets, dpkt and
+# scapy all decode, so every frame re-parses across the three; impacket has no
+# GRE decoder and libpcap dispatch is only a frame counter, so both are marked
+# unsupported. This is the routing-protocol analogue of the L7 comparison: the
+# reason for it is regression detection -- catching the packets GRE decode path
+# slowing down toward the pure-Python libraries early -- not proving a win.
+#
+# Timing is in-memory, matching the L7 section: the frames are read once
+# (untimed) and kept in a list, then each op decodes that list from bytes, so
+# the number is a pure decode comparison unaffected by each library's pcap
+# reader speed (that read cost is the pcaprd rows over --pcap).
+GRE_OPS = ('gre',)
+
+
+def bench_gre_op(lib, op, fn, verify=None):
+    """Verify one untimed decode pass resolves, then time the operation."""
+    try:
+        if verify is not None:
+            counts = verify()
+            log('  %s/%s decoded: %s', lib, op, ' '.join(
+                '%s=%s' % (name, counts[name]) for name in sorted(counts)))
+            results.setdefault(lib, {})['%s_counts' % op] = dict(counts)
+            dump_results()
+            if not counts.get('decoded'):
+                raise RuntimeError('%s decoded nothing from %s'
+                                   % (op, GRE_PCAP))
+        bench_pcap_op(lib, op, fn, seconds=GRE_SAMPLE_SECONDS, source=GRE_PCAP)
+    except Exception as exc:
+        log('%s/%s: FAILED, %s: %s', lib, op, exc.__class__.__name__, exc)
+        results.setdefault(lib, {})[op] = {'error': str(exc)}
+        dump_results()
+
+
+def gre_unsupported(lib, reason, ops=GRE_OPS):
+    for op in ops:
+        results.setdefault(lib, {})[op] = {'unsupported': reason}
+    log('%s: %s', lib, reason)
+    dump_results()
+
+
+def _is_gre_frame(raw):
+    """Return True for an Ethernet II frame whose IPv4/IPv6 payload is GRE.
+
+    A tiny struct-free parse keeps the classification library-agnostic, so the
+    same frame list feeds every library without any one decoder shaping it.
+    """
+    if len(raw) < 14:
+        return False
+    ethtype = (raw[12] << 8) | raw[13]
+    offset = 14
+    if ethtype == 0x0800:
+        if len(raw) < offset + 20:
+            return False
+        return raw[offset + 9] == 47
+    elif ethtype == 0x86dd:
+        if len(raw) < offset + 40:
+            return False
+        return raw[offset + 6] == 47
+    return False
+
+
+def _load_gre_frames():
+    frames = []
+    reader = PCAPReader(filename=GRE_PCAP)
+    try:
+        for _ts, _hdr, raw in reader:
+            frame = bytes(raw)
+            if _is_gre_frame(frame):
+                frames.append(frame)
+    finally:
+        reader.close()
+    return frames
+
+
+if not GRE_PCAP:
+    log('=== GRE decode comparison: skipped, no --gre-pcap ===')
+else:
+    log('=== GRE decode comparison: %s ===', os.path.basename(GRE_PCAP))
+    GRE_FRAMES = _load_gre_frames()
+    log('gre frames: %d', len(GRE_FRAMES))
+    if not GRE_FRAMES:
+        log('gre capture has no GRE frames -- rebuild it with '
+            'make_corpus.py --gre')
+
+    # ------------------------------------------------------------ packets 2.1
+    if not enabled('packets'):
+        log('%s: GRE decode skipped, packets not selected', PACKETS_LABEL)
+    else:
+        try:
+            # GRE is dispatched from IP proto 47, so Ethernet(raw) decodes it
+            # without an l7_ports map, exactly as ICMP/IGMP are. Import GRE so
+            # a build that predates it is marked unsupported rather than
+            # failing the whole column.
+            from packets.core.inetpkt import GRE as PktGRE
+
+            def _packets_gre():
+                n = 0
+                for raw in GRE_FRAMES:
+                    frame = Ethernet(raw)
+                    if isinstance(frame.get_layer('GRE'), PktGRE):
+                        n += 1
+                return n
+
+            bench_gre_op(PACKETS_LABEL, 'gre', _packets_gre,
+                         _l7_probe(_packets_gre))
+        except ImportError as e:
+            gre_unsupported(PACKETS_LABEL,
+                            'this packets build has no GRE decoder (%s)' % e)
+        except Exception as e:
+            section_failed(PACKETS_LABEL, e)
+
+    # --------------------------------------------------------------- libpcap
+    if enabled('libpcap'):
+        gre_unsupported("libpcap dispatch",
+                        'libpcap dispatch is a C frame counter, not a GRE '
+                        'decoder')
+
+    # -------------------------------------------------------------- impacket
+    if enabled('impacket'):
+        gre_unsupported("impacket 0.13.1",
+                        'impacket has no native pcap reader and no GRE '
+                        'decoder')
+
+    # ------------------------------------------------------------------ dpkt
+    if enabled('dpkt'):
+        try:
+            import dpkt
+            import dpkt.gre
+
+            def _dpkt_gre():
+                n = 0
+                for raw in GRE_FRAMES:
+                    try:
+                        l3 = dpkt.ethernet.Ethernet(raw).data
+                        if isinstance(l3.data, dpkt.gre.GRE):
+                            n += 1
+                    except Exception:
+                        # A frame dpkt cannot walk is simply not counted; the
+                        # never-raise loop keeps the timing over the rest.
+                        pass
+                return n
+
+            bench_gre_op("dpkt 1.9.8", 'gre', _dpkt_gre, _l7_probe(_dpkt_gre))
+        except Exception as e:
+            section_failed("dpkt 1.9.8", e)
+
+    # ----------------------------------------------------------------- scapy
+    if enabled('scapy'):
+        try:
+            from scapy.all import Ether as GreEther, GRE as ScGRE
+            from scapy.config import conf as gre_conf
+
+            gre_conf.verb = 0
+
+            def _scapy_gre():
+                n = 0
+                for raw in GRE_FRAMES:
+                    try:
+                        if ScGRE in GreEther(raw):
+                            n += 1
+                    except Exception:
+                        pass
+                return n
+
+            bench_gre_op("scapy 2.5.0", 'gre', _scapy_gre,
+                         _l7_probe(_scapy_gre))
         except Exception as e:
             section_failed("scapy 2.5.0", e)
 

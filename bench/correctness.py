@@ -18,7 +18,16 @@ import json
 import hashlib
 from array import array
 
-from packets.core.inetpkt import IP_CONST, Ethernet, ARP, IP, UDP, TCP, NullPkt
+from packets.core.inetpkt import IP_CONST, Ethernet, ARP, IP, IP6, UDP, TCP, \
+    NullPkt
+try:
+    # GRE ships only in builds that carry the routing codecs. Importing it
+    # optionally lets this harness run unchanged against a pre-GRE baseline
+    # (regression.py measures both builds with this one current harness), where
+    # the GRE golden records are simply absent from the emitted JSON.
+    from packets.core.inetpkt import GRE
+except ImportError:
+    GRE = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_AAAA, DNSTYPE_CNAME, DNSTYPE_NS, DNSTYPE_PTR, \
     DNSTYPE_SOA, DNSTYPE_TXT, RCLASS_IN
@@ -112,6 +121,94 @@ def corpus():
     }
 
     out.update(dns_corpus())
+    if GRE is not None:
+        out.update(gre_corpus())
+    return out
+
+
+def _gre_inner():
+    """The inner IPv4/UDP packet the GRE round-trips carry."""
+    return IP(proto=C.PROTO_UDP, src='10.8.0.1', dst='10.8.0.2',
+              payload=UDP(sport=44000, dport=45000,
+                          payload=NullPkt(b'gre-correctness')))
+
+
+def _gre_eth_wrap(gre, v6=False):
+    """Wrap a GRE layer in an Ethernet/IPv4 (or IPv6) frame."""
+    eth = Ethernet(dst_mac='02:00:00:00:08:01', src_mac='02:00:00:00:08:02')
+    if v6:
+        eth.type = 0x86dd
+        eth.payload = IP6(next_header=C.PROTO_GRE,
+                          src='2001:db8:8::1', dst='2001:db8:8::2',
+                          payload=gre)
+    else:
+        eth.payload = IP(proto=C.PROTO_GRE, src='10.8.1.1', dst='10.8.1.2',
+                         payload=gre)
+    return eth
+
+
+def record_gre(name, eth, out):
+    """Serialize a GRE frame with checksum+update, reparse it, and capture the
+    GRE fields and inner layer the reader recovered plus the full wire hash.
+
+    GRE auto-dispatches from IP proto 47, so Ethernet(wire) walks the GRE
+    header and its payload without an l7_ports map. Optional fields report None
+    when their presence bit is clear, which is the behaviour the golden diff
+    locks down.
+    """
+    wire = eth.pkt2net({'csum': 1, 'update': 1})
+    copy = Ethernet(wire)
+    gre = copy.get_layer('GRE')
+    out[name] = {
+        'wire_len': len(wire),
+        'wire_sha1': hashlib.sha1(wire).hexdigest(),
+        'gre.proto': gre.get_field_val('gre.proto'),
+        'gre.checksum': gre.get_field_val('gre.checksum'),
+        'gre.key': gre.get_field_val('gre.key'),
+        'gre.key.vsid': gre.get_field_val('gre.key.vsid'),
+        'gre.key.flowid': gre.get_field_val('gre.key.flowid'),
+        'gre.sequence_number': gre.get_field_val('gre.sequence_number'),
+        'gre.ack_number': gre.get_field_val('gre.ack_number'),
+        'gre.flags.c': gre.get_field_val('gre.flags.c'),
+        'gre.flags.k': gre.get_field_val('gre.flags.k'),
+        'gre.flags.s': gre.get_field_val('gre.flags.s'),
+        'gre.version': gre.version,
+        'gre.malformed': gre.malformed,
+        'inner': gre.payload.pkt_name,
+    }
+
+
+def gre_corpus():
+    """GRE read/write coverage across every optional-word combination.
+
+    Each variant is serialized, reparsed and captured, so the golden diff sees
+    a change to the GRE header layout, the NVGRE key split, the enhanced-GRE
+    ack, or the inner-ethertype dispatch. All values are fixed, so the bytes
+    are byte-for-byte reproducible.
+    """
+    out = {}
+    record_gre('gre_plain', _gre_eth_wrap(GRE(payload=_gre_inner())), out)
+    record_gre('gre_key',
+               _gre_eth_wrap(GRE(key=0x11223344, payload=_gre_inner())), out)
+    record_gre('gre_seq',
+               _gre_eth_wrap(GRE(sequence_number=0x0000abcd,
+                                 payload=_gre_inner())), out)
+    record_gre('gre_cksum',
+               _gre_eth_wrap(GRE(checksum=0, payload=_gre_inner())), out)
+    # NVGRE / Transparent Ethernet Bridging: the key is a 24-bit VSID + 8-bit
+    # FlowID and the payload is a full inner Ethernet frame (TEB, 0x6558).
+    inner_eth = Ethernet(dst_mac='02:00:00:00:08:cc',
+                         src_mac='02:00:00:00:08:dd', payload=_gre_inner())
+    record_gre('gre_nvgre',
+               _gre_eth_wrap(GRE(vsid=0x123456, flowid=0x78,
+                                 payload=inner_eth)), out)
+    record_gre('gre6', _gre_eth_wrap(GRE(payload=_gre_inner()), v6=True), out)
+    # PPTP enhanced GRE (version 1): the acknowledgment number is present with
+    # the sequence number, and the protocol type is PPP (0x880b).
+    record_gre('gre_enhanced',
+               _gre_eth_wrap(GRE(version=1, sequence_number=0x1111,
+                                 ack_number=0x2222, proto=0x880b,
+                                 payload=NullPkt(b'ppp-payload'))), out)
     return out
 
 
