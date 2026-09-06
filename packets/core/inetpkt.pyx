@@ -942,8 +942,15 @@ cdef class PKT:
             self._l7_ports = kwargs['l7_ports']
         else:
             self._l7_ports = None
-        self._decode_context = kwargs.get('decode_context')
-        self._decode_exporter = kwargs.get('exporter')
+        # attribution is almost never supplied on the universal init path,
+        # and _decode_context/_decode_exporter are already None-initialised by
+        # Cython. Only pay for a lookup when the caller actually passes them,
+        # rather than two unconditional dict.get() per constructed layer.
+        if kwargs:
+            if 'decode_context' in kwargs:
+                self._decode_context = kwargs['decode_context']
+            if 'exporter' in kwargs:
+                self._decode_exporter = kwargs['exporter']
 
     property l7_ports:
         """Layer-7 registry, allocated on first public access when absent."""
@@ -9032,6 +9039,14 @@ cdef inline NullPkt _null_range(bytes owner, Py_ssize_t start,
     return raw
 
 
+# The L4 decoders pass their transport tag to _l7_range on every datagram.
+# Bind the two literals to module-level names so the exact same interned str
+# object is reused for every UDP/TCP layer instead of relying on the literal
+# cache, keeping the source-keyed exporter tuple byte-identical.
+cdef str _PROTO_UDP = 'udp'
+cdef str _PROTO_TCP = 'tcp'
+
+
 cdef inline PKT _l7_range(bytes owner, const unsigned char[:] mv,
                            Py_ssize_t start, Py_ssize_t end, dict l7_ports,
                            uint16_t sport, uint16_t dport,
@@ -9059,6 +9074,19 @@ cdef inline PKT _l7_range(bytes owner, const unsigned char[:] mv,
     if dispatcher is not None:
         if isinstance(exporter_source, tuple):
             exporter = exporter_source
+        elif type(exporter_source) is bytes:
+            # The IP source is threaded down as raw bytes and formatted into
+            # the exporter string only here, where a dispatching layer actually
+            # consumes it -- not eagerly per datagram in the IP decoder. The
+            # only producer of bytes here is that fallback (4 bytes => IPv4,
+            # 16 => IPv6), so the resulting exporter tuple is byte-for-byte what
+            # eagerly formatting pkt.src used to produce.
+            if len(<bytes>exporter_source) == 4:
+                exporter = (_fmt_ipv4(<bytes>exporter_source),
+                            sport, dport, transport)
+            else:
+                exporter = (_fmt_ipv6(<bytes>exporter_source),
+                            sport, dport, transport)
         else:
             exporter = (exporter_source, sport, dport, transport)
         return dispatcher(rd_bytes(mv, start, end),
@@ -9071,21 +9099,39 @@ cdef inline PKT _l7_range(bytes owner, const unsigned char[:] mv,
 cdef inline int _decode_udp(UDP pkt, bytes owner,
                             const unsigned char[:] mv, Py_ssize_t start,
                             Py_ssize_t end, dict l7_ports) except -1:
-    cdef Py_ssize_t body_end
+    cdef:
+        Py_ssize_t body_end
+        Py_ssize_t ulen
     _need_range(start, end, 8, 'UDP')
     pkt.sport = rd_u16(mv, start)
     pkt.dport = rd_u16(mv, start + 2)
-    pkt.ulen = rd_u16(mv, start + 4)
+    ulen = rd_u16(mv, start + 4)
+    pkt.ulen = ulen
     pkt.checksum = rd_u16(mv, start + 6)
     # ulen counts the header and the data behind it, so it is what says where
     # the datagram stops. Anything past it belongs to the frame, not to this
     # layer, and must not reach the layer 7 parser.
-    body_end = _declared_end(start, end, pkt.ulen, 8, 'UDP')
-    if body_end < end:
+    #
+    # This was a call to _declared_end(); inlining it drops that `except -1`
+    # helper call per datagram and short-circuits the common, unpadded case --
+    # where ulen accounts for every remaining byte -- to a single compare that
+    # leaves body_end == end and skips the trailer split entirely. Behavior is
+    # identical to _declared_end: ulen == 0 means "unstated" (parse to end); a
+    # ulen that cannot cover its own 8-byte header is malformed; a declared end
+    # short of `end` marks the frame trailer/padding that must stay out of L7.
+    body_end = start + ulen
+    if ulen <= 0:
+        body_end = end
+    elif ulen < 8:
+        raise ValueError('UDP: length field says %d bytes, less than the 8 '
+                         'byte header it has to cover' % ulen)
+    elif body_end < end:
         pkt._trailer = rd_bytes(mv, body_end, end)
+    else:
+        body_end = end
     pkt.payload = _l7_range(owner, mv, start + 8, body_end, l7_ports,
                             pkt.sport, pkt.dport, pkt._decode_context,
-                            pkt._decode_exporter, 'udp')
+                            pkt._decode_exporter, _PROTO_UDP)
     return 0
 
 
@@ -9128,7 +9174,7 @@ cdef inline int _decode_tcp(TCP pkt, bytes owner,
             pkt._options = b''
         pkt.payload = _l7_range(owner, mv, header_end, end, l7_ports,
                                 pkt.sport, pkt.dport, pkt._decode_context,
-                                pkt._decode_exporter, 'tcp')
+                                pkt._decode_exporter, _PROTO_TCP)
         return 0
 
     if length != TCP_QUOTE_LEN:
@@ -9216,9 +9262,13 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         udp = UDP.__new__(UDP)
         udp._l7_ports = l7_ports
         udp._decode_context = pkt._decode_context
+        # Propagate an explicit exporter as-is; otherwise thread the raw IP
+        # source bytes (cheap, already parsed) rather than formatting pkt.src to
+        # a string on every datagram. _l7_range formats it into the exporter
+        # only if a dispatching layer actually consumes it.
         udp._decode_exporter = (pkt._decode_exporter
                                 if pkt._decode_exporter is not None
-                                else pkt.src)
+                                else pkt._src)
         udp.pkt_name = 'UDP'
         udp.pq_type, udp.query_fields = _QI_UDP
         _decode_udp(udp, owner, mv, payload_start, end, l7_ports)
@@ -9227,9 +9277,10 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         tcp = TCP.__new__(TCP)
         tcp._l7_ports = l7_ports
         tcp._decode_context = pkt._decode_context
+        # See the UDP branch -- raw source bytes, formatted lazily.
         tcp._decode_exporter = (pkt._decode_exporter
                                 if pkt._decode_exporter is not None
-                                else pkt.src)
+                                else pkt._src)
         tcp.pkt_name = 'TCP'
         tcp.pq_type, tcp.query_fields = _QI_TCP
         _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, {})
@@ -9380,9 +9431,10 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
         udp = UDP.__new__(UDP)
         udp._l7_ports = l7_ports
         udp._decode_context = pkt._decode_context
+        # Propagate an explicit exporter as-is. Same as IPv4
         udp._decode_exporter = (pkt._decode_exporter
                                 if pkt._decode_exporter is not None
-                                else pkt.src)
+                                else pkt._src)
         udp.pkt_name = 'UDP'
         udp.pq_type, udp.query_fields = _QI_UDP
         _decode_udp(udp, owner, mv, payload_start, end, l7_ports)
@@ -9391,9 +9443,10 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
         tcp = TCP.__new__(TCP)
         tcp._l7_ports = l7_ports
         tcp._decode_context = pkt._decode_context
+        # See the UDP branch -- raw source bytes, formatted lazily.
         tcp._decode_exporter = (pkt._decode_exporter
                                 if pkt._decode_exporter is not None
-                                else pkt.src)
+                                else pkt._src)
         tcp.pkt_name = 'TCP'
         tcp.pq_type, tcp.query_fields = _QI_TCP
         _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, {})
