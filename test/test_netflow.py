@@ -50,7 +50,7 @@ class TestNetflow(unittest.TestCase):
         self.assertEqual(packet.records[0].dst_port, 443)
         self.assertEqual(packet.records[0].protocol, 6)
         self.assertEqual(packet.records[0].reserved, 0x50607080)
-        self.assertIsNone(packet.get_field_val('netflow.sequence'))
+        self.assertIsNone(packet.get_field_val('cflow.sequence'))
         self.assertEqual(packet.pkt2net({}), wire)
 
         model = Netflow(
@@ -81,7 +81,7 @@ class TestNetflow(unittest.TestCase):
         self.assertIsInstance(packet.records[0], NetflowV5Record)
         self.assertEqual(packet.header.sequence, 77)
         self.assertEqual(packet.records[0].src_addr, '10.0.0.1')
-        self.assertEqual(packet.get_field_val('netflow.sequence'), 77)
+        self.assertEqual(packet.get_field_val('cflow.sequence'), 77)
         self.assertEqual(packet.pkt2net({}), wire)
 
         model = Netflow(
@@ -152,7 +152,7 @@ class TestNetflow(unittest.TestCase):
                                  payload=b'opaque')
         self.assertEqual(legacy.pkt2net({}), wire)
         self.assertEqual(protocol.pkt2net({}), wire)
-        self.assertEqual(protocol.get_field_val('netflow.unix_secs'), 200)
+        self.assertEqual(protocol.get_field_val('cflow.unix_secs'), 200)
         self.assertEqual(NetflowSimple.query_info()[0], 2005)
         self.assertEqual(NetflowSimple.default_ports(), [2005, 2055])
 
@@ -716,7 +716,7 @@ class TestNetflow(unittest.TestCase):
 
             query = PcapQuery(
                 filename=filename,
-                wshark_fields=['netflow.version', 'netflow.sequence'],
+                wshark_fields=['cflow.version', 'cflow.sequence'],
                 pkt_classes=[Netflow], l7_ports={2055: Netflow},
                 decode_context=context)
             self.assertIs(query.decode_context, context)

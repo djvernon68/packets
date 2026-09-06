@@ -59,13 +59,13 @@ class TestDNSPurePy(unittest.TestCase):
         self.assertEqual(pq_type, 53)
         self.assertIsInstance(fields, tuple)
         self.assertIsInstance(fields[0], str)
-        self.assertIn('dns.resp_code', fields)
-        self.assertNotIn(b'dns.resp_code', fields)
+        self.assertIn('dns.flags.rcode', fields)
+        self.assertNotIn(b'dns.flags.rcode', fields)
 
     def test_get_field_val(self):
         pkt = DNS(ident=0xabcd, resp_code=3)
-        self.assertEqual(pkt.get_field_val('dns.ident'), 0xabcd)
-        self.assertEqual(pkt.get_field_val('dns.resp_code'), 3)
+        self.assertEqual(pkt.get_field_val('dns.id'), 0xabcd)
+        self.assertEqual(pkt.get_field_val('dns.flags.rcode'), 3)
 
     def test_pkt2net_roundtrip(self):
         pkt = DNS(ident=0x5678, query_resp=1)

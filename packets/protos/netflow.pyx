@@ -2149,9 +2149,9 @@ cdef class Netflow(PKT):
     @classmethod
     def query_info(cls):
         return (NETFLOW_PACKET_TYPE,
-                ('netflow.version', 'netflow.count', 'netflow.sequence',
-                 'netflow.source_id', 'netflow.sys_uptime',
-                 'netflow.unix_secs'))
+                ('cflow.version', 'cflow.count', 'cflow.sequence',
+                 'cflow.source_id', 'cflow.sysuptime',
+                 'cflow.unix_secs'))
 
     @classmethod
     def default_ports(cls):
@@ -2169,19 +2169,19 @@ cdef class Netflow(PKT):
         return [NETFLOW_PACKET_PORT]
 
     cpdef object get_field_val(self, str field):
-        if field == 'netflow.version':
+        if field == 'cflow.version':
             return self.version
         if self.header is None:
             return None
-        if field == 'netflow.count':
+        if field == 'cflow.count':
             return getattr(self.header, 'count', None)
-        elif field == 'netflow.sequence':
+        elif field == 'cflow.sequence':
             return getattr(self.header, 'sequence', None)
-        elif field == 'netflow.source_id':
+        elif field == 'cflow.source_id':
             return getattr(self.header, 'source_id', None)
-        elif field == 'netflow.sys_uptime':
+        elif field == 'cflow.sysuptime':
             return getattr(self.header, 'sys_uptime', None)
-        elif field == 'netflow.unix_secs':
+        elif field == 'cflow.unix_secs':
             return getattr(self.header, 'unix_secs', None)
         return None
 

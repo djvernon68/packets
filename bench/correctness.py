@@ -199,9 +199,9 @@ def record_gre(name, eth, out):
         'gre.key.flowid': gre.get_field_val('gre.key.flowid'),
         'gre.sequence_number': gre.get_field_val('gre.sequence_number'),
         'gre.ack_number': gre.get_field_val('gre.ack_number'),
-        'gre.flags.c': gre.get_field_val('gre.flags.c'),
-        'gre.flags.k': gre.get_field_val('gre.flags.k'),
-        'gre.flags.s': gre.get_field_val('gre.flags.s'),
+        'gre.flags.checksum': gre.get_field_val('gre.flags.checksum'),
+        'gre.flags.key': gre.get_field_val('gre.flags.key'),
+        'gre.flags.sequence_number': gre.get_field_val('gre.flags.sequence_number'),
         'gre.version': gre.version,
         'gre.malformed': gre.malformed,
         'inner': gre.payload.pkt_name,
@@ -315,7 +315,7 @@ def record_ospf(name, eth, pq_type, out):
         'ospf.malformed': o.malformed,
     }
     if o.lsas:
-        rec['lsa0.type'] = o.lsas[0].get_field_val('ospf.lsa.type') \
+        rec['lsa0.type'] = o.lsas[0].get_field_val('ospf.lsa') \
             if pq_type == C.PQ_OSPF \
             else o.lsas[0].get_field_val('ospf.v3.lsa.type')
         rec['lsa0.id'] = o.lsas[0].get_field_val('ospf.lsa.id')
@@ -643,7 +643,7 @@ def dns_corpus():
             'wire_len': len(wire),
             'wire_sha1': hashlib.sha1(wire).hexdigest(),
             'udp.checksum': copy.get_layer('UDP').checksum,
-            'dns.ident': back.ident,
+            'dns.id': back.ident,
             'dns.answers': [(r.domain_name, r.res_type, r.res_len, r.res_data)
                             for r in back.answers],
             'dns.authority': [(r.domain_name, r.res_type, r.res_len,

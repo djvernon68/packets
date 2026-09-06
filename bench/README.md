@@ -116,7 +116,8 @@ not proving a win. The remaining routing protocols now all ship. OSPFv2/v3,
 BGP and RIP/RIPng/HSRP are exercised by the `correctness.py` golden corpus
 (`ospf2_hello`, `ospf2_lsupdate`, `ospf3_hello`, `bgp_open`, `bgp_update`,
 `rip_response`, `ripng_response`, `hsrp_v1_hello`, `hsrp_v2_group_state`) and by
-the `microbench.py` `parse_ospf`, `parse_bgp` and `parse_rip` rows; cross-library
+the `microbench.py` `parse_ospf`, `parse_bgp`, `parse_rip`, `parse_ripng` and
+`parse_hsrp` rows; cross-library
 `--ospf-pcap`, `--bgp-pcap` and `--rip-pcap` comparisons can be added here later
 the same way GRE's was.
 

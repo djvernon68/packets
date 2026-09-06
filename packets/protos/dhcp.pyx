@@ -346,10 +346,10 @@ cdef class DHCP(PKT):
         # bytes remain available on the object but are outside pcap-query's
         # fixed-field model.
         return (DHCP_PACKET_TYPE,
-                ('dhcp.op', 'dhcp.htype', 'dhcp.hlen', 'dhcp.hops',
-                 'dhcp.xid', 'dhcp.secs', 'dhcp.flags', 'dhcp.ciaddr',
-                 'dhcp.yiaddr', 'dhcp.siaddr', 'dhcp.giaddr',
-                 'dhcp.message_type'))
+                ('dhcp.type', 'dhcp.hw.type', 'dhcp.hw.len', 'dhcp.hops',
+                 'dhcp.id', 'dhcp.secs', 'dhcp.flags', 'dhcp.ip.client',
+                 'dhcp.ip.your', 'dhcp.ip.server', 'dhcp.ip.relay',
+                 'dhcp.option.dhcp'))
 
     @classmethod
     def default_ports(cls):
@@ -358,29 +358,29 @@ cdef class DHCP(PKT):
         return [DHCP_SERVER_PORT, DHCP_CLIENT_PORT]
 
     cpdef object get_field_val(self, str field):
-        if field == 'dhcp.op':
+        if field == 'dhcp.type':
             return self.op
-        elif field == 'dhcp.htype':
+        elif field == 'dhcp.hw.type':
             return self.htype
-        elif field == 'dhcp.hlen':
+        elif field == 'dhcp.hw.len':
             return self.hlen
         elif field == 'dhcp.hops':
             return self.hops
-        elif field == 'dhcp.xid':
+        elif field == 'dhcp.id':
             return self.xid
         elif field == 'dhcp.secs':
             return self.secs
         elif field == 'dhcp.flags':
             return self.flags
-        elif field == 'dhcp.ciaddr':
+        elif field == 'dhcp.ip.client':
             return self.ciaddr
-        elif field == 'dhcp.yiaddr':
+        elif field == 'dhcp.ip.your':
             return self.yiaddr
-        elif field == 'dhcp.siaddr':
+        elif field == 'dhcp.ip.server':
             return self.siaddr
-        elif field == 'dhcp.giaddr':
+        elif field == 'dhcp.ip.relay':
             return self.giaddr
-        elif field == 'dhcp.message_type':
+        elif field == 'dhcp.option.dhcp':
             return self.message_type
         return None
 
@@ -601,24 +601,24 @@ cdef class DHCP6(PKT):
         # stable neutral values (zero or ::), keeping every advertised query
         # field resolvable without protocol-shape special cases.
         return (DHCP6_PACKET_TYPE,
-                ('dhcp6.msg_type', 'dhcp6.transaction_id',
-                 'dhcp6.hop_count', 'dhcp6.link_address',
-                 'dhcp6.peer_address'))
+                ('dhcpv6.msgtype', 'dhcpv6.xid',
+                 'dhcpv6.hopcount', 'dhcpv6.linkaddr',
+                 'dhcpv6.peeraddr'))
 
     @classmethod
     def default_ports(cls):
         return [DHCP6_SERVER_PORT, DHCP6_CLIENT_PORT]
 
     cpdef object get_field_val(self, str field):
-        if field == 'dhcp6.msg_type':
+        if field == 'dhcpv6.msgtype':
             return self.msg_type
-        elif field == 'dhcp6.transaction_id':
+        elif field == 'dhcpv6.xid':
             return self.transaction_id
-        elif field == 'dhcp6.hop_count':
+        elif field == 'dhcpv6.hopcount':
             return self.hop_count
-        elif field == 'dhcp6.link_address':
+        elif field == 'dhcpv6.linkaddr':
             return self.link_address
-        elif field == 'dhcp6.peer_address':
+        elif field == 'dhcpv6.peeraddr':
             return self.peer_address
         return None
 

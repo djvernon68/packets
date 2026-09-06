@@ -229,7 +229,7 @@ class TestNetflowGenerator(unittest.TestCase):
             # Query with PcapQuery
             query = PcapQuery(
                 filename=filename,
-                wshark_fields=['netflow.version', 'netflow.sequence'],
+                wshark_fields=['cflow.version', 'cflow.sequence'],
                 pkt_classes=[Netflow],
                 l7_ports={2055: Netflow},
                 decode_context=ctx,

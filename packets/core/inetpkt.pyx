@@ -1648,8 +1648,8 @@ cdef class NetflowSimple(PKT):
             field names.
         """
         return (PQ_NETFLOW_SIMPLE,
-                ('netflow.version', 'netflow.count', 'netflow.sys_uptime',
-                 'netflow.unix_secs', 'netflow.unix_nano_seconds'))
+                ('cflow.version', 'cflow.count', 'cflow.sysuptime',
+                 'cflow.unix_secs', 'cflow.unix_nsecs'))
 
     @classmethod
     def default_ports(cls):
@@ -1682,15 +1682,15 @@ cdef class NetflowSimple(PKT):
         Returns:
             :object: the value of the field.
         """
-        if field == 'netflow.version':
+        if field == 'cflow.version':
             return self.version
-        elif field == 'netflow.count':
+        elif field == 'cflow.count':
             return self.count
-        elif field == 'netflow.sys_uptime':
+        elif field == 'cflow.sysuptime':
             return self.sys_uptime
-        elif field == 'netflow.unix_secs':
+        elif field == 'cflow.unix_secs':
             return self.unix_secs
-        elif field == 'netflow.unix_nano_seconds':
+        elif field == 'cflow.unix_nsecs':
             return self.unix_nano_seconds
         else:
             return None
@@ -2857,11 +2857,11 @@ cdef class IGMPGroupRecord(PKT):
             field names.
         """
         return (PQ_IGMPv3GroupRecord,
-                ('igmpv3grouprecord.type', 'igmpv3grouprecord.aux_data_len',
-                 'igmpv3grouprecord.num_src',
-                 'igmpv3grouprecord.group_address',
-                 'igmpv3grouprecord.source_addresses',
-                 'igmpv3grouprecord.aux_data'))
+                ('igmp.record_type', 'igmp.aux_data_len',
+                 'igmp.num_src',
+                 'igmp.maddr',
+                 'igmp.saddr',
+                 'igmp.aux_data'))
 
     cpdef object get_field_val(self, str field):
         """Returns the value of the Wireshark format field name. Implemented as 
@@ -2875,17 +2875,17 @@ cdef class IGMPGroupRecord(PKT):
         Returns:
             :object: the value of the field.
         """
-        if field == 'igmpv3grouprecord.type':
+        if field == 'igmp.record_type':
             return self.type
-        elif field == 'igmpv3grouprecord.aux_data_len':
+        elif field == 'igmp.aux_data_len':
             return self.aux_data_len
-        elif field == 'igmpv3grouprecord.num_src':
+        elif field == 'igmp.num_src':
             return self.num_src
-        elif field == 'igmpv3grouprecord.group_address':
+        elif field == 'igmp.maddr':
             return self.group_address
-        elif field == 'igmpv3grouprecord.source_addresses':
+        elif field == 'igmp.saddr':
             return self.source_addresses
-        elif field == 'igmpv3grouprecord.aux_data':
+        elif field == 'igmp.aux_data':
             return self.aux_data
         else:
             return None
@@ -4255,7 +4255,7 @@ cdef class ICMP6Opt(PKT):
                  'icmpv6.opt.prefix.flag.a',
                  'icmpv6.opt.prefix.valid_lifetime',
                  'icmpv6.opt.prefix.preferred_lifetime',
-                 'icmpv6.opt.prefix.prefix'))
+                 'icmpv6.opt.prefix'))
 
     cpdef object get_field_val(self, str field):
         """Returns the value of the Wireshark format field name."""
@@ -4277,7 +4277,7 @@ cdef class ICMP6Opt(PKT):
             return self.valid_lifetime
         elif field == 'icmpv6.opt.prefix.preferred_lifetime':
             return self.preferred_lifetime
-        elif field == 'icmpv6.opt.prefix.prefix':
+        elif field == 'icmpv6.opt.prefix':
             return self.prefix
         else:
             return None
@@ -4808,10 +4808,10 @@ cdef class ICMP6(PKT):
                  'icmpv6.nd.ns.target_address', 'icmpv6.nd.na.target_address',
                  'icmpv6.nd.na.flag.r', 'icmpv6.nd.na.flag.s',
                  'icmpv6.nd.na.flag.o', 'icmpv6.nd.rd.target_address',
-                 'icmpv6.nd.rd.destination_address',
+                 'icmpv6.rd.na.destination_address',
                  'icmpv6.mld.maximum_response_delay',
                  'icmpv6.mld.multicast_address', 'icmpv6.mld.flag.s',
-                 'icmpv6.mld.qrv', 'icmpv6.mld.qqic',
+                 'icmpv6.mld.flag.qrv', 'icmpv6.mld.qqi',
                  'icmpv6.mld.nb_sources', 'icmpv6.mld.source_address',
                  'icmpv6.mldr.nb_mcast_records'))
 
@@ -4879,7 +4879,7 @@ cdef class ICMP6(PKT):
             if self.type == ICMP6_ND_REDIRECT:
                 return self.target_address
             return None
-        elif field == 'icmpv6.nd.rd.destination_address':
+        elif field == 'icmpv6.rd.na.destination_address':
             if self.type == ICMP6_ND_REDIRECT:
                 return self.dest_address
             return None
@@ -4889,9 +4889,9 @@ cdef class ICMP6(PKT):
             return self.multicast_address
         elif field == 'icmpv6.mld.flag.s':
             return self.s_flag
-        elif field == 'icmpv6.mld.qrv':
+        elif field == 'icmpv6.mld.flag.qrv':
             return self.qrv
-        elif field == 'icmpv6.mld.qqic':
+        elif field == 'icmpv6.mld.qqi':
             return self.qqic
         elif field == 'icmpv6.mld.nb_sources':
             return self.num_src
@@ -5301,47 +5301,34 @@ cdef class MPLS(PKT):
             :tuple: PQTYPES.t_mpls and a tuple of the supported field names.
         """
         return (PQ_MPLS,
-                ('mpls.bottom.label', 'mpls.bottom.tc',
-                 'mpls.bottom.stack_bit', 'mpls.bottom.ttl',
-                 'mpls.top.label', 'mpls.top.tc',
-                 'mpls.top.stack_bit', 'mpls.top.ttl'))
+                ('mpls.label', 'mpls.exp', 'mpls.bottom', 'mpls.ttl'))
 
     cpdef get_field_val(self, str field):
         """Returns the value of the Wireshark format field name. Implemented as 
         an if, elif, else set because Cython documentation shows that this 
-        form is turned that into an efficient case switch. This function is
-        different from other protocols in that it detects if this is or is not
-        the botton of stack MPLS label.
+        form is turned that into an efficient case switch.
+
+        Each MPLS label in a stack is its own layer, so this returns this
+        label's own values -- exactly like Wireshark, which repeats the
+        mpls.label / mpls.exp / mpls.bottom / mpls.ttl fields once per label
+        (the Nth label is selected via the query engine's layer instance).
+        Anything else is delegated down the stack to the payload.
 
         Args:
-            :field (bytes): name of the desired field in Wireshark format. For 
-                example: arp.proto.type or tcp.flags.urg
+            :field (str): name of the desired field in Wireshark format. For 
+                example: mpls.label or mpls.ttl
 
         Returns: 
             :object: value of the field.
         """
-        if field.find('.bottom.') >= 0 and self.s:
-            if field == 'mpls.bottom.label':
-                return self.label
-            elif field == 'mpls.bottom.tc':
-                return self.tc
-            elif field == 'mpls.bottom.stack_bit':
-                return self.s
-            elif field == 'mpls.bottom.ttl':
-                return self.ttl
-            else:
-                return None
-        elif field.find('.top.') >= 0 and not self.s:
-            if field == 'mpls.top.label':
-                return self.label
-            elif field == 'mpls.top.tc':
-                return self.tc
-            elif field == 'mpls.top.stack_bit':
-                return self.s
-            elif field == 'mpls.top.ttl':
-                return self.ttl
-            else:
-                return None
+        if field == 'mpls.label':
+            return self.label
+        elif field == 'mpls.exp':
+            return self.tc
+        elif field == 'mpls.bottom':
+            return self.s
+        elif field == 'mpls.ttl':
+            return self.ttl
         else:
             return self.payload.get_field_val(field)
 
@@ -5651,7 +5638,7 @@ cdef class GRE(PKT):
                 ('gre.proto', 'gre.checksum', 'gre.key',
                  'gre.key.vsid', 'gre.key.flowid',
                  'gre.sequence_number', 'gre.ack_number',
-                 'gre.flags.k', 'gre.flags.s', 'gre.flags.c'))
+                 'gre.flags.key', 'gre.flags.sequence_number', 'gre.flags.checksum'))
 
     cpdef object get_field_val(self, str field):
         """Return the value of a Wireshark-format field name.
@@ -5677,11 +5664,11 @@ cdef class GRE(PKT):
             if (self._flags & 0x0007) == 1 and (self._flags & 0x0080):
                 return self.ack
             return None
-        elif field == 'gre.flags.k':
+        elif field == 'gre.flags.key':
             return 1 if (self._flags & 0x2000) else 0
-        elif field == 'gre.flags.s':
+        elif field == 'gre.flags.sequence_number':
             return 1 if (self._flags & 0x1000) else 0
-        elif field == 'gre.flags.c':
+        elif field == 'gre.flags.checksum':
             return 1 if (self._flags & 0x8000) else 0
         elif isinstance(self.payload, PKT):
             return self.payload.get_field_val(field)
@@ -6030,7 +6017,7 @@ cdef class OSPFLSA(PKT):
             return self.ls_age
         elif field == 'ospf.lsa.do_not_age' or field == 'ospf.lsa.donotage':
             return 1 if (self.ls_age & 0x8000) else 0
-        elif field == 'ospf.lsa.type' or field == 'ospf.v3.lsa.type':
+        elif field == 'ospf.lsa' or field == 'ospf.v3.lsa.type':
             if self._v3:
                 return _ospf_vs(_OSPF_V3_LS_TYPE_VALS,
                                 self.ls_type & 0x1fff)
@@ -6105,7 +6092,7 @@ cdef dict _ospf_v2_lsa_body(unsigned char ls_type, const unsigned char[:] mv,
                 attached.append(_fmt_ipv4_buf(&mv[o]))
                 o += 4
             if attached:
-                f['ospf.lsa.network.attachrtr'] = attached[0]
+                f['ospf.lsa.network.attchrtr'] = attached[0]
                 f['ospf.lsa.network.attached_routers'] = attached
     elif ls_type == 3 or ls_type == 4:
         # Summary-LSA / ASBR-Summary: netmask, then TOS/metric triples.
@@ -6288,13 +6275,13 @@ cdef class OSPFv2(PKT):
                  'ospf.hello.active_neighbor',
                  'ospf.db.interface_mtu', 'ospf.db.dd_sequence',
                  'ospf.dbd.ms', 'ospf.dbd.m', 'ospf.dbd.i',
-                 'ospf.lsa.age', 'ospf.lsa.type', 'ospf.lsa.id',
+                 'ospf.lsa.age', 'ospf.lsa', 'ospf.lsa.id',
                  'ospf.link_state_id',
                  'ospf.advrouter', 'ospf.lsa.seqnum', 'ospf.lsa.chksum',
                  'ospf.lsa.length', 'ospf.lsa.number_of_links',
                  'ospf.lsa.router.linktype', 'ospf.lsa.router.linkid',
                  'ospf.lsa.router.linkdata', 'ospf.lsa.router.metric0',
-                 'ospf.lsa.network.netmask', 'ospf.lsa.network.attachrtr',
+                 'ospf.lsa.network.netmask', 'ospf.lsa.network.attchrtr',
                  'ospf.lsa.asext.netmask', 'ospf.lsa.asext.type',
                  'ospf.lsa.asext.fwdaddr', 'ospf.lsa.asext.extrttag'))
 
@@ -6332,8 +6319,8 @@ cdef class OSPFv2(PKT):
             return self.body.get(field) if self.type == 1 else None
         elif field.startswith('ospf.db.') or field.startswith('ospf.dbd.'):
             return self.body.get(field) if self.type == 2 else None
-        elif (field.startswith('ospf.lsa.') or field == 'ospf.advrouter' or
-              field == 'ospf.link_state_id'):
+        elif (field.startswith('ospf.lsa.') or field == 'ospf.lsa' or
+              field == 'ospf.advrouter' or field == 'ospf.link_state_id'):
             for lsa in self.lsas:
                 v = lsa.get_field_val(field)
                 if v is not None:
@@ -6577,7 +6564,7 @@ cdef dict _ospf_v3_lsa_body(uint16_t ls_type, const unsigned char[:] mv,
     elif code == 3:
         # Inter-Area-Prefix-LSA: 0(1), metric(3), then prefix.
         if _have_range(o, bend, 4):
-            f['ospf.v3.lsa.metric'] = ((<uint32_t>mv[o + 1] << 16) |
+            f['ospf.metric'] = ((<uint32_t>mv[o + 1] << 16) |
                                        (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
     elif code == 4:
         # Inter-Area-Router-LSA: 0(1), options(3), 0(1), metric(3),
@@ -6585,14 +6572,14 @@ cdef dict _ospf_v3_lsa_body(uint16_t ls_type, const unsigned char[:] mv,
         if _have_range(o, bend, 12):
             f['ospf.v3.options'] = ((<uint32_t>mv[o + 1] << 16) |
                                     (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
-            f['ospf.v3.lsa.metric'] = ((<uint32_t>mv[o + 5] << 16) |
+            f['ospf.metric'] = ((<uint32_t>mv[o + 5] << 16) |
                                        (<uint32_t>mv[o + 6] << 8) | mv[o + 7])
             f['ospf.v3.lsa.destination_router_id'] = _fmt_ipv4_buf(&mv[o + 8])
     elif code == 5 or code == 7:
         # AS-External / NSSA: flags(1), metric(3).
         if _have_range(o, bend, 4):
             f['ospf.v3.as.external.flags'] = mv[o]
-            f['ospf.v3.lsa.metric'] = ((<uint32_t>mv[o + 1] << 16) |
+            f['ospf.metric'] = ((<uint32_t>mv[o + 1] << 16) |
                                        (<uint32_t>mv[o + 2] << 8) | mv[o + 3])
     elif code == 8:
         # Link-LSA: rtr-priority(1), options(3), link-local address(16),
@@ -6751,7 +6738,7 @@ cdef class OSPFv3(PKT):
                  'ospf.v3.lsa.type', 'ospf.lsa.id', 'ospf.link_state_id',
                  'ospf.advrouter',
                  'ospf.lsa.seqnum', 'ospf.lsa.chksum', 'ospf.lsa.length',
-                 'ospf.v3.options', 'ospf.v3.lsa.metric',
+                 'ospf.v3.options', 'ospf.metric',
                  'ospf.v3.lsa.attached_router', 'ospf.v3.lsa.num_prefixes',
                  'ospf.at.auth_type', 'ospf.at.auth_data_len',
                  'ospf.at.crypto_seq_nbr', 'ospf.at.sa_id'))
@@ -6785,7 +6772,8 @@ cdef class OSPFv3(PKT):
             # in a Hello or DB Description body).
             return self.body[field]
         elif (field.startswith('ospf.lsa.') or field.startswith('ospf.v3.') or
-              field == 'ospf.advrouter' or field == 'ospf.link_state_id'):
+              field == 'ospf.metric' or field == 'ospf.advrouter' or
+              field == 'ospf.link_state_id'):
             for lsa in self.lsas:
                 v = lsa.get_field_val(field)
                 if v is not None:
@@ -7259,7 +7247,7 @@ cdef class BGP(PKT):
         return (PQ_BGP,
                 ('bgp.type', 'bgp.length', 'bgp.marker',
                  'bgp.open.version', 'bgp.open.myas', 'bgp.open.holdtime',
-                 'bgp.open.identifier', 'bgp.open.opt_param_len',
+                 'bgp.open.identifier', 'bgp.open.opt.len',
                  'bgp.cap.type', 'bgp.cap.length',
                  'bgp.cap.mp.afi', 'bgp.cap.mp.safi',
                  'bgp.cap.ap.afi', 'bgp.cap.ap.safi',
@@ -7295,7 +7283,7 @@ cdef class BGP(PKT):
                  'bgp.large_communities',
                  'bgp.notify.major_error', 'bgp.notify.minor_error',
                  'bgp.route_refresh.afi', 'bgp.route_refresh.safi',
-                 'bgp.route_refresh.reserved'))
+                 'bgp.route_refresh.subtype'))
 
     cpdef object get_field_val(self, str field):
         """Return the value of a Wireshark-format field name, else None.
@@ -7614,7 +7602,7 @@ cdef void _decode_bgp_open(BGP pkt, const unsigned char[:] mv,
     pkt.body['bgp.open.holdtime'] = rd_u16(mv, o + 3)
     pkt.body['bgp.open.identifier'] = _fmt_ipv4_buf(&mv[o + 5])
     opt_len = mv[o + 9]
-    pkt.body['bgp.open.opt_param_len'] = opt_len
+    pkt.body['bgp.open.opt.len'] = opt_len
     o += 10
     pend = o + opt_len
     if pend > end:
@@ -7705,7 +7693,7 @@ cdef void _decode_bgp_route_refresh(BGP pkt, const unsigned char[:] mv,
     if _have_range(o, end, 4):
         pkt.body['bgp.route_refresh.afi'] = \
             _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, o))
-        pkt.body['bgp.route_refresh.reserved'] = mv[o + 2]
+        pkt.body['bgp.route_refresh.subtype'] = mv[o + 2]
         pkt.body['bgp.route_refresh.safi'] = \
             _bgp_vs(_BGP_SAFI_VALS, mv[o + 3])
 
@@ -9712,8 +9700,8 @@ cdef class Ethernet(PKT):
                 field names.
         """
         return (PQ_ETH,
-                ('eth.type', 'eth.src', 'eth.dst', 'eth.vlan.cfi',
-                 'eth.vlan.id', 'eth.vlan.pri', 'eth.vlan.tpid'))
+                ('eth.type', 'eth.src', 'eth.dst', 'vlan.cfi',
+                 'vlan.id', 'vlan.priority', 'eth.vlan.tpid'))
 
     cpdef object get_field_val(self, str field):
         """Returns the value of the Wireshark format field name. Implemented as 
@@ -9733,11 +9721,11 @@ cdef class Ethernet(PKT):
             return self.src_mac
         elif field == 'eth.dst':
             return self.dst_mac
-        elif field == 'eth.vlan.cfi':
+        elif field == 'vlan.cfi':
             return self.drop_eligible
-        elif field == 'eth.vlan.id':
+        elif field == 'vlan.id':
             return self.vlan_id
-        elif field == 'eth.vlan.pri':
+        elif field == 'vlan.priority':
             return self.priority_code
         elif field == 'eth.vlan.tpid':
             return self.tpid

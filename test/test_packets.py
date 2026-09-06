@@ -3094,7 +3094,7 @@ class TestPackets(unittest.TestCase):
         # The payload offset prefix match is the one case that still applies.
         self.assertTrue(q.fields_supported(['tcp.payload.offset[0:4]',
                                             'icmpv6.nd.rd.target_address',
-                                            'icmpv6.nd.rd.destination_address',
+                                            'icmpv6.rd.na.destination_address',
                                             'icmpv6.mld.maximum_response_delay',
                                             'ipv6.src', 'ipv6.dst']))
         self.assertFalse(q.fields_supported(['icmpv6.nd.rd.not_a_field']))

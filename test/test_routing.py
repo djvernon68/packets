@@ -8,13 +8,17 @@ that every later routing protocol inherits. Later stages extend this file.
 """
 
 import gc
+import os
 import struct
+import tempfile
 import unittest
 from array import array
 
 from packets.core.inetpkt import IP_CONST, GRE, IP, IP6, ICMP, ICMP6, \
     MPLS, Ethernet, NullPkt, OSPFv2, OSPFv3, OSPFLSA, TCP, UDP, BGP, \
     BGPParam, RIP, RIPng, HSRP, RtParam
+from packets.core.pcap import PCAPWriter
+from packets.query.pcap_query import PcapQuery
 
 C = IP_CONST()
 
@@ -198,7 +202,7 @@ class GREQueryTestCase(unittest.TestCase):
         self.assertIsNone(gre.get_field_val('gre.key.vsid'))
         self.assertIsNone(gre.get_field_val('gre.sequence_number'))
         self.assertIsNone(gre.get_field_val('gre.ack_number'))
-        self.assertEqual(gre.get_field_val('gre.flags.c'), 0)
+        self.assertEqual(gre.get_field_val('gre.flags.checksum'), 0)
 
 
 class GREMalformedTestCase(unittest.TestCase):
@@ -387,12 +391,12 @@ class OSPFv2LSATestCase(unittest.TestCase):
         self.assertEqual(o.type, 4)
         self.assertEqual(o.body.get('ospf.lsa.number_of_lsas'), 2)
         self.assertEqual(len(o.lsas), 2)
-        self.assertEqual(o.lsas[0].get_field_val('ospf.lsa.type'),
+        self.assertEqual(o.lsas[0].get_field_val('ospf.lsa'),
                          'Router-LSA')
         self.assertEqual(o.lsas[0].get_field_val('ospf.lsa.id'), '1.1.1.1')
         self.assertEqual(o.get_field_val('ospf.lsa.router.linktype'), 1)
         self.assertEqual(o.get_field_val('ospf.lsa.router.metric0'), 5)
-        self.assertEqual(o.lsas[1].get_field_val('ospf.lsa.type'),
+        self.assertEqual(o.lsas[1].get_field_val('ospf.lsa'),
                          'AS-External-LSA (ASBR)')
         self.assertEqual(o.get_field_val('ospf.lsa.asext.fwdaddr'), '9.9.9.9')
         self.assertEqual(o.get_field_val('ospf.lsa.asext.extrttag'), 100)
@@ -406,7 +410,7 @@ class OSPFv2LSATestCase(unittest.TestCase):
         raw = _ospf2_lsupdate(lsa)
         o = OSPFv2(raw)
         self.assertEqual(len(o.lsas), 1)
-        self.assertEqual(o.lsas[0].get_field_val('ospf.lsa.type'),
+        self.assertEqual(o.lsas[0].get_field_val('ospf.lsa'),
                          'Unknown (200)')
         self.assertEqual(o.pkt2net({}), raw)
 
@@ -552,7 +556,7 @@ class OSPFv2QueryTestCase(unittest.TestCase):
 
     def test_lsupdate_lsa_fields_resolve(self):
         o = OSPFv2(_ospf2_lsupdate(_router_lsa(), _asext_lsa()))
-        for f in ('ospf.lsa.age', 'ospf.lsa.type', 'ospf.lsa.id',
+        for f in ('ospf.lsa.age', 'ospf.lsa', 'ospf.lsa.id',
                   'ospf.advrouter', 'ospf.lsa.seqnum', 'ospf.lsa.chksum',
                   'ospf.lsa.length'):
             self.assertIsNotNone(o.get_field_val(f), f)
@@ -1381,6 +1385,110 @@ class HSRPContractTestCase(unittest.TestCase):
         h = IP(wire, l7_ports={HSRP_PORT: HSRP}).get_layer_by_type(C.PQ_HSRP)
         self.assertIsInstance(h, HSRP)
         self.assertEqual(h.get_field_val('hsrp.opcode'), 'Hello')
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: end-to-end pcap_query integration for every routing codec.
+# ---------------------------------------------------------------------------
+
+class RoutingPcapQueryIntegrationTestCase(unittest.TestCase):
+    """Drive every routing codec through the real PcapQuery engine.
+
+    Each protocol is written into one shared capture file and queried back
+    through PcapQuery exactly as an end user would: the codec is handed to the
+    engine via ``pkt_classes`` (which registers its Wireshark field names), and
+    for the L4-port protocols the port map is supplied via ``l7_ports`` (RIP,
+    RIPng and HSRP also advertise it through ``default_ports()``; BGP is mapped
+    explicitly). This proves the query-engine integration end to end, on top of
+    the per-codec decode tests above.
+
+    Routing codecs stay opt-in -- they are deliberately absent from the
+    engine's built-in ``default_classes`` list, matching the GRE/OSPF/BGP/RIP
+    precedent, so a caller enables them per query. OSPFv2 and OSPFv3 share the
+    ``ospf.*`` field namespace but map to different PQ types, so they are
+    queried through separate PcapQuery objects.
+    """
+
+    @staticmethod
+    def _eth(inner_l3):
+        return Ethernet(dst_mac='02:00:00:00:00:02',
+                        src_mac='02:00:00:00:00:01',
+                        payload=inner_l3).pkt2net({'update': 1, 'csum': 1})
+
+    def _frames(self):
+        gre = self._eth(IP(proto=C.PROTO_GRE, src='10.0.0.1', dst='10.0.0.2',
+                           payload=GRE(payload=_inner_ip())))
+        ospf2 = self._eth(IP(proto=OSPF_PROTO, src='10.0.0.1', dst='224.0.0.5',
+                             payload=OSPFv2(_ospf2_hello())))
+        ospf3 = self._eth(IP6(next_header=OSPF_PROTO, src='2001:db8::1',
+                              dst='ff02::5', payload=OSPFv3(_ospf3_hello())))
+        bgp = self._eth(IP(proto=C.PROTO_TCP, src='10.0.0.1', dst='10.0.0.2',
+                           payload=TCP(sport=50000, dport=BGP_PORT,
+                                       payload=_bgp_std_update())))
+        rip = self._eth(IP(proto=C.PQ_UDP, src='10.0.0.1', dst='224.0.0.9',
+                           payload=UDP(sport=RIP_PORT, dport=RIP_PORT,
+                                       payload=_rip(entries=_rip_route()))))
+        ripng = self._eth(IP6(next_header=C.PQ_UDP, src='2001:db8::1',
+                              dst='ff02::9',
+                              payload=UDP(sport=RIPNG_PORT, dport=RIPNG_PORT,
+                                          payload=_ripng(rtes=_ripng_rte()))))
+        hsrp = self._eth(IP(proto=C.PQ_UDP, src='10.0.0.1', dst='224.0.0.2',
+                            payload=UDP(sport=HSRP_PORT, dport=HSRP_PORT,
+                                        payload=_hsrpv1(opcode=0))))
+        return [gre, ospf2, ospf3, bgp, rip, ripng, hsrp]
+
+    def _write_pcap(self, frames):
+        fd, filename = tempfile.mkstemp(suffix='.pcap')
+        os.close(fd)
+        writer = PCAPWriter(filename=filename, snaplen=65535)
+        for i, fr in enumerate(frames):
+            writer.dump_pkt(fr, 1000 + i, 0)
+        writer.close()
+        return filename
+
+    def _query(self, filename, field, pkt_classes, l7_ports=None):
+        kwargs = dict(filename=filename, wshark_fields=[field],
+                      pkt_classes=pkt_classes)
+        if l7_ports is not None:
+            kwargs['l7_ports'] = l7_ports
+        return PcapQuery(**kwargs).query()
+
+    def test_all_routing_codecs_resolve_through_pcap_query(self):
+        filename = self._write_pcap(self._frames())
+        try:
+            # GRE and OSPF dispatch by IP protocol number, so no l7_ports.
+            self.assertEqual(self._query(filename, 'gre.proto', [GRE]),
+                             [(ETH_IPV4,)])
+            self.assertEqual(self._query(filename, 'ospf.srcrouter', [OSPFv2]),
+                             [('1.1.1.1',)])
+            self.assertEqual(self._query(filename, 'ospf.srcrouter', [OSPFv3]),
+                             [('1.1.1.1',)])
+            # BGP has no default_ports(); it is mapped explicitly.
+            self.assertEqual(self._query(filename, 'bgp.type', [BGP],
+                                         {BGP_PORT: BGP}),
+                             [('UPDATE Message',)])
+            # RIP/RIPng/HSRP self-register their UDP ports via default_ports().
+            self.assertEqual(self._query(filename, 'rip.command', [RIP]),
+                             [('Response',)])
+            self.assertEqual(self._query(filename, 'ripng.cmd', [RIPng]),
+                             [('Response',)])
+            self.assertEqual(self._query(filename, 'hsrp.opcode', [HSRP]),
+                             [('Hello',)])
+        finally:
+            if os.path.exists(filename):
+                os.unlink(filename)
+
+    def test_routing_codecs_absent_from_default_classes(self):
+        # Without opt-in, the routing field names are not known to the engine.
+        filename = self._write_pcap(self._frames())
+        try:
+            for field in ('gre.proto', 'ospf.srcrouter', 'bgp.type',
+                          'rip.command', 'ripng.cmd', 'hsrp.opcode'):
+                with self.assertRaises(ValueError):
+                    PcapQuery(filename=filename, wshark_fields=[field])
+        finally:
+            if os.path.exists(filename):
+                os.unlink(filename)
 
 
 if __name__ == '__main__':

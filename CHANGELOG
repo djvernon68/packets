@@ -1,6 +1,54 @@
 CHANGELOG
 ---------
 
+[2.2.0]
+ * **Cross-cutting Wireshark field-name audit: every query field name exposed
+   by `pcap_query` now matches Wireshark's display-filter abbreviation exactly.**
+   `pcap_query` is only useful if it shares one field-identifier "language" with
+   Wireshark, so every name a packet class exposes through `query_info()` /
+   `get_field_val()` was audited against the canonical abbreviation registered
+   by the matching `epan/dissectors/packet-*.c` dissector. Any pre-existing name
+   that did not match was treated as a bug and **hard-renamed with no deprecated
+   alias** - this is a BREAKING change: callers must update affected queries.
+   The full old->new mapping is checked in at `docs/wireshark_field_audit.rst`,
+   and a new `test/test_wireshark_field_names.py` asserts that every advertised
+   field is either a known Wireshark abbreviation or one of a small set of
+   documented `packets`-only extensions, so future protocols cannot drift.
+ * **Renamed to the Wireshark abbreviation (breaking).** DNS header/flags/counts
+   (`dns.ident`->`dns.id`, `dns.op_code`->`dns.flags.opcode`,
+   `dns.query_resp`->`dns.flags.response`, `dns.*_count`->`dns.count.*`, and the
+   remaining flag bits under `dns.flags.*`); DHCP (`dhcp.op`->`dhcp.type`,
+   `dhcp.htype`->`dhcp.hw.type`, `dhcp.hlen`->`dhcp.hw.len`, `dhcp.xid`->
+   `dhcp.id`, `dhcp.ciaddr`/`yiaddr`/`siaddr`/`giaddr`->`dhcp.ip.client`/`your`/
+   `server`/`relay`, `dhcp.message_type`->`dhcp.option.dhcp`); DHCPv6 (whole
+   `dhcp6.*` namespace corrected to `dhcpv6.*`: `dhcp6.msg_type`->
+   `dhcpv6.msgtype`, `dhcp6.transaction_id`->`dhcpv6.xid`, `dhcp6.hop_count`->
+   `dhcpv6.hopcount`, `dhcp6.link_address`->`dhcpv6.linkaddr`,
+   `dhcp6.peer_address`->`dhcpv6.peeraddr`); NetFlow/IPFIX (whole `netflow.*`
+   namespace corrected to Wireshark's `cflow.*`, e.g. `netflow.sys_uptime`->
+   `cflow.sysuptime`, `netflow.unix_nano_seconds`->`cflow.unix_nsecs`); the
+   IGMPv3 group record (`igmpv3grouprecord.*`->`igmp.record_type`/`igmp.maddr`/
+   `igmp.saddr`/`igmp.num_src`/`igmp.aux_data`/`igmp.aux_data_len`); MPLS (the
+   `mpls.top.*`/`mpls.bottom.*` split replaced by Wireshark's single repeated
+   `mpls.label`/`mpls.exp`/`mpls.bottom`/`mpls.ttl`, one set per label layer);
+   802.1Q VLAN (`eth.vlan.cfi`/`id`/`pri`->`vlan.cfi`/`vlan.id`/
+   `vlan.priority`); HTTP (`http.request.target`->`http.request.uri`,
+   `http.response.status`->`http.response.code`, `http.response.reason`->
+   `http.response.phrase`); ICMPv6 (`icmpv6.nd.rd.destination_address`->
+   `icmpv6.rd.na.destination_address`, `icmpv6.mld.qrv`->`icmpv6.mld.flag.qrv`,
+   `icmpv6.mld.qqic`->`icmpv6.mld.qqi`, `icmpv6.opt.prefix.prefix`->
+   `icmpv6.opt.prefix`); and in the routing codecs GRE (`gre.flags.k`/`s`/`c`->
+   `gre.flags.key`/`sequence_number`/`checksum`), OSPF (`ospf.lsa.type`->
+   `ospf.lsa`, `ospf.lsa.network.attachrtr`->`ospf.lsa.network.attchrtr`,
+   `ospf.v3.lsa.metric`->`ospf.metric`), and BGP (`bgp.open.opt_param_len`->
+   `bgp.open.opt.len`, `bgp.route_refresh.reserved`->`bgp.route_refresh.subtype`).
+ * **Retained as documented `packets`-only extensions** (data Wireshark does not
+   expose under a distinct display-filter name): the NVGRE `gre.key.vsid` /
+   `gre.key.flowid` breakouts, the `tcp.payload.offset[x:y]` /
+   `udp.payload.offset[x:y]` byte-slice accessors, the `igmp.obj.saddr` /
+   `igmp.obj.grecs` list accessors, `http.body_length`, and `eth.vlan.tpid`.
+   These are whitelisted by the drift test.
+
 [2.1.11]
  * **RIP, RIPng, and HSRP are decoded, queried, and re-serialized as
    first-class layers, carried over their well-known UDP ports.** UDP payloads

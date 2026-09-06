@@ -864,8 +864,8 @@ because PcapQuery calls ``default_ports()`` for you.
    >>> # To the above imports we add one more.
    >>> from packets.query.pcap_query import PcapQuery
    >>> fields = ['frame.time_epoch', 'ip.src', 'ip.dst', 'udp.srcport',
-   >>>           'udp.dstport', 'dns.query_count', 'dns.answer_count',
-   >>>           'dns.auth_count']
+   >>>           'udp.dstport', 'dns.count.queries', 'dns.count.answers',
+   >>>           'dns.count.auth_rr']
    >>> pq = PcapQuery(filename='dns.pcap',
    >>>                wshark_fields=fields,
    >>>                pkt_classes=[DNS])
@@ -962,33 +962,33 @@ Another change is the way get_field_val is declared:
         """
         ...
         """
-        if field == 'dns.ident':
+        if field == 'dns.id':
             return self.ident
-        elif field == 'dns.query_resp':
+        elif field == 'dns.flags.response':
             return self.query_resp
-        elif field == 'dns.op_code':
+        elif field == 'dns.flags.opcode':
             return self.op_code
-        elif field == 'dns.authoritative':
+        elif field == 'dns.flags.authoritative':
             return self.authoritative
-        elif field == 'dns.truncated':
+        elif field == 'dns.flags.truncated':
             return self.truncated
-        elif field == 'dns.recursion_requested':
+        elif field == 'dns.flags.recdesired':
             return self.recursion_requested
-        elif field == 'dns.recursion_available':
+        elif field == 'dns.flags.recavail':
             return self.recursion_available
-        elif field == 'dns.authentic_data':
+        elif field == 'dns.flags.authenticated':
             return self.authentic_data
-        elif field == 'dns.check_disabled':
+        elif field == 'dns.flags.checkdisable':
             return self.check_disabled
-        elif field == 'dns.resp_code':
+        elif field == 'dns.flags.rcode':
             return self.resp_code
-        elif field == 'dns.query_count':
+        elif field == 'dns.count.queries':
             return self.query_count
-        elif field == 'dns.answer_count':
+        elif field == 'dns.count.answers':
             return self.answer_count
-        elif field == 'dns.auth_count':
+        elif field == 'dns.count.auth_rr':
             return self.auth_count
-        elif field == 'dns.ad_count':
+        elif field == 'dns.count.add_rr':
             return self.ad_count
         else:
             return None

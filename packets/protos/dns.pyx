@@ -641,14 +641,14 @@ cdef class DNS(PKT):
         get_field_val(<field_name>) function as well.
         return: uint16_t pq_type, tuple_of_string query_fields"""
         return (DNS_PACKET_TYPE,
-                ('dns.ident', 'dns.query_resp', 'dns.op_code',
-                 'dns.authoritative',
-                 'dns.truncated', 'dns.recursion_requested',
-                 'dns.recursion_available',
-                 'dns.authentic_data', 'dns.check_disabled',
-                 'dns.resp_code',
-                 'dns.query_count', 'dns.answer_count', 'dns.auth_count',
-                 'dns.ad_count'))
+                ('dns.id', 'dns.flags.response', 'dns.flags.opcode',
+                 'dns.flags.authoritative',
+                 'dns.flags.truncated', 'dns.flags.recdesired',
+                 'dns.flags.recavail',
+                 'dns.flags.authenticated', 'dns.flags.checkdisable',
+                 'dns.flags.rcode',
+                 'dns.count.queries', 'dns.count.answers', 'dns.count.auth_rr',
+                 'dns.count.add_rr'))
 
 
     @classmethod
@@ -667,33 +667,33 @@ cdef class DNS(PKT):
             Returns:
                 :object: the value of the field in this packet.
         """
-        if field == 'dns.ident':
+        if field == 'dns.id':
             return self.ident
-        elif field == 'dns.query_resp':
+        elif field == 'dns.flags.response':
             return self.query_resp
-        elif field == 'dns.op_code':
+        elif field == 'dns.flags.opcode':
             return self.op_code
-        elif field == 'dns.authoritative':
+        elif field == 'dns.flags.authoritative':
             return self.authoritative
-        elif field == 'dns.truncated':
+        elif field == 'dns.flags.truncated':
             return self.truncated
-        elif field == 'dns.recursion_requested':
+        elif field == 'dns.flags.recdesired':
             return self.recursion_requested
-        elif field == 'dns.recursion_available':
+        elif field == 'dns.flags.recavail':
             return self.recursion_available
-        elif field == 'dns.authentic_data':
+        elif field == 'dns.flags.authenticated':
             return self.authentic_data
-        elif field == 'dns.check_disabled':
+        elif field == 'dns.flags.checkdisable':
             return self.check_disabled
-        elif field == 'dns.resp_code':
+        elif field == 'dns.flags.rcode':
             return self.resp_code
-        elif field == 'dns.query_count':
+        elif field == 'dns.count.queries':
             return self.query_count
-        elif field == 'dns.answer_count':
+        elif field == 'dns.count.answers':
             return self.answer_count
-        elif field == 'dns.auth_count':
+        elif field == 'dns.count.auth_rr':
             return self.auth_count
-        elif field == 'dns.ad_count':
+        elif field == 'dns.count.add_rr':
             return self.ad_count
         else:
             return None

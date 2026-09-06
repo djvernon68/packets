@@ -474,14 +474,14 @@ class DNS(PKT):
         get_field_val(<field_name>) function as well.
         return: uint16_t pq_type, tuple_of_string query_fields"""
         return (DNS_PACKET_TYPE,
-                ('dns.ident', 'dns.query_resp', 'dns.op_code',
-                 'dns.authoritative',
-                 'dns.truncated', 'dns.recursion_requested',
-                 'dns.recursion_available',
-                 'dns.authentic_data', 'dns.check_disabled',
-                 'dns.resp_code',
-                 'dns.query_count', 'dns.answer_count', 'dns.auth_count',
-                 'dns.ad_count'))
+                ('dns.id', 'dns.flags.response', 'dns.flags.opcode',
+                 'dns.flags.authoritative',
+                 'dns.flags.truncated', 'dns.flags.recdesired',
+                 'dns.flags.recavail',
+                 'dns.flags.authenticated', 'dns.flags.checkdisable',
+                 'dns.flags.rcode',
+                 'dns.count.queries', 'dns.count.answers', 'dns.count.auth_rr',
+                 'dns.count.add_rr'))
 
 
     @classmethod
@@ -492,14 +492,35 @@ class DNS(PKT):
         return [DNS_PACKET_TYPE]
 
 
+    # Maps each Wireshark display-filter abbreviation this class advertises to
+    # the backing property name. The Wireshark names (e.g. dns.flags.response,
+    # dns.count.queries) do not correspond to the property names token-for-
+    # token, so an explicit map is required.
+    _FIELD_TO_ATTR = {
+        'dns.id': 'ident',
+        'dns.flags.response': 'query_resp',
+        'dns.flags.opcode': 'op_code',
+        'dns.flags.authoritative': 'authoritative',
+        'dns.flags.truncated': 'truncated',
+        'dns.flags.recdesired': 'recursion_requested',
+        'dns.flags.recavail': 'recursion_available',
+        'dns.flags.authenticated': 'authentic_data',
+        'dns.flags.checkdisable': 'check_disabled',
+        'dns.flags.rcode': 'resp_code',
+        'dns.count.queries': 'query_count',
+        'dns.count.answers': 'answer_count',
+        'dns.count.auth_rr': 'auth_count',
+        'dns.count.add_rr': 'ad_count',
+    }
+
     def get_field_val(self, field):
         """
         The simplest form of the get_field_val function.
         :param field: name of the field
         :return:
         """
-        if field in self.query_fields:
-            return getattr(self, field.split('.')[1], None)
+        if field in self._FIELD_TO_ATTR:
+            return getattr(self, self._FIELD_TO_ATTR[field], None)
         else:
             raise AttributeError("Invalid DNS field name {0}".format(field))
 

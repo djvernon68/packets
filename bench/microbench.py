@@ -65,10 +65,22 @@ except ImportError:
 try:
     # RIP ships with the Stage 4 routing codecs; import optionally so the
     # harness still runs against a pre-Stage-4 baseline (the RIP row is
-    # skipped). RIP stands in for the RIP/RIPng/HSRP parse path.
+    # skipped).
     from packets.core.inetpkt import RIP
 except ImportError:
     RIP = None
+try:
+    # RIPng ships with the Stage 4a routing codecs; import optionally so the
+    # harness still runs against a pre-Stage-4 baseline (the row is skipped).
+    from packets.core.inetpkt import RIPng
+except ImportError:
+    RIPng = None
+try:
+    # HSRP ships with the Stage 4b routing codecs; import optionally so the
+    # harness still runs against a pre-Stage-4 baseline (the row is skipped).
+    from packets.core.inetpkt import HSRP
+except ImportError:
+    HSRP = None
 from packets.protos.dns import DNS, DNSQuery, DNSResource, \
     DNSTYPE_A, DNSTYPE_CNAME, RCLASS_IN
 
@@ -229,6 +241,19 @@ def make_layer_corpus():
                      bytes([0, 0, 0, 1]))
         corpus['rip'] = RIP(command=2, version=2,
                             body=_rip_body).pkt2net({'update': 1})
+    if RIPng is not None:
+        # A RIPng Response with one 20-byte IPv6 route table entry, so the
+        # parse row walks the 4-byte header and the RTE loop. 2001:db8::/64,
+        # metric 1. Built as raw wire bytes so no capture file is needed.
+        _ripng_rte = (bytes([0x20, 0x01, 0x0d, 0xb8]) + b'\x00' * 12 +
+                      bytes([0, 0, 64, 1]))
+        corpus['ripng'] = bytes([2, 1, 0, 0]) + _ripng_rte
+    if HSRP is not None:
+        # An HSRPv1 (RFC 2281) Hello: the fixed 20-byte layout, so the parse
+        # row walks the first-byte version sniff and the v1 decode. Built as
+        # raw wire bytes so no capture file is needed on the appliance.
+        corpus['hsrp'] = (bytes([0, 0, 8, 3, 10, 120, 1, 0]) +
+                          b'cisco\x00\x00\x00' + bytes([10, 0, 0, 1]))
     return corpus
 
 
@@ -519,6 +544,12 @@ def main():
               iterations, repeats)
     if RIP is not None:
         bench('parse_rip', lambda: RIP(corpus['rip']),
+              iterations, repeats)
+    if RIPng is not None:
+        bench('parse_ripng', lambda: RIPng(corpus['ripng']),
+              iterations, repeats)
+    if HSRP is not None:
+        bench('parse_hsrp', lambda: HSRP(corpus['hsrp']),
               iterations, repeats)
     bench('parse_netflow', lambda: NetflowSimple(corpus['netflow']),
           iterations, repeats)

@@ -619,7 +619,7 @@ cdef class HTTPRequest(PKT):
     def query_info(cls):
         # Only scalar, shape-valid fields are advertised by this concrete type.
         return (HTTP_PACKET_TYPE,
-                ('http.request.method', 'http.request.target',
+                ('http.request.method', 'http.request.uri',
                  'http.request.version', 'http.body_length'))
 
     @classmethod
@@ -629,7 +629,7 @@ cdef class HTTPRequest(PKT):
     cpdef object get_field_val(self, str field):
         if field == 'http.request.method':
             return self.method
-        elif field == 'http.request.target':
+        elif field == 'http.request.uri':
             return self.target
         elif field == 'http.request.version':
             return self.version
@@ -836,8 +836,8 @@ cdef class HTTPResponse(PKT):
     @classmethod
     def query_info(cls):
         return (HTTP_PACKET_TYPE,
-                ('http.response.version', 'http.response.status',
-                 'http.response.reason', 'http.body_length'))
+                ('http.response.version', 'http.response.code',
+                 'http.response.phrase', 'http.body_length'))
 
     @classmethod
     def default_ports(cls):
@@ -846,9 +846,9 @@ cdef class HTTPResponse(PKT):
     cpdef object get_field_val(self, str field):
         if field == 'http.response.version':
             return self.version
-        elif field == 'http.response.status':
+        elif field == 'http.response.code':
             return self.status
-        elif field == 'http.response.reason':
+        elif field == 'http.response.phrase':
             return self.reason
         elif field == 'http.body_length':
             return len(self.body)
@@ -1055,9 +1055,9 @@ cdef class HTTP(PKT):
         # for fields belonging to the other shape rather than raising, which is
         # the query engine's expected heterogeneous-packet contract.
         return (HTTP_PACKET_TYPE,
-                ('http.request.method', 'http.request.target',
+                ('http.request.method', 'http.request.uri',
                  'http.request.version', 'http.response.version',
-                 'http.response.status', 'http.response.reason',
+                 'http.response.code', 'http.response.phrase',
                  'http.body_length'))
 
     @classmethod

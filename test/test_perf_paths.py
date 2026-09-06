@@ -488,10 +488,10 @@ class TestDhcpAddresses(unittest.TestCase):
         # get_field_val is the path a PcapQuery takes to these.
         packet = DHCP(dhcp_wire(b'\x01\x02\x03\x04', b'\x0a\x00\x00\x64',
                                 b'\x63\x64\x09\x0a', b'\x00\x00\x00\x00'))
-        for name, expected in (('dhcp.ciaddr', packet.ciaddr),
-                               ('dhcp.yiaddr', packet.yiaddr),
-                               ('dhcp.siaddr', packet.siaddr),
-                               ('dhcp.giaddr', packet.giaddr)):
+        for name, expected in (('dhcp.ip.client', packet.ciaddr),
+                               ('dhcp.ip.your', packet.yiaddr),
+                               ('dhcp.ip.server', packet.siaddr),
+                               ('dhcp.ip.relay', packet.giaddr)):
             self.assertEqual(packet.get_field_val(name), expected)
 
 
