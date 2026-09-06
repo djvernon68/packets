@@ -1,6 +1,9 @@
 CHANGELOG
 ---------
 
+[2.2.1]
+* **Small performance improvements:**
+
 [2.2.0]
  * **Cross-cutting Wireshark field-name audit: every query field name exposed
    by `pcap_query` now matches Wireshark's display-filter abbreviation exactly.**
