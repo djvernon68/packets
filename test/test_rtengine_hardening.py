@@ -4,7 +4,7 @@
 # accompanying the software ("License").  This software is distributed "AS IS"
 # as set forth in the License.
 
-"""Stage 5 of the 2.2.2 route fixes: secrets, the API's edges, packaging.
+"""Stage 5 of the 2.3.0 route fixes: secrets, the API's edges, packaging.
 
 One case per review item, named in its docstring:
 
@@ -17,7 +17,7 @@ One case per review item, named in its docstring:
        ``Retry-After``.
 * A-2  an unclean stop is reported, and the command exits 3.
 * L-9  ``openapi.yaml`` is in the sdist and in ``package_data``.
-* L-12 one version string, 2.2.2, everywhere it is reported.
+* L-12 one version string, 2.3.0, everywhere it is reported.
 * C-5  the classifiers cover the interpreters the suite runs on.
 
 (L-10 and A-4 live beside the tests they changed, in
@@ -553,8 +553,8 @@ def _setup_text():
 class VersionTestCase(unittest.TestCase):
     """L-12: one version, written once."""
 
-    def test_it_is_2_2_2(self):
-        self.assertEqual('2.2.2', _source_version())
+    def test_it_is_2_3_0(self):
+        self.assertEqual('2.3.0', _source_version())
 
     def test_every_reader_agrees(self):
         self.assertEqual(_source_version(), packets.__version__)

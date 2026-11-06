@@ -4,7 +4,7 @@
 # accompanying the software ("License").  This software is distributed "AS IS"
 # as set forth in the License.
 
-"""Policy and RIB semantics: the Stage 6 fixes of packets 2.2.2.
+"""Policy and RIB semantics: the Stage 6 fixes of packets 2.3.0.
 
   * P-1 -- IOS ``_`` in an AS-path regex is the path delimiter, so ``deny
     _65001_`` no longer fails open.

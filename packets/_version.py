@@ -14,4 +14,4 @@ it. Keep it a single assignment of a string literal, or the regex will not
 find it.
 """
 
-__version__ = '2.2.2'
+__version__ = '2.3.0'

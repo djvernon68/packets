@@ -1,9 +1,9 @@
 CHANGELOG
 ---------
 
-[2.2.2]
- * **The last 2.2.x release.** It targets the AlmaLinux 8 platform (Python
-   3.6.8, Cython 0.28.1, Flask 0.12.2). 2.3 moves to AlmaLinux 10.2.
+[2.3.0]
+ * **The last release for AlmaLinux 8.x** (Python 3.6.8, Cython 0.28.1,
+   Flask 0.12.2).
  * **New `rtengine`: a protocol-agnostic routing engine, with BGP-4 as its
    first protocol plugin.** `packets` could already decode routing protocols
    off the wire; it could not speak them. `rtengine` closes that gap without

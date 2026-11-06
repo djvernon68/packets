@@ -57,6 +57,6 @@ __all__ = ['Engine', 'ProtocolPlugin', 'RtEngineError', 'ConfigError',
 
 # Tracks the packets version it ships with rather than versioning
 # separately; rtengine is not independently released. Imported, not
-# written here (L-12): a second copy is how an early build of 2.2.2 came
+# written here (L-12): a second copy is how an early build of 2.3.0 came
 # to report 2.2.1.
 from packets._version import __version__  # noqa: E402
