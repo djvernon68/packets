@@ -1,6 +1,78 @@
 CHANGELOG
 ---------
 
+[2.2.2]
+ * **The last 2.2.x release.** It targets the AlmaLinux 8 platform (Python
+   3.6.8, Cython 0.28.1, Flask 0.12.2). 2.3 moves to AlmaLinux 10.2.
+ * **New `rtengine`: a protocol-agnostic routing engine, with BGP-4 as its
+   first protocol plugin.** `packets` could already decode routing protocols
+   off the wire; it could not speak them. `rtengine` closes that gap without
+   turning the library into a router: the engine core owns configuration,
+   revisions, the event bus, the global RIB and the operational `show`/`clear`
+   surface, and knows nothing about any particular protocol. A protocol lives
+   behind the `ProtocolPlugin` interface, owns its own RIB and its own
+   best-path algorithm, and offers protocol-neutral `Route` candidates to the
+   `GlobalRib`, so adding a second protocol later does not mean re-opening the
+   core. Hot paths - RIB storage, prefix lookup, path comparison - are Cython;
+   everything policy-shaped or configuration-shaped stays in Python where it
+   is readable. The engine is a control-plane speaker by default: it will peer,
+   run policy and compute best paths without touching the kernel at all.
+ * **BGP-4 plugin.** Full session state machine, capability negotiation,
+   route-refresh, policy (prefix lists, AS-path access lists, route maps),
+   update groups so that peers sharing an outbound policy share one encoding
+   pass, `remove-private-as`, `as-override`, `next-hop-self`, `allowas-in`,
+   `maximum-prefix`, GTSM/`ttl-security`, `ebgp-multihop`, TCP-MD5 and kernel
+   TCP-AO. Configuration is an IOS-keyed JSON (or YAML) document, so an
+   operator who can read a router configuration can read this one.
+ * **Optional Linux FIB sink, off by default.** When enabled, best paths are
+   installed over netlink under our own `rtm_protocol` (190) and our own
+   `rtm_priority`, which together are what make a route ours and therefore
+   safe to reconcile and withdraw. Leftovers from a previous run are adopted
+   or removed at start-up; routes are withdrawn on shutdown unless
+   `retain-on-shutdown` says otherwise; a route the kernel rejects gets a
+   per-route `fib-error` and a backoff rather than taking the commit down
+   with it.
+ * **Health, and a REST API over the same surface.** `GET /engine/health`
+   reports loop lag, peer flaps, event-queue drops and FIB errors, and rolls
+   them up into `ok`/`degraded`/`down` so a supervisor has one field to poll.
+   The Flask API is a thin translation of the embedding API - it adds no
+   behaviour of its own - and ships an OpenAPI 3 document describing all of
+   it, served at `/api/v1/openapi.json` and optionally browsable via
+   `--swagger-ui`. Auth (bearer token, constant-time compare), the body limit
+   and the pagination cap are implemented in our own code rather than in
+   framework middleware, which keeps the framework surface we depend on small
+   - see below.
+ * **`rtengine` console script and a `packets[rtengine]` extra.** The extra
+   declares `Flask>=0.12`, `Werkzeug>=0.12` and `PyYAML>=3.12` as a *floor*,
+   deliberately not a pin, because the deployment target installs Flask 0.12.2
+   from platform RPMs and we must work with what is there. That stack is EOL
+   upstream and is tracked as a compatibility and security risk; it is one of
+   the reasons authentication and request limits live in our code.
+ * **New `inetpkt` shared BGP decode core, wrapped by `packets.core.bgpcore`.**
+   The engine and the `BGP` dissector were about to grow two independent
+   decoders for the same wire format, which is exactly how the two drift. The
+   decode logic now lives once, in `inetpkt`, and both callers use it.
+   **The existing `BGP` dissector's output is byte-for-byte unchanged**: field
+   names, value types and re-serialization all match 2.2.1 exactly, and this
+   is asserted by test rather than asserted by hand. No caller of `BGP` needs
+   to change anything.
+ * **Hardened before release.** Every finding of a full review of the
+   routing engine, and of live testing against FRR 10.7.1 and ExaBGP 5.0.15, is
+   fixed with a test. The main ones: a NOTIFICATION is sent before every close,
+   and session collisions follow RFC 4271. Inbound UPDATEs are validated per
+   RFC 7606, and IPv6 next hops and instance timers are correct on the wire. The
+   CLI can install routes, and secrets are kept off the event bus. The IOS `_`
+   in AS-path regexes is a delimiter. A regex whose cost could grow faster than
+   the square of the path length is refused, as is a quadratic one when
+   `maxas-limit` (new, default 255) allows longer paths. Next hops are
+   re-validated when a static route or `resolve-via-default` changes. Enhanced
+   Route Refresh (RFC 7313) is no longer advertised, because it was not
+   implemented.
+ * **Documentation.** `docs/rtengine.rst` covers the configuration document,
+   the REST API, the embedding API, the security posture including the Flask
+   EOL position and the reverse-proxy boundary, FIB install, and how to write
+   a protocol plugin.
+
 [2.2.1]
 * **Small performance improvements:**
 

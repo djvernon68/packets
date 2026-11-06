@@ -34,6 +34,11 @@ offset_re = re.compile(r'^(udp|tcp)\.payload\.offset\[(\d*):(\d*)\]$')
 
 MIN_FRAME_SIZE = 60
 
+#: Whether this build's rd_u16/rd_u32 abort on an out-of-bounds read: the
+#: ``-DPACKETS_RD_CHECK=1`` build the C-1 fuzz tests are meant for. Always
+#: False in a normal build.
+RD_CHECK = bool(PACKETS_RD_CHECK)
+
 PTR_VAL = 0
 IPV4_LEN = 4
 IPV4_VER = 4
@@ -5490,26 +5495,13 @@ cdef inline Py_ssize_t _declared_end(Py_ssize_t start, Py_ssize_t end,
 #      plan (IMPORTANT-1) and Answers 6 and 7, which require GRE-in-UDP and
 #      IPsec-wrapped payloads to parse without raising.
 #
-# The soft-bounds helper below is what keeps these codecs off the raising path:
-# it reports whether a range holds a given number of bytes instead of raising
-# when it does not. Existing protocols and their raising helpers are unchanged.
-
-
-cdef inline bint _have_range(Py_ssize_t start, Py_ssize_t end,
-                             Py_ssize_t least):
-    """Soft bounds check for the never-raise routing codecs.
-
-    The routing analogue of _need_range: it returns whether at least ``least``
-    bytes are available in ``[start, end)`` rather than raising when they are
-    not, so a codec can stop cleanly on a short header, flag itself malformed,
-    and preserve the remainder instead of aborting the whole parse.
-
-    :param start: first readable offset.
-    :param end: one past the last readable offset.
-    :param least: minimum number of bytes the caller is about to read.
-    :return: 1 when the bytes are present, 0 otherwise.
-    """
-    return start >= 0 and (end - start) >= least
+# The soft-bounds helper _have_range is what keeps these codecs off the raising
+# path: it reports whether a range holds a given number of bytes instead of
+# raising when it does not. Existing protocols and their raising helpers are
+# unchanged. It lives in inetpkt.pxd rather than here, beside need_bytes and
+# the rd_* readers, because a cdef inline function is only inlined into
+# another module when its body is in the .pxd -- the routing engine's own
+# decoders cimport it.
 
 
 @cython.final
@@ -7108,6 +7100,442 @@ cdef dict _BGP_WELLKNOWN_COMMUNITY = {
     0xFFFFFF04: 'NOPEER'}
 
 
+# --- BGP wire-level decode primitives ---------------------------------------
+# The typed, nogil half of the BGP codec: everything below this comment and
+# above _bgp_vs walks the wire format and nothing else. No Python object is
+# created, no string is rendered, no dict is touched. The text dissector in
+# this module and the routing engine's own BGP codec both parse through these,
+# so there is exactly one implementation of the byte arithmetic to be wrong.
+#
+# Four conventions hold throughout, and they are what make the primitives
+# usable from both callers:
+#
+#   1. No ``except`` clause. A nogil function declared ``except -1`` makes
+#      Cython re-acquire the GIL after every call to look for an exception,
+#      which would cost more than the parse. Errors are return values: the
+#      ``int`` primitives return 0 on success and -1 on short or unusable
+#      input, and the iterator primitives return the offset of the next
+#      element or -1 to stop. Nothing here can raise, so the routing
+#      never-raise contract holds by construction rather than by discipline.
+#
+#   2. Results go out through C pointers. The return value carries only
+#      status, or the next offset, which is what lets one call site feed
+#      either a rendered dict of Wireshark strings or a typed route object.
+#
+#   3. Offsets only, never bytes. rd_bytes allocates a Python bytes object and
+#      so can never be nogil; a primitive that returned bytes would drag the
+#      GIL back in. Address and next-hop bytes are reported as a [start, end)
+#      span and copied by the caller, holding the GIL, if it wants them.
+#
+#   4. A declared length and a readable length are reported separately. BGP
+#      length fields routinely claim more than the buffer holds, and the
+#      dissector shows the claim while reading only what is there. So for the
+#      TLV iterators ``ve`` is the end the length field *claims* (and may run
+#      past ``e``) while the *return value* is the next offset, clamped into
+#      the buffer. The declared length is ``ve - vs``; the readable span is
+#      ``[vs, min(ve, e))``. Both callers need both numbers.
+#
+#   5. ``e <= mv.shape[0]`` is a precondition, and nothing is left
+#      unwritten. The caller bounds ``e`` once, where the buffer enters
+#      (C-2): bgpcore's ``_end`` and ``scan_updates``, the dissector's
+#      ``_decode_bgp`` (``len(owner)``, each block end clamped to it) and
+#      wire.pyx (``n = len(msg)``; a value end past its block is faulted
+#      before any value decoder sees it). Every derived end -- ``ve``,
+#      ``opt_end``, a block end -- is clamped or faulted by the caller before
+#      it is passed back in. A clamp per call cost 8 % of ``scan_updates``
+#      and guarded no reachable input, so it is not paid here; a checked
+#      build (PACKETS_RD_CHECK) instead aborts on a violation, which is how
+#      the fuzz tests would catch a future cimport caller that broke it.
+#      ``s`` needs no such rule: ``_have_range`` rejects a negative start.
+#      Every failure path writes every out-param it has not, 0 or -1 for an
+#      offset, so a caller that reads one after a failure reads a defined
+#      value rather than its own stack (C-3). Only the failure paths: the
+#      success path writes them all anyway, and these run once per prefix.
+#      What a failure can still report is kept: an attribute's flags and
+#      type survive a missing length octet.
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef int _bgp_msg_header(const unsigned char[:] mv, Py_ssize_t s, Py_ssize_t e,
+                         uint16_t *length, unsigned char *mtype) nogil:
+    """Read the 19-byte BGP message header at ``s``.
+
+    The 16-byte marker is not returned: it is 16 bytes the caller either
+    ignores or copies itself. What is left is the 2-byte length and the
+    1-byte type.
+
+    :param mv: the parse buffer.
+    :param s: offset of the marker.
+    :param e: one past the last readable offset.
+    :param length: out, the message length field as it appears on the wire --
+        not validated against ``e``, because a length that overruns the
+        buffer is exactly what the caller needs to see to flag the message.
+    :param mtype: out, the message type (1 OPEN .. 5 ROUTE-REFRESH).
+    :return: 0, or -1 if fewer than 19 bytes are available.
+    """
+    # C-3: on failure every out-param is still written, on that path only:
+    # the success path writes them anyway and pays nothing extra.
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    if not _have_range(s, e, 19):
+        length[0] = 0
+        mtype[0] = 0
+        return -1
+    length[0] = rd_u16(mv, s + 16)
+    mtype[0] = mv[s + 18]
+    return 0
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef int _bgp_open_fixed(const unsigned char[:] mv, Py_ssize_t o, Py_ssize_t e,
+                         bint allow_ext, unsigned char *ver, uint16_t *my_as,
+                         uint16_t *hold, uint32_t *bgp_id,
+                         Py_ssize_t *opt_start, Py_ssize_t *opt_end) nogil:
+    """Read the fixed part of an OPEN body and locate its optional parameters.
+
+    ``allow_ext`` selects between the two encodings of the optional-parameter
+    length, and is the whole reason this takes a flag. With it clear the
+    length is the single octet RFC 4271 defines. With it set, RFC 9072's
+    extended form is recognised: a non-zero Non-Ext OP Len. followed by a
+    Non-Ext OP Type of 255 means the real length is the two octets after it
+    and the parameters start 3 bytes further on. Per RFC 9072 the detection is
+    on the *type* octet -- the non-extended length octet "MUST be ignored on
+    receipt once the use of the extended format is determined positively" --
+    with the one exception that it "MUST NOT be set to 0", so a zero there is
+    taken at face value as "no optional parameters" and no type octet is
+    inspected.
+
+    The dissector in this module passes ``allow_ext=0`` so its output is
+    byte-for-byte what it has always been; the routing engine passes 1.
+
+    :param mv: the parse buffer.
+    :param o: first byte of the OPEN body, i.e. past the 19-byte header.
+    :param e: one past the last readable offset.
+    :param allow_ext: honour the RFC 9072 extended encoding.
+    :param ver: out, BGP version.
+    :param my_as: out, My Autonomous System.
+    :param hold: out, Hold Time.
+    :param bgp_id: out, BGP Identifier as a 32-bit integer. The dissector
+        renders the same four bytes as a dotted quad at its own call site.
+    :param opt_start: out, first byte of the Optional Parameters field.
+    :param opt_end: out, the end the length field *claims*; may exceed ``e``,
+        and ``opt_end - opt_start`` is the declared length.
+    :return: 0, or -1 if the 10-byte fixed part is not all present.
+    """
+    cdef Py_ssize_t olen
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    if not _have_range(o, e, 10):
+        ver[0] = 0
+        my_as[0] = 0
+        hold[0] = 0
+        bgp_id[0] = 0
+        opt_start[0] = -1
+        opt_end[0] = -1
+        return -1
+    ver[0] = mv[o]
+    my_as[0] = rd_u16(mv, o + 1)
+    hold[0] = rd_u16(mv, o + 3)
+    bgp_id[0] = rd_u32(mv, o + 5)
+    olen = mv[o + 9]
+    if (allow_ext and olen != 0 and _have_range(o + 10, e, 3) and
+            mv[o + 10] == 255):
+        olen = rd_u16(mv, o + 11)
+        opt_start[0] = o + 13
+    else:
+        opt_start[0] = o + 10
+    opt_end[0] = opt_start[0] + olen
+    return 0
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef Py_ssize_t _bgp_cap_next(const unsigned char[:] mv, Py_ssize_t o,
+                              Py_ssize_t e, unsigned char *code,
+                              Py_ssize_t *vs, Py_ssize_t *ve) nogil:
+    """Step over one capability TLV -- code(1), length(1), value -- at ``o``.
+
+    :param mv: the parse buffer.
+    :param o: first byte of the capability.
+    :param e: one past the last readable offset, i.e. the end of the enclosing
+        Capability optional parameter.
+    :param code: out, capability code.
+    :param vs: out, first byte of the capability value.
+    :param ve: out, the value end the length octet claims; may exceed ``e``,
+        so the declared capability length is ``ve - vs``.
+    :return: the offset of the next capability, clamped into the buffer, or
+        -1 when there is not even a 2-byte TLV header left.
+    """
+    cdef Py_ssize_t nxt
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    if not _have_range(o, e, 2):
+        code[0] = 0
+        vs[0] = -1
+        ve[0] = -1
+        return -1
+    code[0] = mv[o]
+    vs[0] = o + 2
+    ve[0] = vs[0] + mv[o + 1]
+    nxt = ve[0]
+    if nxt > e:
+        nxt = e
+    return nxt
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef Py_ssize_t _bgp_attr_next(const unsigned char[:] mv, Py_ssize_t o,
+                               Py_ssize_t e, unsigned char *flags,
+                               unsigned char *atype, Py_ssize_t *vs,
+                               Py_ssize_t *ve) nogil:
+    """Step over one UPDATE path attribute at ``o``, extended length included.
+
+    The Extended Length bit (0x10) in the flags octet is what decides whether
+    the length is one octet or two, so that arithmetic lives here rather than
+    being repeated by every caller.
+
+    :param mv: the parse buffer.
+    :param o: first byte of the attribute.
+    :param e: one past the last readable offset, i.e. the end of the
+        path-attributes block.
+    :param flags: out, the attribute flags octet.
+    :param atype: out, the attribute type code.
+    :param vs: out, first byte of the attribute value.
+    :param ve: out, the value end the length field claims; may exceed ``e``,
+        so the declared attribute length is ``ve - vs``.
+    :return: the offset of the next attribute, clamped into the buffer, or -1
+        when the flags, type and length are not all present.
+    """
+    cdef Py_ssize_t nxt
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    if not _have_range(o, e, 2):
+        flags[0] = 0
+        atype[0] = 0
+        vs[0] = -1
+        ve[0] = -1
+        return -1
+    flags[0] = mv[o]
+    atype[0] = mv[o + 1]
+    if flags[0] & 0x10:
+        if not _have_range(o, e, 4):
+            # Flags and type are kept: they are what the dissector shows
+            # for an attribute whose length octets are missing.
+            vs[0] = -1
+            ve[0] = -1
+            return -1
+        vs[0] = o + 4
+        ve[0] = vs[0] + rd_u16(mv, o + 2)
+    else:
+        if not _have_range(o, e, 3):
+            vs[0] = -1
+            ve[0] = -1
+            return -1
+        vs[0] = o + 3
+        ve[0] = vs[0] + mv[o + 2]
+    nxt = ve[0]
+    if nxt > e:
+        nxt = e
+    return nxt
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef Py_ssize_t _bgp_nlri_next(const unsigned char[:] mv, Py_ssize_t o,
+                               Py_ssize_t e, bint add_path,
+                               Py_ssize_t max_addr_bytes, uint32_t *path_id,
+                               unsigned char *plen,
+                               Py_ssize_t *addr_start) nogil:
+    """Step over one length-prefixed prefix: optional path id, bits, address.
+
+    ``max_addr_bytes`` is the address-family width and is what makes this
+    reusable: 4 accepts IPv4 prefixes and rejects anything longer, which is
+    the behaviour the dissector has always had, and 16 accepts IPv6. A prefix
+    length implying more address bytes than the family allows stops the run
+    rather than being truncated, because a run of prefixes has no delimiter
+    other than its own lengths -- once one is wrong, every following offset is
+    meaningless.
+
+    :param mv: the parse buffer.
+    :param o: first byte of the entry.
+    :param e: one past the last readable offset.
+    :param add_path: a 4-byte RFC 7911 Path Identifier precedes each prefix.
+    :param max_addr_bytes: widest address the caller's family allows.
+    :param path_id: out, the path identifier, or 0 when ``add_path`` is clear.
+    :param plen: out, the prefix length in bits.
+    :param addr_start: out, first of the ``(plen + 7) // 8`` address bytes.
+    :return: the offset just past this entry, or -1 to stop the run: the
+        buffer is exhausted, or the entry is partial, or ``plen`` is too wide
+        for the family.
+    """
+    cdef Py_ssize_t nbytes
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    path_id[0] = 0
+    if o >= e:
+        plen[0] = 0
+        addr_start[0] = -1
+        return -1
+    if add_path:
+        if not _have_range(o, e, 4):
+            plen[0] = 0
+            addr_start[0] = -1
+            return -1
+        path_id[0] = rd_u32(mv, o)
+        o += 4
+    if not _have_range(o, e, 1):
+        plen[0] = 0
+        addr_start[0] = -1
+        return -1
+    plen[0] = mv[o]
+    o += 1
+    nbytes = (plen[0] + 7) // 8
+    if nbytes > max_addr_bytes or not _have_range(o, e, nbytes):
+        addr_start[0] = -1
+        return -1
+    addr_start[0] = o
+    return o + nbytes
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef int _bgp_mp_reach_hdr(const unsigned char[:] mv, Py_ssize_t o,
+                           Py_ssize_t e, uint16_t *afi, unsigned char *safi,
+                           Py_ssize_t *nh_start, Py_ssize_t *nh_end,
+                           Py_ssize_t *nlri_start) nogil:
+    """Read an MP_REACH_NLRI (RFC 4760, attribute 14) header.
+
+    The AFI/SAFI pair and the next hop are reported independently, because an
+    MP_REACH attribute truncated after its 3-byte AFI/SAFI is still worth
+    reporting that far and the dissector has always shown it: a return of 0
+    means afi and safi are valid, and the three span out-parameters are -1
+    unless the next hop was *fully* present. So a caller that needs the next
+    hop tests ``nh_start >= 0``, not the return value.
+
+    :param mv: the parse buffer.
+    :param o: first byte of the attribute value.
+    :param e: one past the last readable offset, i.e. the attribute end.
+    :param afi: out, Address Family Identifier.
+    :param safi: out, Subsequent Address Family Identifier.
+    :param nh_start: out, first next-hop byte, or -1.
+    :param nh_end: out, one past the last next-hop byte, or -1.
+    :param nlri_start: out, first NLRI byte -- past the next hop and the one
+        reserved octet -- clamped to ``e``, or -1.
+    :return: 0 when afi/safi were read, -1 when even those are not present.
+    """
+    cdef Py_ssize_t nhlen
+    nh_start[0] = -1
+    nh_end[0] = -1
+    nlri_start[0] = -1
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    if not _have_range(o, e, 3):
+        afi[0] = 0
+        safi[0] = 0
+        return -1
+    afi[0] = rd_u16(mv, o)
+    safi[0] = mv[o + 2]
+    if not _have_range(o + 3, e, 1):
+        return 0
+    nhlen = mv[o + 3]
+    if not _have_range(o + 4, e, nhlen):
+        return 0
+    nh_start[0] = o + 4
+    nh_end[0] = o + 4 + nhlen
+    nlri_start[0] = nh_end[0] + 1
+    if nlri_start[0] > e:
+        nlri_start[0] = e
+    return 0
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef int _bgp_mp_unreach_hdr(const unsigned char[:] mv, Py_ssize_t o,
+                             Py_ssize_t e, uint16_t *afi,
+                             unsigned char *safi,
+                             Py_ssize_t *nlri_start) nogil:
+    """Read an MP_UNREACH_NLRI (RFC 4760, attribute 15) header.
+
+    Three octets, then withdrawn NLRI -- there is no next hop.
+
+    :param mv: the parse buffer.
+    :param o: first byte of the attribute value.
+    :param e: one past the last readable offset.
+    :param afi: out, Address Family Identifier.
+    :param safi: out, Subsequent Address Family Identifier.
+    :param nlri_start: out, first withdrawn-NLRI byte, or -1.
+    :return: 0, or -1 if the 3-byte header is not present.
+    """
+    nlri_start[0] = -1
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    if not _have_range(o, e, 3):
+        afi[0] = 0
+        safi[0] = 0
+        return -1
+    afi[0] = rd_u16(mv, o)
+    safi[0] = mv[o + 2]
+    nlri_start[0] = o + 3
+    return 0
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef Py_ssize_t _bgp_aspath_seg_next(const unsigned char[:] mv, Py_ssize_t o,
+                                     Py_ssize_t e, bint as4,
+                                     unsigned char *seg_type,
+                                     unsigned char *count,
+                                     Py_ssize_t *asn_start) nogil:
+    """Step over one AS_PATH segment: type(1), count(1), then the AS numbers.
+
+    ``count`` is a number of AS numbers, not a byte count, so the stride has
+    to come from outside the segment: ``as4`` selects the 4-byte ASNs of
+    AS4_PATH and of a session that negotiated RFC 6793, against the 2-byte
+    ASNs of a plain AS_PATH.
+
+    :param mv: the parse buffer.
+    :param o: first byte of the segment.
+    :param e: one past the last readable offset.
+    :param as4: AS numbers are 4 bytes wide rather than 2.
+    :param seg_type: out, AS_SET / AS_SEQUENCE / AS_CONFED_*.
+    :param count: out, how many AS numbers the segment claims.
+    :param asn_start: out, first ASN byte.
+    :return: the offset of the next segment, clamped into the buffer, or -1
+        when the 2-byte segment header is not present. A caller reading the
+        ASNs must still bound each read itself: ``count`` is a claim, and the
+        clamped return value is the only thing that is certainly in range.
+    """
+    cdef Py_ssize_t nxt
+    # C-2: ``e <= mv.shape[0]`` is the caller's to keep (design note 5).
+    if PACKETS_RD_CHECK and e > mv.shape[0]:
+        packets_end_oob(e, mv.shape[0])
+    if not _have_range(o, e, 2):
+        seg_type[0] = 0
+        count[0] = 0
+        asn_start[0] = -1
+        return -1
+    seg_type[0] = mv[o]
+    count[0] = mv[o + 1]
+    asn_start[0] = o + 2
+    if as4:
+        nxt = asn_start[0] + (<Py_ssize_t>count[0]) * 4
+    else:
+        nxt = asn_start[0] + (<Py_ssize_t>count[0]) * 2
+    if nxt > e:
+        nxt = e
+    return nxt
+
+
 cdef inline str _bgp_vs(dict table, object key):
     """Render an enum value as Wireshark does: its string, else 'Unknown (N)'."""
     cdef object txt = table.get(key)
@@ -7393,59 +7821,66 @@ cdef list _bgp_read_prefixes(const unsigned char[:] mv, Py_ssize_t o,
                              Py_ssize_t end, bint add_path):
     """Read a run of length-prefixed NLRI, each a (dotted-quad, prefix_len).
 
-    Each entry is an optional 4-byte Add-Path identifier, a 1-byte prefix
-    length in bits, then ceil(bits/8) address bytes. Never raises: a partial
-    entry ends the run.
+    The walk itself is _bgp_nlri_next; this is the rendering half of it. The
+    ``max_addr_bytes=4`` argument is where the IPv4-only restriction now
+    lives -- it used to be an inline ``nbytes > 4`` rejection here -- so the
+    routing engine can read the same prefixes as IPv6 by passing 16 without
+    this function changing at all.
+
+    Never raises: a partial entry ends the run.
     """
     cdef:
         list out = []
-        unsigned char plen, nbytes
+        Py_ssize_t nxt, addr
+        unsigned char plen = 0, nbytes
         unsigned char b0, b1, b2, b3
-    while o < end:
-        if add_path:
-            if not _have_range(o, end, 4):
-                break
-            o += 4
-        if not _have_range(o, end, 1):
+        uint32_t path_id = 0
+    while True:
+        nxt = _bgp_nlri_next(mv, o, end, add_path, 4, &path_id, &plen, &addr)
+        if nxt < 0 or nxt <= o:
             break
-        plen = mv[o]
-        o += 1
         nbytes = (plen + 7) // 8
-        if nbytes > 4 or not _have_range(o, end, nbytes):
-            break
-        b0 = mv[o] if nbytes > 0 else 0
-        b1 = mv[o + 1] if nbytes > 1 else 0
-        b2 = mv[o + 2] if nbytes > 2 else 0
-        b3 = mv[o + 3] if nbytes > 3 else 0
+        b0 = mv[addr] if nbytes > 0 else 0
+        b1 = mv[addr + 1] if nbytes > 1 else 0
+        b2 = mv[addr + 2] if nbytes > 2 else 0
+        b3 = mv[addr + 3] if nbytes > 3 else 0
         out.append(('%d.%d.%d.%d' % (b0, b1, b2, b3), plen))
-        o += nbytes
+        o = nxt
     return out
 
 
 cdef void _decode_bgp_attr_value(BGPParam p, unsigned char atype,
                                  const unsigned char[:] mv, Py_ssize_t o,
                                  Py_ssize_t end):
-    """Decode one path-attribute value to Wireshark depth; never raises."""
+    """Decode one path-attribute value to Wireshark depth; never raises.
+
+    Only the first AS_PATH segment and the first community are exposed, as
+    they always have been -- the primitives can walk every one of them, but
+    widening what this renders would change the dissector's output, which
+    Stage 1 does not do.
+    """
     cdef:
         Py_ssize_t s
-        unsigned char seg_type, seg_len, asn_size, i, nhlen
+        unsigned char seg_type = 0, seg_len = 0, asn_size, i
         list segs, comms
         uint32_t comm
+        uint16_t afi = 0
+        unsigned char safi = 0
+        Py_ssize_t nh_start = -1, nh_end = -1, nlri_start = -1
     if atype == 1:                       # ORIGIN
         if _have_range(o, end, 1):
             p.fields['bgp.update.path_attribute.origin'] = \
                 _bgp_vs(_BGP_ORIGIN_VALS, mv[o])
     elif atype == 2 or atype == 17:      # AS_PATH / AS4_PATH (first segment)
-        s = o
-        if _have_range(s, end, 2):
-            seg_type = mv[s]
-            seg_len = mv[s + 1]
-            asn_size = 4 if atype == 17 else 2
+        asn_size = 4 if atype == 17 else 2
+        # The segment header comes from the primitive; the ASN reads stay
+        # here because they append to a Python list.
+        if _bgp_aspath_seg_next(mv, o, end, atype == 17, &seg_type, &seg_len,
+                                &s) >= 0:
             p.fields['bgp.update.path_attribute.as_path_segment.type'] = \
                 _bgp_vs(_BGP_AS_SEG_VALS, seg_type)
             p.fields['bgp.update.path_attribute.as_path_segment.length'] = \
                 seg_len
-            s += 2
             segs = []
             for i in range(seg_len):
                 if not _have_range(s, end, asn_size):
@@ -7502,23 +7937,27 @@ cdef void _decode_bgp_attr_value(BGPParam p, unsigned char atype,
             p.fields['bgp.update.path_attribute.originator_id'] = \
                 _fmt_ipv4_buf(&mv[o])
     elif atype == 14:                    # MP_REACH_NLRI
-        if _have_range(o, end, 3):
+        # nlri_start is discarded here on purpose: the primitive locates the
+        # MP NLRI but this dissector has never decoded it, and Stage 1 adds
+        # no fields. The routing engine uses that offset.
+        if _bgp_mp_reach_hdr(mv, o, end, &afi, &safi, &nh_start, &nh_end,
+                             &nlri_start) == 0:
             p.fields['bgp.update.path_attribute.mp_reach_nlri.afi'] = \
-                _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, o))
+                _bgp_vs(_BGP_AFI_VALS, afi)
             p.fields['bgp.update.path_attribute.mp_reach_nlri.safi'] = \
-                _bgp_vs(_BGP_SAFI_VALS, mv[o + 2])
-            if _have_range(o + 3, end, 1):
-                nhlen = mv[o + 3]
-                if _have_range(o + 4, end, nhlen):
-                    p.fields[
-                        'bgp.update.path_attribute.mp_reach_nlri.next_hop'] = \
-                        rd_bytes(mv, o + 4, o + 4 + nhlen)
+                _bgp_vs(_BGP_SAFI_VALS, safi)
+            # afi/safi survive a next hop that is absent or overruns, which
+            # is why this tests the span rather than the return value.
+            if nh_start >= 0:
+                p.fields[
+                    'bgp.update.path_attribute.mp_reach_nlri.next_hop'] = \
+                    rd_bytes(mv, nh_start, nh_end)
     elif atype == 15:                    # MP_UNREACH_NLRI
-        if _have_range(o, end, 3):
+        if _bgp_mp_unreach_hdr(mv, o, end, &afi, &safi, &nlri_start) == 0:
             p.fields['bgp.update.path_attribute.mp_unreach_nlri.afi'] = \
-                _bgp_vs(_BGP_AFI_VALS, rd_u16(mv, o))
+                _bgp_vs(_BGP_AFI_VALS, afi)
             p.fields['bgp.update.path_attribute.mp_unreach_nlri.safi'] = \
-                _bgp_vs(_BGP_SAFI_VALS, mv[o + 2])
+                _bgp_vs(_BGP_SAFI_VALS, safi)
     elif atype == 32:                    # LARGE_COMMUNITY
         comms = []
         s = o
@@ -7532,28 +7971,22 @@ cdef void _decode_bgp_attr_value(BGPParam p, unsigned char atype,
 
 cdef Py_ssize_t _decode_bgp_pathattr(BGP pkt, const unsigned char[:] mv,
                                      Py_ssize_t o, Py_ssize_t end) except? -2:
-    """Decode one path attribute at ``o``; return the offset past it, or -1."""
+    """Decode one path attribute at ``o``; return the offset past it, or -1.
+
+    _bgp_attr_next owns the flags/type/length read, the extended-length bit
+    and the clamping. It hands back two ends: ``declared_end`` is where the
+    length field says the value stops, which is what bgp.update.
+    path_attribute.length reports, and ``vend`` is where it actually stops in
+    this buffer, which is what the BGPParam spans and the value decoder sees.
+    """
     cdef:
-        unsigned char flags, atype
-        Py_ssize_t alen, vstart, vend
+        unsigned char flags = 0, atype = 0
+        Py_ssize_t alen, vstart = 0, vend, declared_end = 0
         BGPParam p
-    if not _have_range(o, end, 2):
+    vend = _bgp_attr_next(mv, o, end, &flags, &atype, &vstart, &declared_end)
+    if vend < 0:
         return -1
-    flags = mv[o]
-    atype = mv[o + 1]
-    if flags & 0x10:                     # extended length: 2-byte length
-        if not _have_range(o, end, 4):
-            return -1
-        alen = rd_u16(mv, o + 2)
-        vstart = o + 4
-    else:
-        if not _have_range(o, end, 3):
-            return -1
-        alen = mv[o + 2]
-        vstart = o + 3
-    vend = vstart + alen
-    if vend > end:
-        vend = end
+    alen = declared_end - vstart
     p = _new_bgp_param(mv, o, vend)
     p.fields['bgp.update.path_attribute.type_code'] = \
         _bgp_vs(_BGP_ATTR_TYPE_VALS, atype)
@@ -7597,21 +8030,38 @@ cdef void _bgp_add_cap(BGP pkt, const unsigned char[:] mv, Py_ssize_t start,
 
 cdef void _decode_bgp_open(BGP pkt, const unsigned char[:] mv,
                            Py_ssize_t off, Py_ssize_t end):
-    """Decode an OPEN body and its capabilities; never raises."""
+    """Decode an OPEN body and its capabilities; never raises.
+
+    ``allow_ext=0`` is deliberate and load-bearing: it keeps RFC 9072's
+    extended optional-parameter length invisible here, so this dissector
+    reads the one-octet length it always has and its output is byte for byte
+    unchanged. The routing engine passes 1 to the same primitive.
+    """
     cdef:
         Py_ssize_t o = off, pend, pstart, cstart, cend
-        unsigned char opt_len, ptype, opl, cap_type, cap_len
-        Py_ssize_t clen
-    if not _have_range(o, end, 10):
+        Py_ssize_t cnxt, cvs = 0, cve = 0
+        Py_ssize_t opt_start = 0, opt_end = 0
+        unsigned char opt_len, ptype, opl, cap_type = 0
+        unsigned char ver = 0
+        uint16_t my_as = 0, hold = 0
+        uint32_t bgp_id = 0
+    if _bgp_open_fixed(mv, o, end, 0, &ver, &my_as, &hold, &bgp_id,
+                       &opt_start, &opt_end) < 0:
         return
-    pkt.body['bgp.open.version'] = mv[o]
-    pkt.body['bgp.open.myas'] = rd_u16(mv, o + 1)
-    pkt.body['bgp.open.holdtime'] = rd_u16(mv, o + 3)
+    pkt.body['bgp.open.version'] = ver
+    pkt.body['bgp.open.myas'] = my_as
+    pkt.body['bgp.open.holdtime'] = hold
+    # The identifier is rendered from the same four bytes the primitive read
+    # as bgp_id: _fmt_ipv4_buf builds a Python str and so stays on this side
+    # of the GIL, which is why the primitive returns the integer instead.
     pkt.body['bgp.open.identifier'] = _fmt_ipv4_buf(&mv[o + 5])
-    opt_len = mv[o + 9]
+    # opt_end is the end the length octet claims, so the declared length --
+    # which is what bgp.open.opt.len has always reported, unclamped -- is the
+    # span the primitive handed back.
+    opt_len = <unsigned char>(opt_end - opt_start)
     pkt.body['bgp.open.opt.len'] = opt_len
-    o += 10
-    pend = o + opt_len
+    o = opt_start
+    pend = opt_end
     if pend > end:
         pend = end
     # Optional parameters: type(1), len(1), value. Type 2 = Capability, whose
@@ -7625,21 +8075,31 @@ cdef void _decode_bgp_open(BGP pkt, const unsigned char[:] mv,
         if ptype == 2:
             cstart = pstart
             cend = pstart + opl
-            while _have_range(cstart, cend, 2):
-                cap_type = mv[cstart]
-                cap_len = mv[cstart + 1]
-                clen = cap_len
-                if cstart + 2 + clen > cend:
-                    clen = cend - (cstart + 2)
-                _bgp_add_cap(pkt, mv, cstart, cstart + 2 + clen, cap_type,
-                             cap_len)
-                cstart += 2 + clen
+            # _bgp_cap_next owns the TLV arithmetic: cnxt is the next
+            # capability, clamped into the parameter, and cve is the end the
+            # length octet claims, so cve - cvs is the declared capability
+            # length that bgp.cap.length has always shown.
+            while True:
+                cnxt = _bgp_cap_next(mv, cstart, cend, &cap_type, &cvs, &cve)
+                if cnxt < 0 or cnxt <= cstart:
+                    break
+                _bgp_add_cap(pkt, mv, cstart, cnxt, cap_type,
+                             <unsigned char>(cve - cvs))
+                cstart = cnxt
         o = pstart + opl
 
 
 cdef void _decode_bgp_update(BGP pkt, const unsigned char[:] mv,
                              Py_ssize_t off, Py_ssize_t end):
-    """Decode an UPDATE body: withdrawn routes, path attributes, NLRI."""
+    """Decode an UPDATE body: withdrawn routes, path attributes, NLRI.
+
+    There is deliberately no _bgp_update_* primitive. The three blocks are
+    framed by two bare 2-byte lengths, so once _bgp_read_prefixes and
+    _decode_bgp_pathattr sit on the primitives there is nothing left here but
+    rd_u16 and _have_range -- both already nogil and cimportable -- and a
+    primitive wrapping two reads would add a call without removing a
+    duplicated line. The clamping of each block end to ``end`` is unchanged.
+    """
     cdef:
         Py_ssize_t o = off, wend, tpa_end, nxt
         uint16_t wlen, tpalen
@@ -7710,7 +8170,8 @@ cdef int _decode_bgp(BGP pkt, bytes owner, const unsigned char[:] mv,
                      dict l7_ports) except -1:
     cdef:
         Py_ssize_t off, msg_end
-        uint16_t mlen
+        uint16_t mlen = 0
+        unsigned char mtype = 0
     pkt.malformed = 0
     pkt._raw = None
     pkt.type = 0
@@ -7721,15 +8182,16 @@ cdef int _decode_bgp(BGP pkt, bytes owner, const unsigned char[:] mv,
     pkt._body = b''
     pkt.payload = NullPkt(b'')
 
-    # 19-byte header: 16-byte marker, 2-byte length, 1-byte type.
-    if not _have_range(start, end, 19):
+    # 19-byte header: 16-byte marker, 2-byte length, 1-byte type. The length
+    # and type come from _bgp_msg_header; the marker is a bytes copy, so it
+    # stays here with the GIL.
+    if _bgp_msg_header(mv, start, end, &mlen, &mtype) < 0:
         pkt.malformed = 1
         pkt._raw = rd_bytes(mv, start, end)
         pkt.payload = _null_range(owner, start, end, l7_ports)
         return 0
     pkt._marker = rd_bytes(mv, start, start + 16)
-    mlen = rd_u16(mv, start + 16)
-    pkt.type = mv[start + 18]
+    pkt.type = mtype
     pkt.length = mlen
 
     # The length field names where this message ends. A short buffer (length

@@ -1,0 +1,3897 @@
+# Copyright (c) 2019 Riverbed Technology, Inc.
+#
+# This software is licensed under the terms and conditions of the MIT License
+# accompanying the software ("License").  This software is distributed "AS IS"
+# as set forth in the License.
+
+openapi: 3.0.3
+
+info:
+  title: rtengine REST API
+  version: 1.0.0
+  description: >-
+    The control plane of the rtengine routing engine, as HTTP. There are
+    four kinds of thing an operator does -- read the engine, change the
+    configuration, look at operational state, take an action -- and the
+    four groups of endpoints below behave differently on purpose.
+
+
+    Configuration URLs are the IOS hierarchy spelled as paths.
+    `router bgp 65000 / neighbor 10.0.0.2 / remote-as 65001` is
+    `PUT /router/bgp/65000/neighbor/10.0.0.2` with
+    `{"remote-as": 65001}`, and `no neighbor 10.0.0.2` is a `DELETE` on
+    the same URL. The vocabulary is not translated on the way through --
+    IOS keywords are the JSON keys and the path segments -- so an
+    operator who knows the CLI can guess the URL, and
+    `show running-config` and this API describe the same document in
+    the same words.
+
+
+    Every change is optimistically concurrent. A read returns the
+    configuration revision in `ETag`; a write that sends it back in
+    `If-Match` is refused with 412 when somebody else committed in
+    between, which is how a client avoids clobbering a change it never
+    saw. A write with no `If-Match` is last-write-wins, which is what
+    omitting the header asks for.
+
+
+    Reads are redacted. A secret comes back as `"<redacted>"`, and
+    writing that value back means "keep the stored secret" rather than
+    "set the password to the word redacted". That is the whole reason
+    read-edit-write is safe for a client that is not allowed to see the
+    password it is preserving.
+
+
+    A change is atomic or it did not happen. Validation, then every
+    affected plugin's `prepare`, then the commit: a rejection anywhere
+    leaves the running configuration and its revision exactly as they
+    were, so a failed write never needs unpicking.
+
+
+    Which `/show` and `/clear` paths exist depends on which plugins this
+    engine has registered -- an engine with BGP answers more than one
+    without -- so this document describes one rule for each and the two
+    index endpoints enumerate what the engine you are talking to
+    actually answers.
+
+servers:
+  - url: /api/v1
+    description: >-
+      Relative to wherever the engine's API is bound (`api.bind`,
+      loopback by default). The version lives in the path rather than in
+      a header because an operator pasting a URL into a bug report
+      should be pasting something unambiguous; every path in this
+      document is written without the `/api/v1` prefix because the
+      prefix is here.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: engine
+    description: >-
+      What this engine is and how it is doing. These are the endpoints
+      something else reads -- a supervisor, a monitoring system, a
+      deployment tool -- rather than the ones an operator drives.
+  - name: configuration
+    description: >-
+      The configuration document, as a resource tree. `GET` reads a
+      subtree with the revision in `ETag`, `PUT` creates or replaces it,
+      `PATCH` merges into it, and `DELETE` is IOS `no`. A `PATCH` merges
+      key by key and a JSON `null` removes a key, which is the only way
+      to unset one field without sending the rest of the object back. A
+      nested object merges rather than replacing; replacing a nested
+      object outright is what `PUT` on its own URL is for.
+  - name: operational-state
+    description: >-
+      `show ip bgp summary` is `GET /show/ip/bgp/summary`. The documents
+      these return are the engine's own, unaltered: the contract is that
+      the CLI and the API answer the same question with the same bytes.
+  - name: actions
+    description: >-
+      Things that change running state without changing the
+      configuration. They are `POST` because they are not idempotent and
+      not free; enumerating them is a `GET`, because listing what can be
+      done must not do any of it.
+
+paths:
+
+  /:
+    get:
+      tags: [engine]
+      operationId: getServiceIndex
+      summary: What this is, and where the rest of it lives
+      description: >-
+        A client that has not been told where the specification lives
+        can find it here, and a human who typed the base URL into a
+        browser gets something better than a 404. This is still behind
+        the token when one is configured: the authentication hook runs
+        before every route in this document.
+      responses:
+        '200':
+          description: The service banner and its links.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceIndex'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /openapi.json:
+    get:
+      tags: [engine]
+      operationId: getOpenApiDocument
+      summary: This document, as JSON
+      description: >-
+        Served as JSON from a YAML source: YAML is what a human
+        maintains and JSON is what tooling reads, and converting on the
+        way out means there is only ever one document to keep true. It
+        is read from disk and cached on first use, so an engine whose
+        copy is missing still routes -- it just answers 500 here.
+      responses:
+        '200':
+          description: The OpenAPI document describing this application.
+          content:
+            application/json:
+              schema:
+                type: object
+                description: An OpenAPI 3.0 document.
+                additionalProperties: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /engine/status:
+    get:
+      tags: [engine]
+      operationId: getEngineStatus
+      summary: Identity and configuration
+      description: >-
+        What this engine is: name, version, revision, the plugins
+        registered and the families they carry, and the REST layer's own
+        view of itself. The bind, the authentication policy and the
+        bridge counters are facts the engine has no way to know, and
+        they are merged in here rather than given their own endpoint so
+        that one question does not need two polls. For measurement --
+        loop lag, table sizes, whether anything is wrong -- use
+        `/engine/health`.
+      responses:
+        '200':
+          description: The status document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /engine/health:
+    get:
+      tags: [engine]
+      operationId: getEngineHealth
+      summary: The health document, unmodified
+      description: >-
+        Exactly what `Engine.health()` returns, with nothing added,
+        because a monitoring rule written against one must hold for the
+        other and a probe must not see a different answer depending on
+        which door it came through.
+
+
+        This is the one endpoint that can be exempted from
+        authentication, with `api.auth.allow-unauthenticated-health`:
+        the thing polling it is usually a supervisor or a load balancer
+        with nowhere to keep a secret, and the document contains no key
+        material by construction.
+      responses:
+        '200':
+          description: >-
+            The health document. `status` is the roll-up; the sections
+            below it say which subsystem produced it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /engine/plugins:
+    get:
+      tags: [engine]
+      operationId: getEnginePlugins
+      summary: The registered protocol plugins
+      description: >-
+        Which protocols this engine speaks, which address families each
+        carries, and where each keeps its configuration. Worth reading
+        before anything else that varies by plugin: the `/show` and
+        `/clear` vocabularies and the `router` section of the
+        configuration document all grow with this list.
+      responses:
+        '200':
+          description: The registered plugins.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plugins'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /engine/config-schema:
+    get:
+      tags: [engine]
+      operationId: getConfigSchema
+      summary: The configuration schema, core plus every plugin's
+      description: >-
+        The vocabulary rather than the shape. This document describes
+        what each configuration resource looks like; the schema is the
+        complete answer to "what may I put in this document", and it
+        grows when a plugin is registered, which a static document
+        cannot express. Each node carries its `type` and its bounds, and
+        a node of type `secret` is one that reads back as
+        `"<redacted>"`.
+      responses:
+        '200':
+          description: The schema tree.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigSchema'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /running-config:
+    get:
+      tags: [configuration]
+      operationId: getRunningConfig
+      summary: The whole configuration document
+      description: >-
+        Secrets redacted. The `ETag` is the revision, so the ordinary
+        HTTP idiom -- read, edit, write back with `If-Match` -- is
+        exactly the optimistic concurrency the engine already
+        implements.
+      responses:
+        '200':
+          description: The running document.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunningConfig'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    post:
+      tags: [configuration]
+      operationId: replaceRunningConfigPost
+      summary: Replace the whole document atomically
+      description: >-
+        Validate, prepare with every affected plugin, then commit: a
+        rejection anywhere leaves the running configuration and its
+        revision exactly as they were. Anything absent from the body is
+        removed, which is the point of a replace and the reason to send
+        `If-Match`.
+
+
+        Secrets written back as `"<redacted>"` keep their stored values.
+        That is what makes it safe to `GET` this document, edit one
+        unrelated field and `POST` it back without ever holding the
+        password it contains.
+
+
+        `POST` and `PUT` on this URL do the same thing. Both spellings
+        are accepted because this is a replace of a document that
+        already exists, which reads as `PUT`, reached through a URL that
+        is not the document's own identity, which reads as `POST`.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        description: The complete configuration document.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunningConfig'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: replaceRunningConfigPut
+      summary: Replace the whole document atomically
+      description: >-
+        The same operation as `POST` on this URL, down to the last byte
+        of the response; see its description for what a replace does to
+        the keys you left out and to the secrets you did not send.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        description: The complete configuration document.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunningConfig'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /show:
+    get:
+      tags: [operational-state]
+      operationId: getShowIndex
+      summary: Every operational view this engine answers
+      description: >-
+        The list is the union of the core's own views and every
+        registered plugin's, so it is this engine's actual capability
+        rather than what the documentation happened to know when it was
+        written. Each entry carries the CLI spelling and the URL, which
+        makes this the discovery mechanism that per-command routes would
+        have been.
+
+
+        `/show/` is the same URL, not a second one: the rule is
+        registered once with `strict_slashes=False`, so both spellings
+        are answered rather than one of them being redirected to the
+        other. A 301 is a reasonable thing to serve a browser and a poor
+        thing to serve an API client, which may not follow it.
+      responses:
+        '200':
+          description: The views this engine answers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShowIndex'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /show/{command}:
+    parameters:
+      - $ref: '#/components/parameters/Command'
+    get:
+      tags: [operational-state]
+      operationId: showCommand
+      summary: Answer one operational query
+      description: >-
+        The handler's document, unaltered: `engine.show(...)` and this
+        endpoint return the same thing for the same command.
+
+
+        The path is resolved against the registered views before it is
+        dispatched, rather than being handed straight to the engine.
+        Engine dispatch matches the longest registered prefix and passes
+        the rest to the handler as arguments, which is right for a CLI
+        and too permissive for a URL: a mistyped segment would arrive at
+        a handler as an argument and be reported as a missing neighbour
+        rather than as a bad URL. An unresolvable path is a 404 that
+        names the index.
+
+
+        Pagination keywords are the handler's, not this layer's: the BGP
+        table pages by `offset`, the core's route table by `after`, and
+        several views take neither. Sending one to a view that declares
+        its keywords is a 400 naming the parameter; a view that takes
+        arbitrary keywords ignores what it does not use, so read what
+        came back rather than assuming a page was a page.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/After'
+      responses:
+        '200':
+          description: >-
+            The view's document. Its shape is the handler's own -- a
+            summary, a table with `items` and `next`, a single object --
+            so it is not constrained here.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShowResult'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /clear:
+    get:
+      tags: [actions]
+      operationId: getClearIndex
+      summary: Every action this engine offers
+      description: >-
+        A `GET`, even though the actions themselves are `POST`s:
+        enumerating what can be done must not do any of it. As with
+        `/show`, the list depends on the plugins registered here, and
+        `/clear/` is the same URL rather than a second one.
+      responses:
+        '200':
+          description: The actions this engine offers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearIndex'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /clear/{command}:
+    parameters:
+      - $ref: '#/components/parameters/Command'
+    post:
+      tags: [actions]
+      operationId: clearCommand
+      summary: Run one action
+      description: >-
+        `clear ip bgp` is the most dangerous command an operator types
+        at a BGP speaker, and the difference between its forms is the
+        difference between a free operation and a minute of churn
+        propagated to every peer. With no body at all, or with
+        `{"soft": false}`, `POST /clear/ip/bgp` drops every session:
+        both ends forget everything and relearn it. With
+        `{"soft": "in"}` it does not -- inbound policy is re-run over
+        the paths already held, and a ROUTE-REFRESH is sent when the
+        capability was negotiated. `{"soft": "out"}` re-advertises this
+        router's choices from the update group's record. Both soft forms
+        are cheap.
+
+
+        `POST /clear/ip/bgp/10.0.0.2` is deliberately a 404, and the
+        body names `/clear/ip/bgp/neighbor/10.0.0.2` instead. It looks
+        exactly like a request to clear one neighbour, but engine
+        dispatch would match `clear ip bgp` and pass the address on as
+        the first positional argument -- which that handler reads as the
+        soft directive, because `clear ip bgp soft in` is a real CLI
+        spelling. An address is not one of `in`/`out`/`both`, so the
+        request would clear *every* session, softly, and nothing in the
+        response would say so.
+
+
+        A typo in `soft` is rejected rather than interpreted, for the
+        same reason.
+      requestBody:
+        required: false
+        description: >-
+          Omit it entirely for a hard clear. The body takes no key other
+          than `soft`.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClearRequest'
+      responses:
+        '200':
+          description: >-
+            The handler's report, naming what was actually cleared and
+            in which direction -- the only way for a client to confirm
+            that a soft clear was soft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearResult'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+
+  /router/bgp:
+    get:
+      tags: [configuration]
+      operationId: getBgpInstances
+      summary: The BGP instances, keyed by AS number
+      description: >-
+        One entry in v1: a second `router bgp` is a conflict rather than
+        an invalid document, and it is reported as 409 when a write
+        would create one. Nothing configured here is a 404 rather than
+        an empty object -- the resource is the subtree, and a subtree
+        that is not in the document is not there.
+      responses:
+        '200':
+          description: The `router bgp` section, secrets redacted.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpInstances'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+    get:
+      tags: [configuration]
+      operationId: getBgpInstance
+      summary: One BGP instance
+      description: >-
+        The whole instance -- timers, bestpath, every neighbour and
+        every address family -- with any neighbour password reading back
+        as `"<redacted>"`.
+      responses:
+        '200':
+          description: The instance, secrets redacted.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpInstance'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putBgpInstance
+      summary: Create or replace a BGP instance
+      description: >-
+        A replace: neighbours and families absent from the body are
+        removed, and removing a neighbour drops its session. Use `PATCH`
+        to change one setting, or `PUT` on the neighbour's own URL to
+        replace just that neighbour.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpInstance'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchBgpInstance
+      summary: Merge into a BGP instance
+      description: >-
+        Merged key by key into what is stored, so
+        `{"bestpath": {"always-compare-med": true}}` leaves the rest of
+        `bestpath` alone. A `null` removes a key. The merge is against
+        the redacted document, so a neighbour's password survives a
+        patch that never mentions it.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpInstance'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteBgpInstance
+      summary: Remove a BGP instance -- IOS `no router bgp`
+      description: >-
+        Every session this instance holds is torn down and everything it
+        learned is withdrawn, including from the forwarding plane.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}/neighbor:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+    get:
+      tags: [configuration]
+      operationId: getBgpNeighbors
+      summary: The configured neighbours, keyed by address
+      description: >-
+        Configuration, not state: a neighbour appears here whether or
+        not its session is up. For the sessions, use
+        `GET /show/ip/bgp/summary`.
+      responses:
+        '200':
+          description: The `neighbor` section, passwords redacted.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpNeighbors'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}/neighbor/{addr}:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+      - $ref: '#/components/parameters/Addr'
+    get:
+      tags: [configuration]
+      operationId: getBgpNeighbor
+      summary: One neighbour's configuration
+      description: >-
+        `password` reads back as `"<redacted>"`. Send that value back
+        unchanged to keep the stored password; send a new string to
+        change it; send `null` in a `PATCH` to remove it.
+      responses:
+        '200':
+          description: The neighbour, password redacted.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpNeighbor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putBgpNeighbor
+      summary: Create or replace a neighbour
+      description: >-
+        Changing anything the two ends agreed on in OPEN, or anything
+        about the transport -- `remote-as`, `local-as`, `password`,
+        `ao`, `update-source`, `ttl-security`, `ebgp-multihop`,
+        `passive`, `shutdown`, `timers`, `capability`, `port` -- resets
+        the session. Everything else is applied to a running session in
+        place. A replace therefore resets the session whenever it
+        changes one of those, including by omitting it.
+
+
+        Authentication is checked when the change is prepared, not when
+        the session next connects: a kernel with no TCP-MD5 rejects a
+        `password` here with 400, because finding out at connect time
+        leaves the operator with a peer that will not come up and no
+        explanation attached to the thing they typed.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpNeighbor'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchBgpNeighbor
+      summary: Merge into a neighbour
+      description: >-
+        The safe way to change one field of a neighbour that has a
+        password: the merge is against the redacted document, so a
+        client can set `description` without ever holding the secret it
+        is preserving.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpNeighbor'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteBgpNeighbor
+      summary: Remove a neighbour -- IOS `no neighbor`
+      description: >-
+        The session is closed with a NOTIFICATION and everything learned
+        from it is withdrawn. To stop talking to a peer while keeping
+        its configuration, `PATCH` `{"shutdown": true}` instead.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}/neighbor/{addr}/address-family/{afi}/{safi}:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+      - $ref: '#/components/parameters/Addr'
+      - $ref: '#/components/parameters/Afi'
+      - $ref: '#/components/parameters/Safi'
+    get:
+      tags: [configuration]
+      operationId: getBgpNeighborAddressFamily
+      summary: One neighbour's settings for one address family
+      description: >-
+        Policy is per neighbour *and* per family, which is where IOS
+        puts it too: the same neighbour legitimately filters IPv4 and
+        IPv6 differently, and a single per-neighbour route-map could not
+        express that.
+      responses:
+        '200':
+          description: The per-neighbour, per-family settings.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NeighborAddressFamily'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putBgpNeighborAddressFamily
+      summary: Create or replace a neighbour's family settings
+      description: >-
+        The three policy objects compose and run in order: a
+        prefix-list filters on the NLRI, a filter-list on the AS path,
+        and a route-map can do both and rewrite attributes as well.
+        Naming one that does not exist is accepted -- the chain simply
+        matches nothing until it does -- so check the name.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NeighborAddressFamily'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchBgpNeighborAddressFamily
+      summary: Merge into a neighbour's family settings
+      description: >-
+        `{"route-map": {"in": null}}` removes the inbound route-map and
+        leaves the outbound one, which a `PUT` of the same object could
+        not do without resending it.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NeighborAddressFamily'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteBgpNeighborAddressFamily
+      summary: Remove a neighbour's settings for one family
+      description: >-
+        Removing the block deactivates the family for this neighbour and
+        withdraws what it carried, which is not the same as setting
+        `activate` to false and keeping the policy for later.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}/address-family:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+    get:
+      tags: [configuration]
+      operationId: getBgpAddressFamilies
+      summary: The instance's address families, keyed by AFI then SAFI
+      description: >-
+        Two levels of key rather than one `ipv4-unicast` token, matching
+        the two nested keys the schema validates. The instance-level
+        block holds the networks this router originates and how it
+        selects among paths; the per-neighbour blocks live under each
+        neighbour.
+      responses:
+        '200':
+          description: The `address-family` section.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpAddressFamilies'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}/address-family/{afi}/{safi}:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+      - $ref: '#/components/parameters/Afi'
+      - $ref: '#/components/parameters/Safi'
+    get:
+      tags: [configuration]
+      operationId: getBgpAddressFamily
+      summary: One instance-level address family
+      description: >-
+        An address family the plugin does not carry is rejected when it
+        is written, not when it is read, so anything here is a family
+        this engine actually has a table for.
+      responses:
+        '200':
+          description: The family block.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpAddressFamily'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putBgpAddressFamily
+      summary: Create or replace an instance-level address family
+      description: >-
+        A family this engine's plugins do not carry is a 400 naming the
+        family, rather than a block that is accepted and then quietly
+        does nothing.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpAddressFamily'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchBgpAddressFamily
+      summary: Merge into an instance-level address family
+      description: >-
+        A merge reaches into `network` as well, so a patch naming one
+        prefix adds or changes that one and leaves the others. To
+        replace the whole set of originated networks, `PUT` this
+        resource.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpAddressFamily'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteBgpAddressFamily
+      summary: Remove an instance-level address family
+      description: >-
+        Withdraws everything this router originated in the family. The
+        neighbours' own blocks for it are not touched: they live under
+        each neighbour and are removed there.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}/address-family/{afi}/{safi}/network:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+      - $ref: '#/components/parameters/Afi'
+      - $ref: '#/components/parameters/Safi'
+    get:
+      tags: [configuration]
+      operationId: getBgpNetworks
+      summary: The prefixes this router originates in a family
+      description: >-
+        What is configured to be originated, which is not the same as
+        what is being advertised: with `import-check` set, a network
+        that nothing in the local table backs is configured here and
+        absent from the table. `GET /show/ip/bgp` is the second half of
+        that question.
+      responses:
+        '200':
+          description: The `network` section, keyed by prefix.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpNetworks'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /router/bgp/{asn}/address-family/{afi}/{safi}/network/{prefix}:
+    parameters:
+      - $ref: '#/components/parameters/Asn'
+      - $ref: '#/components/parameters/Afi'
+      - $ref: '#/components/parameters/Safi'
+      - $ref: '#/components/parameters/Prefix'
+    get:
+      tags: [configuration]
+      operationId: getBgpNetwork
+      summary: One originated prefix
+      responses:
+        '200':
+          description: The network's options.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BgpNetwork'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putBgpNetwork
+      summary: Originate a prefix -- IOS `network`
+      description: >-
+        An empty object is the ordinary case: it originates the prefix
+        with no options. The prefix is canonicalised from the URL, so
+        the entry is stored and found under one spelling however it was
+        written.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpNetwork'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchBgpNetwork
+      summary: Merge into one originated prefix
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BgpNetwork'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteBgpNetwork
+      summary: Stop originating a prefix -- IOS `no network`
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+
+  /ip/prefix-list:
+    get:
+      tags: [configuration]
+      operationId: getIpPrefixLists
+      summary: The IPv4 prefix-lists, keyed by name
+      responses:
+        '200':
+          description: Every IPv4 prefix-list.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrefixLists'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ip/prefix-list/{name}:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+    get:
+      tags: [configuration]
+      operationId: getIpPrefixList
+      summary: One IPv4 prefix-list
+      description: >-
+        An array of entries, evaluated in `seq` order, first match
+        wins. No implicit deny is added here: what the chain does when
+        nothing matches is the policy engine's business, not this
+        document's.
+      responses:
+        '200':
+          description: The list's entries.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrefixList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putIpPrefixList
+      summary: Create or replace an IPv4 prefix-list
+      description: >-
+        The whole list at once. There is no `PATCH` here and no
+        per-entry URL, because the resource is an array: merging into
+        one would have to decide whether a body of three entries adds
+        to, replaces or reorders the stored five, and every answer to
+        that is a surprise waiting for somebody. A policy already
+        referring to this name starts using the new entries on the next
+        evaluation.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrefixList'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteIpPrefixList
+      summary: Remove an IPv4 prefix-list
+      description: >-
+        A neighbour still naming this list keeps naming it; the chain
+        matches nothing until the list comes back. That is deliberate --
+        refusing the delete would make the order in which an operator
+        rewrites their policy part of the contract.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ipv6/prefix-list:
+    get:
+      tags: [configuration]
+      operationId: getIpv6PrefixLists
+      summary: The IPv6 prefix-lists, keyed by name
+      description: >-
+        A separate namespace from `/ip/prefix-list`, as in IOS: the same
+        name can exist in both and mean different things.
+      responses:
+        '200':
+          description: Every IPv6 prefix-list.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrefixLists'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ipv6/prefix-list/{name}:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+    get:
+      tags: [configuration]
+      operationId: getIpv6PrefixList
+      summary: One IPv6 prefix-list
+      responses:
+        '200':
+          description: The list's entries.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrefixList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putIpv6PrefixList
+      summary: Create or replace an IPv6 prefix-list
+      description: >-
+        The whole list at once, for the reason given on the IPv4
+        resource: an array has no sensible merge.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrefixList'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteIpv6PrefixList
+      summary: Remove an IPv6 prefix-list
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /route-map:
+    get:
+      tags: [configuration]
+      operationId: getRouteMaps
+      summary: The route-maps, keyed by name
+      description: >-
+        One namespace for both address families, which is where IOS puts
+        route-maps and is why these are not under `/ip` and `/ipv6`.
+      responses:
+        '200':
+          description: Every route-map.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteMaps'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /route-map/{name}:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+    get:
+      tags: [configuration]
+      operationId: getRouteMap
+      summary: One route-map
+      description: >-
+        An array of clauses in `seq` order. The `match` and `set`
+        objects are the policy engine's vocabulary, and the
+        configuration schema accepts them opaquely rather than growing
+        a key every time a match clause is added; the policy engine is
+        what rejects a clause it cannot compile, at commit time.
+      responses:
+        '200':
+          description: The map's clauses.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteMap'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putRouteMap
+      summary: Create or replace a route-map
+      description: >-
+        The whole map at once; as with a prefix-list, an array has no
+        sensible merge. A map in use is swapped atomically with the
+        rest of the commit, so no update is ever evaluated against half
+        of it.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RouteMap'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteRouteMap
+      summary: Remove a route-map
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ip/route/static:
+    get:
+      tags: [configuration]
+      operationId: getIpStaticRoutes
+      summary: The IPv4 static routes, keyed by prefix
+      responses:
+        '200':
+          description: Every configured IPv4 static route.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaticRoutes'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ip/route/static/{prefix}:
+    parameters:
+      - $ref: '#/components/parameters/Prefix'
+    get:
+      tags: [configuration]
+      operationId: getIpStaticRoute
+      summary: One IPv4 static route
+      description: >-
+        Configuration, not the forwarding table: a static route appears
+        here whether or not it won selection or reached the kernel. For
+        what is actually installed, `GET /show/ip/route`.
+      responses:
+        '200':
+          description: The route's next hop and preferences.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaticRoute'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putIpStaticRoute
+      summary: Create or replace an IPv4 static route
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaticRoute'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchIpStaticRoute
+      summary: Merge into an IPv4 static route
+      description: >-
+        Useful for changing a `distance` without restating the next
+        hop, which is the field a typo in would send traffic somewhere
+        else.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaticRoute'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteIpStaticRoute
+      summary: Remove an IPv4 static route
+      description: >-
+        If the engine installed this route in the kernel it is
+        withdrawn as part of the same commit, because that route is ours
+        and nothing else will ever remove it.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ipv6/route/static:
+    get:
+      tags: [configuration]
+      operationId: getIpv6StaticRoutes
+      summary: The IPv6 static routes, keyed by prefix
+      responses:
+        '200':
+          description: Every configured IPv6 static route.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaticRoutes'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ipv6/route/static/{prefix}:
+    parameters:
+      - $ref: '#/components/parameters/Prefix'
+    get:
+      tags: [configuration]
+      operationId: getIpv6StaticRoute
+      summary: One IPv6 static route
+      responses:
+        '200':
+          description: The route's next hop and preferences.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaticRoute'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    put:
+      tags: [configuration]
+      operationId: putIpv6StaticRoute
+      summary: Create or replace an IPv6 static route
+      description: >-
+        The IPv6 tree has no `install` settings of its own: one
+        forwarding-plane policy covers both families, and it lives at
+        `/ip/route/install`.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaticRoute'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchIpv6StaticRoute
+      summary: Merge into an IPv6 static route
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaticRoute'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    delete:
+      tags: [configuration]
+      operationId: deleteIpv6StaticRoute
+      summary: Remove an IPv6 static route
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+  /ip/route/install:
+    get:
+      tags: [configuration]
+      operationId: getRouteInstall
+      summary: The forwarding-plane settings, as they are in effect
+      description: >-
+        Effective rather than configured. The schema's defaults are not
+        written into the document, so a client reading the raw subtree
+        of a fresh engine would see `{}` and have to know from
+        somewhere that `install` is false, the table is 254 and the
+        protocol id is 190. The one question this endpoint exists to
+        answer is "is this engine writing the kernel routing table, and
+        as whom" -- `sink` is the other half of that answer, and it is
+        the running sink rather than a setting.
+
+
+        The static routes are not here: they are a table with their own
+        resource, `/ip/route/static`.
+      responses:
+        '200':
+          description: The settings in effect, defaults filled in.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteInstall'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+    patch:
+      tags: [configuration]
+      operationId: patchRouteInstall
+      summary: Change the forwarding-plane settings
+      description: >-
+        Not a flag to toggle idly, and this endpoint does not pretend
+        otherwise. Turning `install` on opens a netlink socket and
+        reconciles against the routes already in the kernel carrying our
+        protocol id; turning it off withdraws everything we installed,
+        because those routes are ours and nothing else will ever remove
+        them. Both happen inside the engine's commit, so the response
+        arrives after the kernel has agreed -- and a kernel that refuses
+        is a 500 with the reason, not a setting that silently did
+        nothing. That commit is one transaction: if the kernel refuses
+        the socket, the plugins and the stored configuration are rolled
+        back with it and the previous sink keeps running.
+
+
+        The engine builds the sink from these settings itself, so this
+        works from the stock `rtengine` command. Changing `table`,
+        `protocol` or `priority` while installing withdraws the routes
+        under the old identity and installs them under the new one.
+        `install: true` on a host that cannot honour it -- not Linux,
+        or no `CAP_NET_ADMIN` -- is a 400, as are tables 0 and 255. An
+        embedding application that injected a sink of its own keeps
+        it; asking that sink to install when it cannot write is a 409.
+
+
+        `PATCH` only, and only the keys above: `static` is deliberately
+        not one of them, because a merge containing one static route
+        through this endpoint would silently delete the others.
+        Unknown keys are rejected rather than ignored.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RouteInstallPatch'
+      responses:
+        '200':
+          $ref: '#/components/responses/Mutation'
+        '400':
+          $ref: '#/components/responses/Invalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/ApplyFailed'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/Timeout'
+
+
+components:
+
+  securitySchemes:
+
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        `Authorization: Bearer <token>`, compared in constant time so
+        that a wrong token cannot be found one byte at a time by
+        measuring how long the comparison took.
+
+
+        Only enforced when `api.auth` is configured -- with
+        `api.auth.token`, or better with `api.auth.token-file`, because
+        a file has permissions and a configuration document gets copied
+        into support bundles. With neither, this engine serves an open
+        API, which is defensible only because the default bind is
+        loopback: a non-loopback bind with nothing to authenticate it is
+        refused at start-up rather than served, and an operator who
+        genuinely wants one -- behind a proxy that authenticates, say --
+        says so with `api.insecure: true`.
+
+
+        The token is re-read when the configuration revision changes, so
+        rotating `api.auth.token` through this API has rotated it: the
+        old value stops working on the next request and nothing is
+        restarted. A token file is watched as well: rewriting it takes
+        effect within a second, and a rewrite that leaves it empty or
+        unreadable keeps the previous token rather than opening the API.
+        Every operation below can answer 401 for that reason; on an
+        engine with no token configured it never will.
+
+
+        No method is exempt -- `OPTIONS` included, since this API sends
+        no CORS headers and has no preflight to answer. The only
+        exemption is `GET` (and `HEAD`) of `/engine/health`, and only
+        with `api.auth.allow-unauthenticated-health`.
+
+  headers:
+
+    ETag:
+      description: >-
+        The configuration revision as an entity tag: `"7"` is revision
+        7. The document's revision, not this resource's -- a commit is
+        atomic across the whole document, so two reads of different
+        resources carrying the same `ETag` saw the same configuration.
+
+
+        Send it back in `If-Match` on the write that follows and the
+        engine refuses with 412 if anybody committed in between.
+      schema:
+        type: string
+      example: '"7"'
+
+  parameters:
+
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: >-
+        The revision the client believes is current, as returned in
+        `ETag`. The quotes and a `W/` prefix are both accepted, and so
+        is the bare number.
+
+
+        This is how a client avoids clobbering somebody else's change:
+        read, edit, write back with the revision you read, and a write
+        that would land on top of state you never saw is refused with
+        412 rather than applied. Omitting the header is last-write-wins,
+        which is what omitting it asks for; `*` means the same thing and
+        exists so that a client library which insists on sending the
+        header has something to send.
+      schema:
+        type: string
+      example: '"7"'
+
+    Asn:
+      name: asn
+      in: path
+      required: true
+      description: >-
+        The autonomous system number of the BGP instance, 1 to
+        4294967295. It stays a string the whole way through: the
+        configuration document keys `router bgp` by AS number, JSON
+        object keys are strings, and `65000` and `"65000"` would be two
+        different keys in the one place it matters. A number outside
+        that range is a 400, not a 404: it cannot name an instance.
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+      example: '65000'
+
+    Addr:
+      name: addr
+      in: path
+      required: true
+      description: >-
+        A neighbour's address, in either family and without a prefix
+        length -- `10.0.0.2` or `2001:db8::2`. A prefix here is not a
+        neighbour and is rejected as a 404 by the router rather than
+        reaching a handler. Something shaped like an address that is
+        not one -- `10.0.0.256` -- is a 400 saying why.
+
+
+        The address is canonicalised before it is looked up, and the
+        stored key is matched by value: `2001:db8:0::2` finds the
+        neighbour written as `2001:db8::2`, because otherwise a document
+        loaded from a file could contain an entry this API insisted did
+        not exist.
+      schema:
+        type: string
+      example: 10.0.0.2
+
+    Afi:
+      name: afi
+      in: path
+      required: true
+      description: >-
+        The address family. Two segments rather than one `ipv4-unicast`
+        token, matching the two nested keys the configuration schema
+        validates.
+      schema:
+        type: string
+        enum: [ipv4, ipv6]
+      example: ipv4
+
+    Safi:
+      name: safi
+      in: path
+      required: true
+      description: >-
+        The subsequent address family. Only `unicast` in v1; anything
+        else is rejected when it is written rather than accepted and
+        quietly ignored.
+      schema:
+        type: string
+        enum: [unicast]
+      example: unicast
+
+    Name:
+      name: name
+      in: path
+      required: true
+      description: >-
+        The name of a prefix-list or a route-map. It must start with a
+        letter, a digit or an underscore, and may then also contain
+        dots and hyphens.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_][A-Za-z0-9_.\-]*$'
+      example: ALLOW-CUSTOMERS
+
+    Prefix:
+      name: prefix
+      in: path
+      required: true
+      description: >-
+        An address and a length, in either family: `192.0.2.0/24` or
+        `2001:db8::/32`.
+
+
+        The slash is part of this one path segment, not a separator
+        between two. `/ip/route/static/192.0.2.0/24` is a prefix at the
+        end of that URL and nothing else, because the converter matches
+        the address and the length together; there is no need to encode
+        it. `%2F` works as well -- a WSGI server has already decoded it
+        by the time routing sees the path, so the two spellings are
+        indistinguishable here -- and a client assembling URLs
+        programmatically may prefer it.
+
+
+        The prefix is canonicalised, so the entry is stored and found
+        under one spelling however it was written. One that cannot be
+        a prefix -- `192.0.2.0/33`, `192.0.2.300/24` -- is a 400 saying
+        why, not a 404.
+      schema:
+        type: string
+      example: 192.0.2.0/24
+
+    Command:
+      name: command
+      in: path
+      required: true
+      description: >-
+        The command, as several slash-separated segments: the CLI's
+        words with spaces replaced by slashes, so `show ip bgp summary`
+        is `ip/bgp/summary`. It is one path parameter that matches the
+        whole remainder of the URL, however many segments that is.
+
+
+        A trailing address-and-length pair is put back together into one
+        prefix when, and only when, it forms a valid one, which is also
+        the only position any of these commands takes a prefix.
+
+
+        Which paths resolve depends on the plugins this engine has
+        registered; `GET /show` and `GET /clear` enumerate them, and an
+        unresolvable path is a 404 that says so.
+      schema:
+        type: string
+      example: ip/bgp/summary
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: >-
+        The most rows to return. Capped at `api.max-page` rather than
+        rejected -- a client asking for everything is asking a
+        reasonable question badly -- and each paging view says what it
+        did, with `returned` and `truncated` on the BGP table and a
+        `next` cursor on the route tables, so a page cannot be mistaken
+        for the whole of one.
+
+
+        `0` is refused with `400`, not capped and not passed on: it
+        means "no rows" to you and, in the usual `rows[:limit] if limit
+        else rows` idiom, "every row" to a handler, and the request
+        where those two readings differ most is the one against a full
+        table. Omit the parameter to let the view choose.
+
+
+        Only the views that page take it, and what happens to one that
+        does not depends on the view: see `GET /show/{command}`.
+      schema:
+        type: integer
+        minimum: 1
+      example: 100
+
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: >-
+        How many rows to skip. For tables that can be counted; the
+        route tables page with `after` instead, because a table that is
+        being rewritten between two requests has no stable offset.
+      schema:
+        type: integer
+        minimum: 0
+      example: 0
+
+    After:
+      name: after
+      in: query
+      required: false
+      description: >-
+        Resume after this key -- the `next` value from the previous
+        page, which is the last prefix that page returned; this page
+        starts with the first prefix after it. `next` is null on the
+        last page. A cursor rather than an offset: the RIB changes under
+        a reader, and paging it by position would skip and repeat rows
+        rather than merely being out of date.
+      schema:
+        type: string
+      example: 192.0.2.0/24
+
+  responses:
+
+    Mutation:
+      description: >-
+        The change was validated, prepared by every affected plugin and
+        committed. The body carries the revision it produced -- which is
+        how a client tells its own change from somebody else's and
+        builds the next `If-Match` -- and the same value is in `ETag`.
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Mutation'
+
+    Invalid:
+      description: >-
+        The request was rejected before anything was applied: a document
+        the schema does not accept, a body that is not JSON, a value a
+        plugin refuses to prepare, an `If-Match` that is not a revision,
+        or a query parameter the view does not take. `error` is
+        `Invalid`, and `path` names the offending value where there is
+        one. Nothing was committed and the revision has not moved.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Unauthorized:
+      description: >-
+        No usable bearer token. Missing, malformed and wrong all say the
+        same thing on purpose: telling a caller that their token was
+        well formed but wrong is telling them they are close.
+      headers:
+        WWW-Authenticate:
+          description: >-
+            Required by RFC 7235, and the only hint a human poking at
+            this API with curl gets about what is missing.
+          schema:
+            type: string
+          example: Bearer realm="rtengine"
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: >-
+        Nothing is configured at this path, or no handler answers this
+        command. Distinct from `Invalid`: asking about a neighbour that
+        is not configured is not a malformed request, and a 400 would
+        tell a client to fix a URL that is perfectly well formed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    MethodNotAllowed:
+      description: >-
+        The URL exists and this method is not one it takes -- `PATCH` on
+        a prefix-list, which is an array and has no sensible merge, or
+        `DELETE` on a collection. Rendered into the same envelope as
+        everything else, because a client that has to parse two error
+        formats will parse one of them badly, and the one it gets wrong
+        will be the one it sees during an outage.
+
+
+        No operation declares this response, and it is defined here
+        anyway: a 405 arrives exactly when the method is not one of the
+        operations in this document, so there is no operation to attach
+        it to, and leaving it out would mean a client reading the
+        document had never been told the shape of a reply it can
+        certainly receive.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Conflict:
+      description: >-
+        The document is well formed and collides with a stated limit or
+        with existing state. A second `router bgp` is the case in v1:
+        one instance is supported, so a second AS number is a conflict
+        rather than an invalid document, and the difference matters to a
+        client deciding whether to fix the body or to look at what is
+        already configured.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    PreconditionFailed:
+      description: >-
+        `If-Match` named a revision that is no longer current: somebody
+        committed between the read and this write. Nothing was applied.
+        The body carries both the revision the client expected and the
+        one that is current, so a client can re-read, re-apply its edit
+        and try again rather than guessing.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    PayloadTooLarge:
+      description: >-
+        The body is larger than `api.max-body-bytes`. Checked against
+        `Content-Length` before the body is read, because the point of a
+        limit is not to reject the request, it is not to have buffered
+        it first.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    ApplyFailed:
+      description: >-
+        The change was accepted and then failed while being applied --
+        a plugin that could not commit, a kernel that refused a route.
+        `rolled_back` says whether the inverse change was delivered to
+        the plugins that had already committed; rollback is best effort
+        by design, because a session a plugin has already reset cannot
+        be un-reset. The running configuration does not advance either
+        way, so re-reading it is how a client finds out where it stands.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    InternalError:
+      description: >-
+        A defect in this engine, and the body says so rather than
+        pretending the client got something wrong. The traceback goes to
+        the log and not into the response: it names files and line
+        numbers.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Unavailable:
+      description: >-
+        The engine is not running, or is shutting down. Answered rather
+        than served from state nobody is maintaining: a stale answer
+        from a stopped engine is worse than no answer, because it looks
+        like a working one.
+
+
+        Also the answer when 64 API commands are already waiting on the
+        engine's loop: the engine is alive but behind, and the response
+        carries `Retry-After` to say so. A command counts until it
+        finishes, including one whose own request has timed out.
+      headers:
+        Retry-After:
+          description: >-
+            Seconds to wait before retrying. Present only when the
+            engine is busy rather than stopped.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Timeout:
+      description: >-
+        The command did not finish inside the request's budget. `state`
+        is the part worth reading: `cancelled` means it never started
+        and nothing happened, `unknown` means it had already begun and
+        was not interrupted -- half-applying a configuration change is
+        the outcome that design exists to prevent -- so it ran to
+        completion and the client has to re-read to find out which way
+        it went. The revision in the body is the one from before the
+        call, to compare against.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+
+    Error:
+      type: object
+      description: >-
+        The one error envelope. Every failure in this API arrives in
+        this shape -- the engine's own exceptions, the router's 404 and
+        405, the body limit's 413, and a defect in a handler -- because
+        a client that has to parse two error formats will parse one of
+        them badly, and the format it gets wrong will be the one it
+        sees during an outage.
+
+
+        `error` is the engine's token rather than the HTTP status, so a
+        client switching on it does not have to care that "the document
+        is invalid" and "that prefix is not a prefix" are both 400.
+      required: [error, detail]
+      properties:
+        error:
+          type: string
+          description: >-
+            The failure, as a token. The set is closed and is the same
+            set the engine raises internally.
+          enum:
+            - Invalid
+            - Unauthorized
+            - NotFound
+            - MethodNotAllowed
+            - Conflict
+            - PreconditionFailed
+            - PayloadTooLarge
+            - ApplyFailed
+            - Error
+            - Unavailable
+            - Timeout
+        detail:
+          type: string
+          description: >-
+            What went wrong, for a human. Never a traceback.
+          example: 'nothing is configured at router.bgp.65000'
+        path:
+          type: string
+          nullable: true
+          description: >-
+            The dotted configuration path or the request path the
+            failure applies to, or null when it applies to neither.
+          example: router.bgp.65000.neighbor.10.0.0.2.timers.keepalive
+        expected:
+          type: integer
+          description: >-
+            `PreconditionFailed` only: the revision `If-Match` asked
+            for.
+        revision:
+          type: integer
+          nullable: true
+          description: >-
+            `PreconditionFailed`: the revision that is actually current.
+            `Timeout`: the revision as it was before the call, so a
+            client that reads `unknown` has something to compare
+            against.
+        rolled_back:
+          type: boolean
+          description: >-
+            `ApplyFailed` only: whether the inverse change reached the
+            plugins that had already committed. Best effort -- a
+            session that was reset cannot be un-reset.
+        state:
+          type: string
+          description: >-
+            `Timeout` only. `cancelled` means the command never started
+            and nothing happened; `unknown` means it had started, was
+            not interrupted, and the client must re-read.
+          enum: [cancelled, unknown]
+      additionalProperties: true
+
+    Mutation:
+      type: object
+      description: >-
+        What every successful change returns. The revision is the point
+        of it: it is the `ETag` of the configuration after the change,
+        and the `If-Match` a client sends with its next write.
+      required: [revision]
+      properties:
+        revision:
+          type: integer
+          description: The configuration revision after the change.
+          example: 8
+        path:
+          type: string
+          description: >-
+            The configuration path that changed, dotted, and as it is
+            actually stored -- which is not always as it was spelled in
+            the URL, because prefixes and addresses are matched by
+            value.
+          example: router.bgp.65000.neighbor.10.0.0.2
+      additionalProperties: false
+
+    ServiceIndex:
+      type: object
+      description: The service banner served at the root of the API.
+      properties:
+        name:
+          type: string
+          example: rtengine
+        version:
+          type: string
+          description: The engine's version, not the API's.
+          example: 2.2.1
+        links:
+          type: object
+          description: >-
+            Absolute paths, prefix included, so they can be followed
+            without knowing where this document's `servers` entry
+            points.
+          properties:
+            openapi:
+              type: string
+              example: /api/v1/openapi.json
+            status:
+              type: string
+            health:
+              type: string
+            running-config:
+              type: string
+            show:
+              type: string
+            clear:
+              type: string
+          additionalProperties: true
+      additionalProperties: true
+
+    Status:
+      type: object
+      description: >-
+        Identity and configuration: what this engine is. The engine's
+        own status document with the REST layer's view of itself merged
+        into `api`, because the bind, the authentication policy and the
+        bridge's counters are facts the engine has no way to know and
+        answering one question should not need two polls.
+
+
+        Open-ended on purpose: each registered plugin contributes to it,
+        so the keys grow with the plugins.
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        revision:
+          type: integer
+          description: The configuration revision, as in `ETag`.
+        running:
+          type: boolean
+        plugins:
+          type: array
+          description: The registered plugins and the families they carry.
+          items:
+            type: object
+            additionalProperties: true
+        tables:
+          type: array
+          description: The RIB tables, as `afi/safi`.
+          items:
+            type: string
+          example: ['1/1', '2/1']
+        fib:
+          type: object
+          description: The forwarding sink and whether it writes.
+          additionalProperties: true
+        policy:
+          type: object
+          description: How much policy is loaded.
+          additionalProperties: true
+        api:
+          type: object
+          description: >-
+            The REST layer: where it is bound, what it requires, and
+            what the bridge onto the engine's loop has been doing.
+          properties:
+            bind:
+              type: string
+              example: 127.0.0.1:8179
+            auth:
+              type: object
+              description: >-
+                The policy in force, never the token. `source` says
+                where it came from -- `none`, `config` or
+                `file:<path>`.
+              properties:
+                required:
+                  type: boolean
+                source:
+                  type: string
+                allow-unauthenticated-health:
+                  type: boolean
+                reloads:
+                  type: integer
+                  description: >-
+                    Times a rewritten token file was picked up without
+                    a configuration change.
+              additionalProperties: false
+            max-body-bytes:
+              type: integer
+            max-page:
+              type: integer
+            bridge:
+              type: object
+              description: >-
+                Calls made, and how many were cancelled, reported
+                unknown or run inline because the caller was already on
+                the loop. A rising `unknown` is the one to watch: it
+                means requests are giving up on a loop that is still
+                working. `in_flight` is how many are queued or running
+                on the loop now, `max_in_flight` the cap past which a
+                request is answered 503 with `Retry-After`, and
+                `refused` how often that has happened.
+              additionalProperties: true
+          additionalProperties: true
+      additionalProperties: true
+
+    Health:
+      type: object
+      description: >-
+        Exactly what `Engine.health()` returns, with nothing added by
+        this layer, because a monitoring rule written against one must
+        hold for the other.
+
+
+        `status` is the roll-up and the only key worth alerting on
+        without reading the rest; each section below it says which
+        subsystem produced its own. Open-ended for the same reason as
+        `/engine/status`: the `plugins` section is whatever the
+        registered plugins report.
+      properties:
+        status:
+          type: string
+          description: >-
+            The roll-up across every subsystem. `down` on a control
+            plane with no session established is normal at start-up and
+            is not by itself a fault.
+          example: ok
+        pid:
+          type: integer
+        uptime_s:
+          type: number
+        rss_bytes:
+          type: integer
+        loop:
+          type: object
+          description: >-
+            Event-loop lag. The number that says whether this engine is
+            keeping up with its own work.
+          additionalProperties: true
+        config:
+          type: object
+          description: The configuration revision.
+          additionalProperties: true
+        rib:
+          type: object
+          description: Table sizes and what has been selected.
+          additionalProperties: true
+        fib:
+          type: object
+          description: >-
+            The forwarding sink: what it installed, what it withdrew,
+            and whether it is writing at all.
+          additionalProperties: true
+        resolver:
+          type: object
+          additionalProperties: true
+        events:
+          type: object
+          additionalProperties: true
+        commands:
+          type: object
+          additionalProperties: true
+        batches:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        plugins:
+          type: object
+          description: >-
+            One section per registered plugin, keyed by its name, and
+            each plugin's own document.
+          additionalProperties: true
+      additionalProperties: true
+
+    Plugins:
+      type: object
+      description: >-
+        The registered protocol plugins. Worth reading before anything
+        that varies by plugin: the `/show` and `/clear` vocabularies and
+        the `router` section of the configuration document all grow with
+        this list.
+      required: [plugins]
+      properties:
+        plugins:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                example: bgp
+              afi_safi:
+                type: array
+                description: >-
+                  The families this plugin carries, each as a
+                  two-element `[afi, safi]` pair of IANA numbers --
+                  `[1, 1]` is IPv4 unicast.
+                items:
+                  type: array
+                  items:
+                    type: integer
+              admin_distance:
+                type: object
+                description: >-
+                  The plugin's default distances, by which its paths
+                  compete with other sources in the RIB.
+                additionalProperties:
+                  type: integer
+              config_section:
+                type: string
+                description: >-
+                  Where this plugin's configuration lives, dotted.
+                example: router.bgp
+            additionalProperties: true
+      additionalProperties: false
+
+    ConfigSchema:
+      type: object
+      description: >-
+        The configuration schema: the core's sections plus every
+        registered plugin's, which is why it is served rather than
+        written down here. This document describes the *shape* of each
+        resource; the schema is the vocabulary, and it is the complete
+        answer to "what may I put in this document".
+
+
+        A node carries a `type` -- `dict`, `list`, `int`, `bool`, `str`,
+        `prefix`, `addr`, `secret` or `any` -- and the keys that type
+        uses: `keys` for a fixed set, `key_type` and `value` for a
+        keyed collection, `item` for a list, `choices`, `min`, `max`,
+        `pattern`, `required` and `default`. A `secret` node is one that
+        reads back as `"<redacted>"`. Defaults are not written into the
+        document, so a node's `default` is what applies when the key is
+        absent.
+      additionalProperties: true
+
+    RunningConfig:
+      type: object
+      description: >-
+        The whole configuration document: the IOS hierarchy as JSON,
+        with IOS keywords as the keys.
+
+
+        On the way out, secrets are `"<redacted>"`. On the way in, that
+        value means "keep what is stored", which is what makes it safe
+        to read this document, edit one unrelated field and write it
+        back without ever holding the password it contains. Writing it
+        where nothing is stored is an error rather than a silently empty
+        password.
+
+
+        A write here replaces the document: anything absent is removed.
+        The top level is open because a plugin may claim a section of
+        its own, which is also why `router` is.
+      properties:
+        router:
+          type: object
+          description: >-
+            One section per protocol plugin that claims one. `bgp` is
+            present when the BGP plugin is registered, and configuring
+            a section no registered plugin owns is rejected.
+          properties:
+            bgp:
+              $ref: '#/components/schemas/BgpInstances'
+          additionalProperties: true
+        ip:
+          $ref: '#/components/schemas/IpSection'
+        ipv6:
+          $ref: '#/components/schemas/Ipv6Section'
+        route-map:
+          $ref: '#/components/schemas/RouteMaps'
+        api:
+          $ref: '#/components/schemas/ApiConfig'
+      additionalProperties: true
+
+    ApiConfig:
+      type: object
+      description: >-
+        The REST layer's own configuration, which this API can change
+        about itself. A token rotated here takes effect on the next
+        request; a bind changed here takes effect when the server is
+        next started.
+      properties:
+        bind:
+          type: string
+          description: >-
+            `host:port`, with an IPv6 literal in brackets. Loopback by
+            default: an engine that started serving its configuration to
+            the network because somebody imported a library would be
+            indefensible.
+          example: 127.0.0.1:8179
+        auth:
+          type: object
+          properties:
+            token:
+              type: string
+              description: >-
+                The bearer token, at least 16 characters. Reads back as
+                `"<redacted>"`; write that value to keep the stored one.
+              minLength: 16
+            token-file:
+              type: string
+              description: >-
+                A file holding the token, which wins over `token` when
+                both are set: a file has permissions, and a
+                configuration document gets copied into support
+                bundles.
+            allow-unauthenticated-health:
+              type: boolean
+              default: false
+              description: >-
+                Serve `/engine/health` without a token. For a
+                supervisor or a load balancer with nowhere to keep a
+                secret; the health document carries no key material by
+                construction.
+          additionalProperties: false
+        insecure:
+          type: boolean
+          default: false
+          description: >-
+            Accept a non-loopback bind with no authentication. Refused
+            otherwise, so this is a sentence somebody has to type on
+            purpose.
+        tls:
+          type: object
+          properties:
+            cert:
+              type: string
+            key:
+              type: string
+          additionalProperties: false
+        max-body-bytes:
+          type: integer
+          minimum: 1024
+          maximum: 67108864
+          default: 1048576
+        max-page:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          default: 10000
+      additionalProperties: false
+
+    IpSection:
+      type: object
+      description: The core's IPv4 configuration.
+      properties:
+        prefix-list:
+          $ref: '#/components/schemas/PrefixLists'
+        as-path-access-list:
+          $ref: '#/components/schemas/AsPathAccessLists'
+        route:
+          $ref: '#/components/schemas/IpRouteSection'
+      additionalProperties: false
+
+    Ipv6Section:
+      type: object
+      description: >-
+        The core's IPv6 configuration. There are no `install` settings
+        here: one forwarding-plane policy covers both families and it
+        lives under `ip.route`.
+      properties:
+        prefix-list:
+          $ref: '#/components/schemas/PrefixLists'
+        route:
+          type: object
+          properties:
+            static:
+              $ref: '#/components/schemas/StaticRoutes'
+          additionalProperties: false
+      additionalProperties: false
+
+    IpRouteSection:
+      type: object
+      description: >-
+        The static routes and the forwarding-plane settings, in the
+        document. `/ip/route/install` reads the settings alone with the
+        defaults filled in, which is the useful view of them.
+      properties:
+        install:
+          type: boolean
+          default: false
+        table:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 254
+        protocol:
+          type: integer
+          minimum: 1
+          maximum: 255
+          default: 190
+        priority:
+          type: object
+          properties:
+            ebgp:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              default: 20
+            ibgp:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              default: 200
+          additionalProperties: false
+        retain-on-shutdown:
+          type: boolean
+          default: false
+        validate-next-hop:
+          type: boolean
+          default: false
+        resolve-via-default:
+          type: boolean
+          default: false
+          description: >-
+            Whether a default route may resolve a next hop, like FRR's
+            `ip nht resolve-via-default`. Off, because a default covers
+            every address and so proves nothing about any of them.
+        kernel-import:
+          type: boolean
+          default: false
+        static:
+          $ref: '#/components/schemas/StaticRoutes'
+      additionalProperties: false
+
+    BgpInstances:
+      type: object
+      description: >-
+        BGP instances, keyed by AS number as a string. At most one in
+        v1: a second is a conflict rather than an invalid document, and
+        it is reported as 409.
+      maxProperties: 1
+      additionalProperties:
+        $ref: '#/components/schemas/BgpInstance'
+
+    BgpInstance:
+      type: object
+      description: >-
+        One `router bgp` instance. A `PUT` here is a replace, so a
+        neighbour absent from the body is removed and its session
+        dropped; a `PATCH` merges, and `null` removes a key.
+      properties:
+        router-id:
+          type: string
+          description: >-
+            The router id, as an IPv4 address. Derived from a configured
+            address when it is not set, and a speaker with neither
+            cannot open a session.
+          example: 10.0.0.1
+        log-neighbor-changes:
+          type: boolean
+          default: true
+        default-local-preference:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 100
+          description: >-
+            IOS `bgp default local-preference`: the LOCAL_PREF a path
+            without one is ranked as, and the value given to such a path
+            towards internal peers.
+        maxas-limit:
+          type: integer
+          minimum: 0
+          maximum: 2000
+          default: 255
+          description: >-
+            IOS `bgp maxas-limit`: a received path whose AS_PATH holds
+            more ASNs than this, every set and confederation member
+            counted, is treated as withdrawn. 0 turns it off. On by
+            default, unlike IOS, because it also bounds the string
+            AS-path regexes run over.
+        next-hop-validation:
+          type: boolean
+          default: false
+          description: >-
+            Off by default because a control-plane speaker with no
+            forwarding plane has nothing to validate against. With it
+            on, a path whose next hop does not resolve stays in the
+            table, wins nothing and is advertised to nobody.
+        bestpath:
+          type: object
+          description: The tie-breaks, in the order the decision applies them.
+          properties:
+            always-compare-med:
+              type: boolean
+              default: false
+            deterministic-med:
+              type: boolean
+              default: true
+            med-missing-as-worst:
+              type: boolean
+              default: false
+            compare-routerid:
+              type: boolean
+              default: false
+            as-path-ignore:
+              type: boolean
+              default: false
+            as-path-multipath-relax:
+              type: boolean
+              default: false
+          additionalProperties: false
+        timers:
+          type: object
+          description: >-
+            The instance-wide defaults; a neighbour's own `timers`
+            override them.
+          properties:
+            hold-time:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              default: 90
+            keepalive:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              default: 30
+          additionalProperties: false
+        listen:
+          type: object
+          description: Where inbound connections are accepted.
+          properties:
+            address:
+              type: string
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+              default: 179
+          additionalProperties: false
+        neighbor:
+          $ref: '#/components/schemas/BgpNeighbors'
+        address-family:
+          $ref: '#/components/schemas/BgpAddressFamilies'
+      additionalProperties: false
+
+    BgpNeighbors:
+      type: object
+      description: >-
+        Neighbours, keyed by address. Configuration rather than state: a
+        neighbour is here whether or not its session is up, and
+        `GET /show/ip/bgp/summary` is the other half of that question.
+      additionalProperties:
+        $ref: '#/components/schemas/BgpNeighbor'
+
+    BgpNeighbor:
+      type: object
+      description: >-
+        One neighbour. `remote-as` is required for a complete
+        neighbour, so a `PUT` must carry it; a `PATCH` need only carry
+        what changes.
+
+
+        Changing anything the two ends agreed in OPEN, or anything about
+        the transport -- `remote-as`, `local-as`, `password`, `ao`,
+        `update-source`, `ttl-security`, `ebgp-multihop`, `passive`,
+        `shutdown`, `timers`, `capability`, `port` -- resets the
+        session. Everything else is applied to a running session in
+        place.
+      properties:
+        remote-as:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: >-
+            Required. Equal to the local AS makes this peer internal.
+          example: 65001
+        local-as:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+        description:
+          type: string
+        shutdown:
+          type: boolean
+          default: false
+          description: >-
+            Keep the configuration and stop talking. What to use instead
+            of `DELETE` when the peer is coming back.
+        passive:
+          type: boolean
+          default: false
+        update-source:
+          type: string
+          description: The local address to source the session from.
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 179
+        password:
+          type: string
+          minLength: 1
+          description: >-
+            TCP-MD5. Reads back as `"<redacted>"`; write that value back
+            to keep the stored password, a new string to change it, or
+            `null` in a `PATCH` to remove it. Rejected with 400 when the
+            kernel cannot provide TCP-MD5, at the time the change is
+            prepared rather than at the time the session next connects:
+            finding out then leaves an operator with a peer that will
+            not come up and no explanation attached to what they typed.
+          example: '<redacted>'
+        ao:
+          type: object
+          description: >-
+            TCP-AO, which is not TCP-MD5 and does not fall back to it
+            unless `fallback-md5` says so.
+          properties:
+            key-chain:
+              type: string
+              description: Required when `ao` is present.
+            send-id:
+              type: integer
+              minimum: 0
+              maximum: 255
+            recv-id:
+              type: integer
+              minimum: 0
+              maximum: 255
+            algorithm:
+              type: string
+              enum: [cmac-aes-128, hmac-sha1]
+            fallback-md5:
+              type: boolean
+              default: false
+              description: >-
+                Only takes effect with a `password` configured, and must
+                be asked for in writing: a silent downgrade from AO to
+                MD5 is a security regression.
+          additionalProperties: false
+        ttl-security:
+          type: integer
+          minimum: 1
+          maximum: 254
+        ebgp-multihop:
+          type: integer
+          minimum: 1
+          maximum: 255
+        weight:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          default: 0
+        allowas-in:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 0
+          description: >-
+            How many times our own AS may appear in a path we accept.
+            Inbound only; it does not change what is sent to the peer
+            (see `sender-loop-check`).
+        sender-loop-check:
+          type: boolean
+          default: true
+          description: >-
+            Do not send this external peer paths that already contain
+            its AS. Turn off only for a peer configured to accept its own
+            AS (its `allowas-in`); the peer then gets an update group of
+            its own.
+        next-hop-self:
+          type: boolean
+          default: false
+        remove-private-as:
+          oneOf:
+            - type: boolean
+            - type: string
+              enum: [all]
+          default: false
+          description: >-
+            `true` strips RFC 6996 private ASNs only from a path made of
+            nothing else, as IOS does; `all` strips them from any path.
+        as-override:
+          type: boolean
+          default: false
+        send-community:
+          type: boolean
+          default: true
+        advertisement-interval:
+          type: integer
+          minimum: 0
+          maximum: 600
+          default: 0
+          description: >-
+            RFC 4271's MinRouteAdvertisementInterval, and deliberately
+            not IOS's 30 seconds for an external peer: the advertisement
+            pass already coalesces, and a default that held the first
+            full table for half a minute would make every fresh session
+            look broken.
+        maximum-prefix:
+          type: object
+          properties:
+            limit:
+              type: integer
+              minimum: 1
+              maximum: 4294967295
+            warning-percent:
+              type: integer
+              minimum: 1
+              maximum: 100
+              default: 75
+          additionalProperties: false
+        timers:
+          type: object
+          properties:
+            hold-time:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              default: 90
+              description: 0 disables the timers; otherwise at least 3.
+            keepalive:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              description: >-
+                Must be less than `hold-time`, or this peer times out
+                before it sends. Rejected with 400 rather than adjusted.
+            connect-retry:
+              type: integer
+              minimum: 1
+              maximum: 65535
+              default: 120
+            delay-open:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              default: 0
+          additionalProperties: false
+        capability:
+          type: object
+          properties:
+            route-refresh:
+              type: boolean
+              default: true
+              description: >-
+                What makes a soft inbound clear able to recover paths
+                the old policy discarded.
+            extended-message:
+              type: boolean
+              default: false
+            add-path-receive:
+              type: boolean
+              default: false
+            graceful-restart:
+              type: integer
+              minimum: 1
+              maximum: 4095
+              description: The restart time in seconds, when offered.
+          additionalProperties: false
+        address-family:
+          type: object
+          description: >-
+            Per-neighbour, per-family settings, keyed by AFI and then
+            SAFI -- `ipv4` then `unicast`. They hang off the neighbour
+            rather than off the instance's family block because that is
+            where the schema puts them and where IOS puts them.
+          additionalProperties:
+            type: object
+            additionalProperties:
+              $ref: '#/components/schemas/NeighborAddressFamily'
+      additionalProperties: false
+
+    NeighborAddressFamily:
+      type: object
+      description: >-
+        What one neighbour does in one address family. The three policy
+        objects compose and run in order: a prefix-list filters on the
+        NLRI, a filter-list on the AS path, and a route-map can do both
+        and rewrite attributes as well.
+      properties:
+        activate:
+          type: boolean
+          default: true
+        route-map:
+          $ref: '#/components/schemas/DirectionalPolicy'
+        prefix-list:
+          $ref: '#/components/schemas/DirectionalPolicy'
+        filter-list:
+          $ref: '#/components/schemas/DirectionalPolicy'
+        next-hop-self:
+          type: boolean
+          description: >-
+            Overrides the neighbour-wide setting for this family, which
+            is an IPv6 question far more often than an IPv4 one.
+        next-hop:
+          type: string
+          description: >-
+            The next hop advertised in this family when rtengine sets it
+            itself. Must match the family and be a global unicast
+            address. Without it an IPv6 family takes the session's IPv6
+            address, or over an IPv4 session the IPv4-mapped
+            `::ffff:a.b.c.d`; the unspecified address is never sent.
+          example: '2001:db8::1'
+      additionalProperties: false
+
+    DirectionalPolicy:
+      type: object
+      description: >-
+        A policy name per direction. Naming one that does not exist is
+        accepted -- the chain matches nothing until it does -- so check
+        the spelling.
+      properties:
+        in:
+          type: string
+          minLength: 1
+        out:
+          type: string
+          minLength: 1
+      additionalProperties: false
+
+    BgpAddressFamilies:
+      type: object
+      description: >-
+        The instance's address families, keyed by AFI (`ipv4`, `ipv6`)
+        and then SAFI (`unicast`).
+      additionalProperties:
+        type: object
+        additionalProperties:
+          $ref: '#/components/schemas/BgpAddressFamily'
+
+    BgpAddressFamily:
+      type: object
+      description: >-
+        One instance-level address family: what this router originates
+        in it, and how it selects among paths.
+      properties:
+        network:
+          $ref: '#/components/schemas/BgpNetworks'
+        maximum-paths:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 1
+          description: >-
+            Only 1 is accepted in this release; a larger value is a
+            400. One next hop per prefix is installed (no ECMP), and
+            accepting more would show a multipath set that does not
+            forward.
+        maximum-paths-ibgp:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 1
+          description: >-
+            As `maximum-paths`: only 1 is accepted in this release.
+        distance:
+          type: object
+          properties:
+            external:
+              type: integer
+              minimum: 1
+              maximum: 255
+              default: 20
+            internal:
+              type: integer
+              minimum: 1
+              maximum: 255
+              default: 200
+          additionalProperties: false
+      additionalProperties: false
+
+    BgpNetworks:
+      type: object
+      description: >-
+        The prefixes this router originates in a family, keyed by
+        prefix.
+      additionalProperties:
+        $ref: '#/components/schemas/BgpNetwork'
+
+    BgpNetwork:
+      type: object
+      description: >-
+        One originated prefix. An empty object is the ordinary case: it
+        originates the prefix with no options.
+      properties:
+        import-check:
+          type: boolean
+          default: false
+          description: >-
+            Require something in the local table to back the network
+            before it is advertised. Off by default because a
+            control-plane speaker with no forwarding plane has nothing
+            to check against.
+        route-map:
+          type: string
+          description: A route-map applied to the originated path.
+      additionalProperties: false
+
+    PrefixLists:
+      type: object
+      description: >-
+        Prefix-lists, keyed by name. `ip` and `ipv6` are separate
+        namespaces, as in IOS: the same name can exist in both and mean
+        different things.
+      additionalProperties:
+        $ref: '#/components/schemas/PrefixList'
+
+    AsPathAccessLists:
+      type: object
+      description: >-
+        AS-path access-lists, keyed by name, referenced from a
+        neighbour's `filter-list` and a route-map's `match as-path`. A
+        regex that could stall the engine on a long path is a `400`
+        naming the rule it broke; see "AS-path regexes" in the
+        documentation.
+      additionalProperties:
+        type: array
+        items:
+          $ref: '#/components/schemas/AsPathEntry'
+
+    AsPathEntry:
+      type: object
+      required: [action]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+        action:
+          type: string
+          enum: [permit, deny]
+        regex:
+          type: string
+          description: >-
+            An IOS AS-path regex. `_` is a delimiter; `\_` is a literal
+            underscore.
+          example: _65001_
+        pattern:
+          type: string
+          description: A synonym for `regex`; give one or the other.
+      additionalProperties: false
+
+    PrefixList:
+      type: array
+      description: >-
+        One prefix-list: its entries, evaluated in `seq` order, first
+        match wins. No implicit deny is added here -- what the chain
+        does when nothing matches is the policy engine's business, not
+        this document's.
+
+
+        The resource is the whole array. There is no `PATCH` and no
+        per-entry URL, because merging into an array would have to
+        decide whether three entries add to, replace or reorder the
+        stored five, and every answer to that is a surprise waiting for
+        somebody.
+      items:
+        $ref: '#/components/schemas/PrefixListEntry'
+
+    PrefixListEntry:
+      type: object
+      required: [action, prefix]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+        action:
+          type: string
+          enum: [permit, deny]
+        prefix:
+          type: string
+          example: 192.0.2.0/24
+        le:
+          type: integer
+          minimum: 0
+          maximum: 128
+          description: Match any longer prefix up to this length.
+        ge:
+          type: integer
+          minimum: 0
+          maximum: 128
+          description: Match any prefix at least this long.
+      additionalProperties: false
+
+    RouteMaps:
+      type: object
+      description: >-
+        Route-maps, keyed by name. One namespace for both address
+        families, which is where IOS puts them and why they are not
+        under `/ip` and `/ipv6`.
+      additionalProperties:
+        $ref: '#/components/schemas/RouteMap'
+
+    RouteMap:
+      type: array
+      description: >-
+        One route-map: its clauses, in `seq` order. The whole array at
+        once, as with a prefix-list. A map in use is swapped atomically
+        with the rest of the commit, so no update is ever evaluated
+        against half of it.
+      items:
+        $ref: '#/components/schemas/RouteMapClause'
+
+    RouteMapClause:
+      type: object
+      required: [action]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        action:
+          type: string
+          enum: [permit, deny]
+        match:
+          type: object
+          description: >-
+            The conditions, in the policy engine's vocabulary. Accepted
+            opaquely by the configuration schema rather than growing a
+            key every time a match clause is added; the policy engine is
+            what rejects a clause it cannot compile, at commit time.
+          additionalProperties: true
+        set:
+          type: object
+          description: The attribute changes, likewise.
+          additionalProperties: true
+      additionalProperties: false
+
+    StaticRoutes:
+      type: object
+      description: Static routes, keyed by prefix.
+      additionalProperties:
+        $ref: '#/components/schemas/StaticRoute'
+
+    StaticRoute:
+      type: object
+      description: >-
+        One static route. `next-hop` is required for a complete route,
+        so a `PUT` must carry it; a `PATCH` need only carry what
+        changes, which is the safe way to alter a `distance` without
+        restating the address a typo in would send traffic somewhere
+        else.
+      properties:
+        next-hop:
+          type: string
+          description: Required. A bare address, in either family.
+          example: 10.0.0.254
+        distance:
+          type: integer
+          minimum: 0
+          maximum: 255
+          default: 1
+          description: >-
+            How this route competes with other sources for the same
+            destination; lower wins.
+        metric:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          default: 0
+      additionalProperties: false
+
+    RouteInstall:
+      type: object
+      description: >-
+        The forwarding-plane settings as they are in effect, with the
+        schema's defaults filled in. `sink` is the running sink rather
+        than a setting, and is the other half of the question this
+        resource exists to answer: is this engine writing the kernel
+        routing table, and as whom.
+      properties:
+        install:
+          type: boolean
+          description: >-
+            Whether selected routes are written to the kernel. Off by
+            default and deliberately so: importing a library must never
+            be enough to make it write the routing table.
+        table:
+          type: integer
+          description: The kernel routing table; 254 is `main`.
+        protocol:
+          type: integer
+          description: >-
+            The protocol id our routes carry. Having our own is what
+            makes a replace safe -- it can only ever replace our
+            routes -- and it is what reconciliation looks for at
+            start-up.
+        priority:
+          type: object
+          properties:
+            ebgp:
+              type: integer
+            ibgp:
+              type: integer
+          additionalProperties: false
+        retain-on-shutdown:
+          type: boolean
+          description: >-
+            Leave our routes in the kernel when the engine stops.
+        kernel-import:
+          type: boolean
+          description: >-
+            Accepted by the schema and not implemented yet, so
+            configuring it today changes nothing.
+        validate-next-hop:
+          type: boolean
+        resolve-via-default:
+          type: boolean
+        sink:
+          type: object
+          description: The sink in use, and whether it is writing.
+          properties:
+            name:
+              type: string
+              description: >-
+                `null` is the sink that discards, which is what an
+                engine not writing the kernel table has.
+              example: 'null'
+            writes:
+              type: boolean
+          additionalProperties: false
+      additionalProperties: false
+
+    RouteInstallPatch:
+      type: object
+      description: >-
+        The forwarding-plane settings a `PATCH` may change. `static` is
+        deliberately not one of them: it is a table with its own
+        resource, and a merge containing one static route through this
+        endpoint would silently delete the others. An unknown key is
+        rejected rather than ignored, and the response says which.
+      properties:
+        install:
+          type: boolean
+        table:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+        protocol:
+          type: integer
+          minimum: 1
+          maximum: 255
+        priority:
+          type: object
+          properties:
+            ebgp:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+            ibgp:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+          additionalProperties: false
+        retain-on-shutdown:
+          type: boolean
+        kernel-import:
+          type: boolean
+        validate-next-hop:
+          type: boolean
+        resolve-via-default:
+          type: boolean
+      additionalProperties: false
+
+    ShowIndex:
+      type: object
+      description: >-
+        Every operational view this engine answers. The set is the union
+        of the core's own and every registered plugin's, so it is a
+        property of this engine rather than of this document -- which is
+        exactly why the index exists.
+      required: [views]
+      properties:
+        views:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: array
+                description: The command's segments.
+                items:
+                  type: string
+                example: [ip, bgp, summary]
+              command:
+                type: string
+                description: The CLI spelling.
+                example: show ip bgp summary
+              url:
+                type: string
+                description: The URL, prefix included.
+                example: /api/v1/show/ip/bgp/summary
+            additionalProperties: false
+      additionalProperties: false
+
+    ShowResult:
+      type: object
+      description: >-
+        The view's own document, returned unaltered: the contract is
+        that `engine.show(...)` and this endpoint answer the same
+        question with the same bytes, so the shape is the handler's and
+        is not constrained here. A summary, a table with `items` and a
+        `next` cursor, or a single object, depending on the view.
+      additionalProperties: true
+
+    ClearIndex:
+      type: object
+      description: >-
+        Every action this engine offers. As with the show index, it
+        depends on the plugins registered here.
+      required: [actions]
+      properties:
+        actions:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: array
+                items:
+                  type: string
+                example: [ip, bgp, neighbor]
+              command:
+                type: string
+                example: clear ip bgp neighbor
+              url:
+                type: string
+                example: /api/v1/clear/ip/bgp/neighbor
+            additionalProperties: false
+      additionalProperties: false
+
+    ClearRequest:
+      type: object
+      description: >-
+        How hard to clear. Omit the body entirely, or send
+        `{"soft": false}`, for a hard clear: the session is dropped and
+        both ends forget everything and relearn it. The soft forms are
+        cheap by comparison and do not drop anything.
+
+
+        No other key is accepted, and a typo in `soft` is rejected
+        rather than interpreted -- guessing wrong here is the difference
+        between re-running a policy and resetting every session.
+      properties:
+        soft:
+          description: >-
+            `in` re-runs inbound policy over the paths already held and
+            sends a ROUTE-REFRESH when the capability was negotiated;
+            `out` re-advertises this router's choices from the update
+            group's record; `both` does the two. `true` means `in`,
+            which is what every implementation that takes the bare word
+            means by it. `false` is an explicit hard clear.
+          oneOf:
+            - type: string
+              enum: [in, out, both]
+            - type: boolean
+          example: in
+      additionalProperties: false
+
+    ClearResult:
+      type: object
+      description: >-
+        What the handler actually did, which is the only way for a
+        client to confirm that a soft clear was soft. Clearing one
+        neighbour names it; clearing all of them lists what was cleared
+        and carries each neighbour's own report. The shape is the
+        handler's, so other plugins' actions may report differently.
+      properties:
+        neighbor:
+          type: string
+          description: The neighbour cleared, when the action named one.
+        soft:
+          description: >-
+            The direction that was actually applied, or `false` for a
+            hard clear.
+          oneOf:
+            - type: string
+            - type: boolean
+        cleared:
+          type: array
+          description: The neighbours cleared, when the action cleared all.
+          items:
+            type: string
+        results:
+          type: array
+          description: One report per neighbour.
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true

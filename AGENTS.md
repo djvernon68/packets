@@ -11,6 +11,21 @@
   incremental build appears successful.
 - Never edit generated `.c` files as the source of a fix. Change the `.pyx` or
   `.pxd` input and regenerate it.
+- Write a compiler directive in a `.pxd` as a `with` block inside the function
+  body, never as a decorator. Cython parses `@cython.boundscheck(False)` on a
+  `cdef inline` in a `.pxd` and then silently discards it, so the function and
+  every module that inlines it compile with the directive at its default, with
+  no warning. A `with cython.boundscheck(False), cython.wraparound(False):`
+  block in the body is honoured on both 0.28.1 and 0.29.x. Declaration
+  decorators such as `@cython.final` on a `cdef class` are unaffected and
+  belong in the `.pxd`. `test/test_pxd_directives.py` enforces the rule.
+- Suppress a bounds check only where the caller has already validated the
+  range, and only for typed memoryview indexing. Indexing a raw C pointer
+  emits no bounds or wraparound checking to begin with, so the directives
+  change nothing for helpers shaped like `_fmt_ipv4_buf` or the `w_*` writers.
+  A suppressed check on a variable-length copy is a different risk from one on
+  a fixed two- or four-byte read: prove the offset cannot be negative in the
+  body first.
 
 ## Protocol Module Layout
 
@@ -155,6 +170,24 @@ After focused tests pass, run the complete suite and the golden correctness
 benchmark. Performance-sensitive changes should also compare repeated direct
 and representative nested parser measurements; treat small differences as
 noise until repeated samples show otherwise.
+
+Two invocation traps, both of which produce a confident wrong answer rather
+than an error:
+
+- `python3 -m unittest test.test_x` cannot work in this checkout, on any
+  interpreter: `test/` has no `__init__.py`, so it is a namespace package, and
+  CPython ships its own regular `test` package which wins the name.
+  `python3 -m unittest discover -s test` is the only correct invocation.
+- On a host with the library also installed as an RPM (cnp02 has a stale copy
+  in `/usr/lib64/python3.6/site-packages/packets/`), running a script as
+  `python3 bench/correctness.py` imports **that** copy, not the checkout:
+  Python 3 puts the script's own directory on `sys.path`, not the working
+  directory. `bench/correctness.py` guards its newer corpora behind
+  `try/except ImportError`, so a shadowed run silently emits fewer records
+  with exit 0 and an empty stderr. Set `PYTHONPATH` to the checkout for any
+  bench script, and check `packets.__file__` when a golden diff looks
+  surprising. The test suite is unaffected, because `-m unittest` puts the
+  working directory first.
 
 ## Commenting Protocol Examples
 

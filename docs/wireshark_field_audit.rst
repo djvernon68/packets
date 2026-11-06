@@ -157,6 +157,14 @@ BGP (packet-bgp.c)
     bgp.open.opt_param_len     -> bgp.open.opt.len
     bgp.route_refresh.reserved -> bgp.route_refresh.subtype
 
+``bgp.nlri_path_id`` is declared, under its Wireshark name, but the dissector
+never fills it in: it always reads ``None``, with or without the ``add_path``
+parse hint. The hint changes how NLRI are framed, so the prefixes after an
+RFC 7911 Path Identifier decode correctly; the identifier itself is not
+exposed. The field is kept so that the dissector's field list, and the golden
+records built from it, stay frozen. Use ``rtengine``'s BGP codec when you need
+path identifiers.
+
 Retained packets-only extensions (no Wireshark equivalent)
 ---------------------------------------------------------
 

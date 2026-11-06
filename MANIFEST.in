@@ -3,4 +3,5 @@ include LICENSE
 include README.rst
 recursive-include docs *.rst
 recursive-include packets *.pxd *.pyx
+include packets/routing/rtengine/api/openapi.yaml
 prune bench

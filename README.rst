@@ -11,6 +11,15 @@ lives in the ``steelscript`` namespace and does not depend on SteelScript: the
 import path is ``packets``, for example
 ``from packets.core.inetpkt import Ethernet``.
 
+It also includes ``rtengine``, a protocol-agnostic routing engine with BGP-4 as
+its first protocol plugin. ``rtengine`` can be embedded in a python program or
+run as a standalone daemon with a REST API, and it is a control-plane speaker
+by default: it peers, applies policy and computes best paths without touching
+the kernel routing table unless you ask it to. It is configured with an
+IOS-keyed JSON document. The REST API needs Flask, which is not required by
+the base package, so install it with ``pip install .[rtengine]``. See
+``docs/rtengine.rst``.
+
 License
 =======
 

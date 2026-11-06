@@ -20,30 +20,83 @@ cimport cython
 # inlined code instead of a second copy of it. Every parser in the package
 # reads its header fields through these.
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-cdef inline uint16_t rd_u16(const unsigned char[:] b, Py_ssize_t off):
+cdef extern from *:
+    """
+    /* C-1: a checked build of rd_u16/rd_u32, for the fuzz tests. Off unless
+     * the build is given -DPACKETS_RD_CHECK=1 (CFLAGS), and then a read past
+     * the end of its buffer stops the process with the offset, rather than
+     * reading whatever memory follows. Off, the test below is a constant 0
+     * and the compiler removes it: production readers stay unchecked.
+     */
+    #ifndef PACKETS_RD_CHECK
+    #define PACKETS_RD_CHECK 0
+    #endif
+    #include <stdio.h>
+    #include <stdlib.h>
+    static CYTHON_INLINE void packets_rd_oob(Py_ssize_t off, int width,
+                                             Py_ssize_t size) {
+        fprintf(stderr, "packets: rd_u%d at offset %ld of a %ld-byte "
+                "buffer\\n", width * 8, (long)off, (long)size);
+        fflush(stderr);
+        abort();
+    }
+    /* C-2: the BGP primitives' precondition (inetpkt.pyx design note 5),
+     * checked the same way: a caller's end past its buffer stops the process.
+     */
+    static CYTHON_INLINE void packets_end_oob(Py_ssize_t end,
+                                              Py_ssize_t size) {
+        fprintf(stderr, "packets: end %ld past a %ld-byte buffer\\n",
+                (long)end, (long)size);
+        fflush(stderr);
+        abort();
+    }
+    """
+    # The macro, as a C int: 1 in a checked build, 0 otherwise.
+    int PACKETS_RD_CHECK
+    void packets_rd_oob(Py_ssize_t off, int width, Py_ssize_t size) nogil
+    void packets_end_oob(Py_ssize_t end, Py_ssize_t size) nogil
+
+cdef inline uint16_t rd_u16(const unsigned char[:] b, Py_ssize_t off) nogil:
     """Read a big-endian (network order) 16-bit word from a typed memoryview.
 
     Direct-indexing replacement for ``unpack('!H', buf[off:off+2])[0]`` that
     avoids allocating a buffer slice and an unpack tuple per field.
+
+    ``nogil`` because the routing decode primitives in inetpkt.pyx are
+    ``nogil`` and a ``nogil`` function may only call ``nogil`` functions. This
+    is pure arithmetic over a typed memoryview -- no Python object is touched
+    -- so the declaration costs nothing and changes no caller: holding the GIL
+    while calling a ``nogil`` function is always legal.
+
+    The directives are a ``with`` block rather than the ``@cython.*``
+    decorators they used to be. A decorator on a ``cdef inline`` **in a .pxd**
+    is parsed and then silently dropped, on both Cython 0.28.1 and 0.29.x, so
+    this reader had been compiling with full bounds and wraparound checks, a
+    RefNanny context and a WriteUnraisable error path -- the exact opposite of
+    what it claimed, and of what need_bytes below documents. A ``with`` block
+    is honoured. Callers guard with need_bytes or _have_range before reading,
+    which is what makes the unchecked index safe.
     """
-    return (<uint16_t>b[off] << 8) | b[off + 1]
+    with cython.boundscheck(False), cython.wraparound(False):
+        if PACKETS_RD_CHECK and (off < 0 or off + 2 > b.shape[0]):
+            packets_rd_oob(off, 2, b.shape[0])
+        return (<uint16_t>b[off] << 8) | b[off + 1]
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-cdef inline uint32_t rd_u32(const unsigned char[:] b, Py_ssize_t off):
+cdef inline uint32_t rd_u32(const unsigned char[:] b, Py_ssize_t off) nogil:
     """Read a big-endian (network order) 32-bit word from a typed memoryview.
 
     Direct-indexing replacement for ``unpack('!I', buf[off:off+4])[0]``.
+
+    ``nogil`` and ``with``-block directives for the same reasons as rd_u16.
     """
-    return ((<uint32_t>b[off] << 24) | (<uint32_t>b[off + 1] << 16) |
-            (<uint32_t>b[off + 2] << 8) | b[off + 3])
+    with cython.boundscheck(False), cython.wraparound(False):
+        if PACKETS_RD_CHECK and (off < 0 or off + 4 > b.shape[0]):
+            packets_rd_oob(off, 4, b.shape[0])
+        return ((<uint32_t>b[off] << 24) | (<uint32_t>b[off + 1] << 16) |
+                (<uint32_t>b[off + 2] << 8) | b[off + 3])
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
 cdef inline bytes rd_bytes(const unsigned char[:] b,
                            Py_ssize_t start,
                            Py_ssize_t stop):
@@ -53,6 +106,24 @@ cdef inline bytes rd_bytes(const unsigned char[:] b,
     memoryview object per slice, which measured slower than the
     ``array_slice.tobytes()`` it was meant to replace. This is one
     allocation and one memcpy.
+
+    Deliberately **not** ``nogil``, unlike rd_u16/rd_u32: it allocates a
+    Python bytes object, so it never can be. That is why no routing decode
+    primitive returns bytes -- the primitives hand back offsets and the
+    caller does this copy itself, holding the GIL.
+
+    It also keeps its bounds check, deliberately, and carries no directive
+    decorators -- one here would be silently dropped, exactly as rd_u16's
+    were. The check is load-bearing in a way rd_u16's was not: ``stop`` is
+    clamped to the buffer below, so all the check still catches is a negative
+    ``start``, and unchecked that would copy ``stop - start`` bytes -- more
+    than the buffer holds -- from memory *before* the buffer into a Python
+    bytes object. On packet data that is a crash or a disclosure, not a wrong
+    answer. Suppressing it is only worth doing together with an explicit
+    ``if start < 0`` guard in the body, and only with a measurement: for a
+    ``[:]`` slice the addressing is ``data + i * strides[0]`` either way, so
+    what goes away is one compare and an error path, set against an
+    allocation and a memcpy.
 
     :param b: the parse buffer.
     :param start: first byte to copy.
@@ -72,10 +143,19 @@ cdef inline void need_bytes(const unsigned char[:] b,
                             str name) except *:
     """Raise if a parse buffer is too short for the header about to be read.
 
-    ``rd_u16``/``rd_u32`` run with ``boundscheck(False)``, so a truncated
-    frame would read past the end of the buffer instead of failing. The
-    struct.unpack calls these replaced raised struct.error on short input;
-    this keeps truncated input an exception rather than undefined behaviour.
+    ``rd_u16``/``rd_u32`` index with bounds and wraparound checking switched
+    off -- in a ``with`` block, see rd_u16 for why that is not a decorator --
+    so a truncated frame would read past the end of the buffer instead of
+    failing. The struct.unpack calls these replaced raised struct.error on
+    short input; this keeps truncated input an exception rather than
+    undefined behaviour.
+
+    Worth knowing when reading the history: this paragraph claimed the same
+    thing from the day it was written, but the suppression it referred to was
+    a decorator on a ``cdef inline`` in this .pxd and was therefore dropped
+    on the floor -- the readers were bounds-checked the whole time, and this
+    docstring only became true when they were rewritten to use a ``with``
+    block. rd_bytes keeps its check on purpose; see it for the reason.
 
     :param b: the parse buffer.
     :param least: minimum number of bytes the caller is about to read.
@@ -84,6 +164,29 @@ cdef inline void need_bytes(const unsigned char[:] b,
     if b.shape[0] < least:
         raise ValueError('%s: truncated packet, need at least %d bytes, '
                          'got %d' % (name, least, b.shape[0]))
+
+
+cdef inline bint _have_range(Py_ssize_t start, Py_ssize_t end,
+                             Py_ssize_t least) nogil:
+    """Soft bounds check for the never-raise routing codecs.
+
+    The routing analogue of _need_range: it returns whether at least ``least``
+    bytes are available in ``[start, end)`` rather than raising when they are
+    not, so a codec can stop cleanly on a short header, flag itself malformed,
+    and preserve the remainder instead of aborting the whole parse.
+
+    Here rather than in inetpkt.pyx, where it started, for the reason the
+    readers above are here: Cython inlines a ``cdef inline`` function into
+    another module only when its body is in the .pxd, and the routing engine's
+    decoders cimport this. ``nogil`` for the same reason rd_u16 is -- it is
+    three integer comparisons and touches no Python object.
+
+    :param start: first readable offset.
+    :param end: one past the last readable offset.
+    :param least: minimum number of bytes the caller is about to read.
+    :return: 1 when the bytes are present, 0 otherwise.
+    """
+    return start >= 0 and (end - start) >= least
 
 
 # --- Shared address formatting ----------------------------------------------
@@ -111,7 +214,10 @@ cdef inline str _fmt_ipv4_buf(const unsigned char *src):
 
     The caller owns the bounds check: 4 readable bytes are assumed. Callers
     holding a Python object rather than a pointer should wrap this in the
-    length test their own error contract needs.
+    length test their own error contract needs. Note that ``src`` is a raw C
+    pointer, so Cython emits no bounds or wraparound checking for ``src[i]``
+    to begin with -- there is nothing here for a ``boundscheck`` directive to
+    switch off, and adding one would change no generated code.
 
     :param src: at least 4 readable bytes of address.
     :return: the address as a str, e.g. '10.1.2.3'.
@@ -146,6 +252,10 @@ cdef inline str _fmt_ipv4_buf(const unsigned char *src):
 #
 # The buffer is raw malloc'd memory rather than a bytearray so the field
 # writers below inline to a couple of stores with no Python level call.
+# Being a raw ``unsigned char *`` also means the writers' stores carry no
+# bounds or wraparound checking in the first place: w_grow is the only thing
+# standing between them and the end of the buffer, and a boundscheck
+# directive here would generate nothing.
 
 @cython.final
 cdef class PktWriter:
@@ -1155,6 +1265,54 @@ cdef int _decode_ospfv3(OSPFv3 pkt, bytes owner, const unsigned char[:] mv,
 cdef int _decode_bgp(BGP pkt, bytes owner, const unsigned char[:] mv,
                      Py_ssize_t start, Py_ssize_t end,
                      dict l7_ports) except -1
+
+# --- BGP wire-level decode primitives ---------------------------------------
+# Published so the routing engine's BGP codec parses through the same byte
+# arithmetic the dissector in inetpkt.pyx does, and so packets/core/bgpcore.pyx
+# can expose them to Python for unit tests and micro-benchmarks -- a cdef
+# function is not callable from Python, so without that wrapper none of this
+# could be tested directly.
+#
+# Note the deliberate absence of an ``except`` clause on every one of these:
+# ``except -1`` on a nogil function makes Cython re-acquire the GIL after each
+# call to check for an exception. Status is the return value instead -- 0/-1
+# for the ``int`` primitives, next-offset/-1 for the iterators -- and results
+# come back through the out-pointers. See the block comment above their
+# definitions in inetpkt.pyx for the full contract, in particular that ``ve``
+# is the end a length field *claims* while the return value is the next offset
+# clamped into the buffer.
+cdef int _bgp_msg_header(const unsigned char[:] mv, Py_ssize_t s, Py_ssize_t e,
+                         uint16_t *length, unsigned char *mtype) nogil
+cdef int _bgp_open_fixed(const unsigned char[:] mv, Py_ssize_t o, Py_ssize_t e,
+                         bint allow_ext, unsigned char *ver, uint16_t *my_as,
+                         uint16_t *hold, uint32_t *bgp_id,
+                         Py_ssize_t *opt_start, Py_ssize_t *opt_end) nogil
+cdef Py_ssize_t _bgp_cap_next(const unsigned char[:] mv, Py_ssize_t o,
+                              Py_ssize_t e, unsigned char *code,
+                              Py_ssize_t *vs, Py_ssize_t *ve) nogil
+cdef Py_ssize_t _bgp_attr_next(const unsigned char[:] mv, Py_ssize_t o,
+                               Py_ssize_t e, unsigned char *flags,
+                               unsigned char *atype, Py_ssize_t *vs,
+                               Py_ssize_t *ve) nogil
+cdef Py_ssize_t _bgp_nlri_next(const unsigned char[:] mv, Py_ssize_t o,
+                               Py_ssize_t e, bint add_path,
+                               Py_ssize_t max_addr_bytes, uint32_t *path_id,
+                               unsigned char *plen,
+                               Py_ssize_t *addr_start) nogil
+cdef int _bgp_mp_reach_hdr(const unsigned char[:] mv, Py_ssize_t o,
+                           Py_ssize_t e, uint16_t *afi, unsigned char *safi,
+                           Py_ssize_t *nh_start, Py_ssize_t *nh_end,
+                           Py_ssize_t *nlri_start) nogil
+cdef int _bgp_mp_unreach_hdr(const unsigned char[:] mv, Py_ssize_t o,
+                             Py_ssize_t e, uint16_t *afi,
+                             unsigned char *safi,
+                             Py_ssize_t *nlri_start) nogil
+cdef Py_ssize_t _bgp_aspath_seg_next(const unsigned char[:] mv, Py_ssize_t o,
+                                     Py_ssize_t e, bint as4,
+                                     unsigned char *seg_type,
+                                     unsigned char *count,
+                                     Py_ssize_t *asn_start) nogil
+
 cdef int _decode_rip(RIP pkt, bytes owner, const unsigned char[:] mv,
                      Py_ssize_t start, Py_ssize_t end,
                      dict l7_ports) except -1
