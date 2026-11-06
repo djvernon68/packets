@@ -23,7 +23,7 @@ the base package, so install it with ``pip install .[rtengine]``. See
 License
 =======
 
-Copyright (c) 2019 Riverbed Technology, Inc.
+Copyright (c) 2019-2026 Riverbed Technology, Inc.
 
 Packets is licensed under the terms and conditions of the MIT License
 accompanying the software ("License").  Packets is distributed "AS IS" as set
