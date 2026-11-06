@@ -1,0 +1,69 @@
+# packets 2.4: AlmaLinux 10.2 and later (Python 3.12, Cython 3.0.9, GCC 14).
+# 2.3.x is the AlmaLinux 8.x line (Python 3.6.8, Cython 0.28.1).
+#
+# Metadata lives here (PEP 621). setup.py only declares the C extensions,
+# which setuptools 69 cannot take from this file.
+#
+# The appliance builds from the platform's RPMs and never downloads at
+# build time, so build with the installed toolchain:
+#     python3 -m pip wheel --no-build-isolation --no-deps .
+#     python3 setup.py build_ext --inplace        (development)
+
+[build-system]
+requires = ["setuptools>=69", "Cython>=3.0.9", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packets"
+dynamic = ["version"]
+description = "Base PCAP and inet packet classes, and the rtengine routing engine."
+readme = "README.rst"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "David Vernon", email = "dvernon@riverbed.com"}]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    # The floor, and the versions the suite runs on.
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Cython",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+Homepage = "https://github.com/djvernon68/packets"
+
+# Floors at the AlmaLinux 10.2 platform versions, not pins: an '==' would
+# either clobber a platform-managed RPM or make the extra uninstallable on
+# the host that needs it. PyYAML is for rtengine --config, which reads JSON
+# with or without it.
+[project.optional-dependencies]
+rtengine = ["Flask>=3.1", "Werkzeug>=3.1", "PyYAML>=6.0"]
+
+[project.scripts]
+netflow-player = "packets.commands.netflow_player:main"
+netflow-generator = "packets.commands.netflow_generator:main"
+rtengine = "packets.commands.rtengine:main"
+
+[tool.setuptools]
+zip-safe = false
+include-package-data = true
+platforms = ["Linux", "MacOS"]
+
+[tool.setuptools.dynamic]
+# Read statically from the one place the version is written (L-12).
+version = {attr = "packets._version.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["packets*"]
+
+# Data the code opens from beside itself (L-9): an installed rtengine must
+# serve /openapi.json. MANIFEST.in carries it into the sdist as well.
+[tool.setuptools.package-data]
+"packets.routing.rtengine.api" = ["openapi.yaml"]

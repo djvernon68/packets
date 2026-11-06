@@ -168,7 +168,6 @@ cdef extern from "<pcap.h>" nogil:
                                   const pcap_pkthdr *,
                                   const u_char *)
 
-    char *pcap_lookupdev(char *)
     int pcap_lookupnet(const char *, bpf_u_int32 *, bpf_u_int32 *, char *)
     pcap_t *pcap_create(const char *, char *)
 
@@ -267,6 +266,9 @@ cdef extern from "<pcap.h>" nogil:
         u_int ps_recv
         u_int ps_drop
         u_int ps_ifdrop
+
+    # pcap_if.flags bit for a loopback interface.
+    int PCAP_IF_LOOPBACK
 
     struct pcap_if:
         pcap_if * next

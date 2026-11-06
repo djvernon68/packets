@@ -919,6 +919,16 @@ cdef void unset_cbit(unsigned char* flags, unsigned char offset):
                          "for unsigned char type".format(offset))
 
 
+# Calling an overridden cdef method on a @cython.final class. Cython 3.0.9
+# (the AlmaLinux 10.2 package) emits a direct call to the final class's
+# implementation but casts ``self`` to the class that first declared the
+# method -- e.g. ``(struct PKT *)rec`` into a function taking an
+# ``IGMPGroupRecord *``. GCC 14 rejects that as -Wincompatible-pointer-types,
+# which is an error by default there (cython/cython#2747). Each such call is
+# therefore written ``(<PKT>obj).method(...)``: a vtable call through the
+# base type, typed consistently, that still reaches the final class's own
+# method. The final classes keep @cython.final for every other call.
+
 cdef class PKT:
     def __init__(self, *args, **kwargs):
         """Initialize a PKT object
@@ -3268,7 +3278,7 @@ cdef class IGMP(PKT):
                 w_u16(w, self.reserved2)
                 w_u16(w, self.num_records)
                 for record in self.group_records:
-                    record._write(w, {})
+                    (<PKT>record)._write(w, {})
         else:
             w_u8(w, self.type)
             w_u8(w, self.max_resp)
@@ -5149,11 +5159,11 @@ cdef class ICMP6(PKT):
             self.num_records = <uint16_t>len(self.records)
             w_u16(w, self.num_records)
             for rec in self.records:
-                rec._write(w, kwargs)
+                (<PKT>rec)._write(w, kwargs)
         elif self.type == ICMP6_ND_ROUTER_SOLICIT:
             w_zeros(w, 4)
             for opt in self.options:
-                opt._write(w, kwargs)
+                (<PKT>opt)._write(w, kwargs)
             w_bytes(w, self._body)
         elif self.type == ICMP6_ND_ROUTER_ADVERT:
             w_u8(w, self.cur_hop_limit)
@@ -5162,7 +5172,7 @@ cdef class ICMP6(PKT):
             w_u32(w, self.reachable_time)
             w_u32(w, self.retrans_timer)
             for opt in self.options:
-                opt._write(w, kwargs)
+                (<PKT>opt)._write(w, kwargs)
             w_bytes(w, self._body)
         elif self.type in (ICMP6_ND_NEIGHBOR_SOLICIT,
                            ICMP6_ND_NEIGHBOR_ADVERT):
@@ -5173,14 +5183,14 @@ cdef class ICMP6(PKT):
                 w_zeros(w, 4)
             w_bytes(w, self._target_address)
             for opt in self.options:
-                opt._write(w, kwargs)
+                (<PKT>opt)._write(w, kwargs)
             w_bytes(w, self._body)
         elif self.type == ICMP6_ND_REDIRECT:
             w_zeros(w, 4)
             w_bytes(w, self._target_address)
             w_bytes(w, self._dest_address)
             for opt in self.options:
-                opt._write(w, kwargs)
+                (<PKT>opt)._write(w, kwargs)
             w_bytes(w, self._body)
         else:
             w_bytes(w, self._body)
@@ -6321,7 +6331,7 @@ cdef class OSPFv2(PKT):
         elif (field.startswith('ospf.lsa.') or field == 'ospf.lsa' or
               field == 'ospf.advrouter' or field == 'ospf.link_state_id'):
             for lsa in self.lsas:
-                v = lsa.get_field_val(field)
+                v = (<PKT>lsa).get_field_val(field)
                 if v is not None:
                     return v
             return None
@@ -6774,7 +6784,7 @@ cdef class OSPFv3(PKT):
               field == 'ospf.metric' or field == 'ospf.advrouter' or
               field == 'ospf.link_state_id'):
             for lsa in self.lsas:
-                v = lsa.get_field_val(field)
+                v = (<PKT>lsa).get_field_val(field)
                 if v is not None:
                     return v
             return None
@@ -7743,7 +7753,7 @@ cdef class BGP(PKT):
               field.startswith('bgp.large_comm') or
               field.startswith('bgp.ext_comm')):
             for p in self.params:
-                v = p.get_field_val(field)
+                v = (<PKT>p).get_field_val(field)
                 if v is not None:
                     return v
             return None
@@ -8489,7 +8499,7 @@ cdef class RIP(PKT):
             return self.routing_domain
         elif field.startswith('rip.'):
             for e in self.entries:
-                v = e.get_field_val(field)
+                v = (<PKT>e).get_field_val(field)
                 if v is not None:
                     return v
             return None
@@ -8608,7 +8618,7 @@ cdef class RIPng(PKT):
             return self.reserved
         elif field.startswith('ripng.'):
             for e in self.rtes:
-                v = e.get_field_val(field)
+                v = (<PKT>e).get_field_val(field)
                 if v is not None:
                     return v
             return None
@@ -8743,7 +8753,7 @@ cdef class HSRP(PKT):
         if field in self.fields:
             return self.fields[field]
         for t in self.tlvs:
-            v = t.get_field_val(field)
+            v = (<PKT>t).get_field_val(field)
             if v is not None:
                 return v
         if isinstance(self.payload, PKT):

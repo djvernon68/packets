@@ -543,9 +543,10 @@ def _source_version():
                          handle.read(), re.M).group(1)
 
 
-def _setup_text():
-    with open(os.path.join(ROOT, 'setup.py')) as handle:
-        return handle.read()
+def _pyproject():
+    import tomllib
+    with open(os.path.join(ROOT, 'pyproject.toml'), 'rb') as handle:
+        return tomllib.load(handle)
 
 
 @unittest.skipUnless(os.path.exists(os.path.join(ROOT, 'setup.py')),
@@ -553,8 +554,8 @@ def _setup_text():
 class VersionTestCase(unittest.TestCase):
     """L-12: one version, written once."""
 
-    def test_it_is_2_3_0(self):
-        self.assertEqual('2.3.0', _source_version())
+    def test_it_is_2_4_0(self):
+        self.assertEqual('2.4.0', _source_version())
 
     def test_every_reader_agrees(self):
         self.assertEqual(_source_version(), packets.__version__)
@@ -563,10 +564,12 @@ class VersionTestCase(unittest.TestCase):
         self.addCleanup(engine.stop)
         self.assertEqual(packets.__version__, engine.status()['version'])
 
-    def test_setup_py_reads_it_rather_than_repeating_it(self):
-        text = _setup_text()
-        self.assertIn("'version':             read_version(),", text)
-        self.assertIsNone(re.search(r"'version':\s*'[0-9]", text))
+    def test_pyproject_reads_it_rather_than_repeating_it(self):
+        project = _pyproject()
+        self.assertIn('version', project['project']['dynamic'])
+        self.assertNotIn('version', project['project'])
+        self.assertEqual({'attr': 'packets._version.__version__'},
+                         project['tool']['setuptools']['dynamic']['version'])
         with open(os.path.join(ROOT, 'packets', 'routing', 'rtengine',
                                '__init__.py')) as handle:
             self.assertIsNone(re.search(r"^__version__\s*=", handle.read(),
@@ -583,17 +586,20 @@ class PackagingTestCase(unittest.TestCase):
     SPEC = 'packets/routing/rtengine/api/openapi.yaml'
 
     def test_the_spec_is_declared_both_ways(self):
-        text = _setup_text()
-        self.assertRegex(text, r"'packets\.routing\.rtengine\.api':\s*"
-                               r"\['openapi\.yaml'\]")
+        self.assertEqual(
+            ['openapi.yaml'],
+            _pyproject()['tool']['setuptools']['package-data'][
+                'packets.routing.rtengine.api'])
         with open(os.path.join(ROOT, 'MANIFEST.in')) as handle:
             self.assertIn('include ' + self.SPEC, handle.read().split('\n'))
 
-    def test_the_classifiers_cover_the_floor_and_the_dev_host(self):
-        text = _setup_text()
-        for version in ('3.6', '3.7', '3.8', '3.9', '3.10', '3.11'):
-            self.assertIn("'Programming Language :: Python :: %s'"
-                          % version, text)
+    def test_the_floor_is_the_platform_python(self):
+        """2.4 is the AlmaLinux 10.2 line: Python 3.12 and Cython 3.0.9."""
+        project = _pyproject()
+        self.assertEqual('>=3.12', project['project']['requires-python'])
+        self.assertIn('Programming Language :: Python :: 3.12',
+                      project['project']['classifiers'])
+        self.assertIn('Cython>=3.0.9', project['build-system']['requires'])
 
     def test_nlri_path_id_is_as_documented(self):
         """C-5: docs/wireshark_field_audit.rst says this field reads None.

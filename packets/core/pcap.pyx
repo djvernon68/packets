@@ -7,6 +7,7 @@
 # as set forth in the License.
 
 from libc.stdint cimport uint32_t, uint64_t, uint16_t
+from libc.string cimport strncpy
 
 import sys
 import time
@@ -149,9 +150,12 @@ cdef struct PcapInfoState:
     double last_ts
 
 
+# noexcept: libpcap calls this from C, inside a nogil loop, where an exception
+# has nowhere to go. Cython 3 defaults a void cdef function to ``except *``,
+# which libpcap's pcap_handler type cannot take.
 cdef void _pcap_info_callback(u_char *user,
                               const pcap_pkthdr *hdr,
-                              const u_char *pkt) nogil:
+                              const u_char *pkt) noexcept nogil:
     cdef:
         PcapInfoState *state = <PcapInfoState *>user
         double ts
@@ -222,14 +226,35 @@ cpdef str int2ip(uint32_t addr):
     return socket.inet_ntoa(struct.pack("!I", addr))
 
 
+# Where lookupdev() leaves its answer, as pcap_lookupdev() did: a static
+# buffer, valid until the next call. 256 bytes covers any interface name.
+cdef char _lookupdev_name[256]
+
+
 cpdef char *lookupdev(char *errtext):
-    cdef:
-        char * device
-    device = pcap_lookupdev(errtext)
-    if not device:
+    """The first capture device pcap_findalldevs() lists, as pcap_lookupdev().
+
+    libpcap 1.10 deprecates pcap_lookupdev(), and its own implementation is
+    exactly this: the first device findalldevs reports, refused if it is a
+    loopback, copied into a static buffer. Doing it here keeps the answer and
+    the signature, and drops the deprecated call (2.4, GCC 14 builds).
+
+    :param errtext: a PCAP_ERRBUF_SIZE buffer for libpcap's error text.
+    :return: the device name, or NULL with ``errtext`` set.
+    """
+    cdef pcap_if_t *ifaces = NULL
+    if pcap_findalldevs(&ifaces, errtext) != 0:
         return NULL
-    else:
-        return device
+    if ifaces == NULL or ifaces.flags & PCAP_IF_LOOPBACK:
+        strncpy(errtext, b"no suitable device found", 255)
+        errtext[255] = 0
+        if ifaces != NULL:
+            pcap_freealldevs(ifaces)
+        return NULL
+    strncpy(_lookupdev_name, ifaces.name, sizeof(_lookupdev_name) - 1)
+    _lookupdev_name[sizeof(_lookupdev_name) - 1] = 0
+    pcap_freealldevs(ifaces)
+    return _lookupdev_name
 
 cpdef int findalldevs(list devices, char *errtext):
     cdef:

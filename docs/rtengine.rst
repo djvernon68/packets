@@ -891,40 +891,31 @@ reads them correctly when a peer sends them.
 Neither is required for a control-plane-only deployment listening on a high
 port, which is the deployment we recommend where the peer permits it.
 
-The Flask floor, and its EOL posture
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The Flask floor
+~~~~~~~~~~~~~~~
 
 The ``packets[rtengine]`` extra declares::
 
-    Flask>=0.12
-    Werkzeug>=0.12
-    PyYAML>=3.12
+    Flask>=3.1
+    Werkzeug>=3.1
+    PyYAML>=6.0
 
-These are a **floor, not a pin**, and they are unusually low on purpose. The
-deployment target is a CentOS/AlmaLinux 8 class appliance that ships Flask
-0.12.2 from platform RPMs, and where replacing a platform RPM with a pip
-install is not something we get to do. Meanwhile Python 3.6 - also the
-platform's python - puts an effective ceiling around Flask 2.0.3. So the
-supported range is genuinely "0.12.2 through roughly 2.0.3", and pinning
-anywhere inside it would break either the appliance or a modern development
-machine.
+These are a **floor, not a pin**: the AlmaLinux 10.2 platform ships Flask
+3.1.2, Werkzeug 3.1.3 and PyYAML 6.0.1 as RPMs, and an ``==`` would either
+replace a platform-managed package or make the extra uninstallable where it is
+needed. (The 2.3.x line, for AlmaLinux 8.x, floors at Flask 0.12.)
 
-This must be stated plainly: **that stack is end-of-life upstream and receives
-no security updates.** It is a tracked compatibility and security risk, not an
-oversight, and it is the reason for two design choices you will see elsewhere
-in this document:
+Two design choices from the 0.12 era remain, because they are still right:
 
 * Authentication, the body-size limit and the pagination cap are implemented in
-  our own code, not in framework middleware or a third-party extension. They
-  therefore behave identically on Flask 0.12.2 and on Flask 2.0.x, and they do
-  not depend on a framework feature that may have a CVE we cannot patch.
-* The framework surface we use is deliberately small - blueprints, a request
-  object, a response object - so that the amount of EOL code in the request
-  path is as close to zero as we can make it.
+  our own code, not in framework middleware or a third-party extension, so
+  their behaviour does not depend on the framework version.
+* The framework surface is deliberately small - blueprints, a request object, a
+  response object.
 
-The operational mitigation is the one in `TLS, and the reverse-proxy
-boundary`_: bind to loopback and put a maintained reverse proxy in front of
-anything network-facing.
+The operational guidance is unchanged: bind to loopback and put a maintained
+reverse proxy in front of anything network-facing; see `TLS, and the
+reverse-proxy boundary`_.
 
 Operations
 ----------
@@ -1412,21 +1403,18 @@ fails silently.
 Platform notes
 --------------
 
-**Python.** The floor is Python 3.6.8, because that is what the deployment
-target ships. Nothing in ``rtengine`` uses f-strings, dataclasses, the walrus
-operator, positional-only parameters or ``from __future__ import annotations``,
-and contributions must not either. The examples in this document all run on
-3.6.
+**Python.** The floor is Python 3.12, the AlmaLinux 10.2 platform version.
+The 2.3.x releases are the line for AlmaLinux 8.x and Python 3.6.8.
 
-**Cython.** The RIB extensions build with Cython 0.28.1, which is likewise the
-platform version. Newer Cython works; do not use syntax that 0.28.1 rejects.
+**Cython.** The extensions build with Cython 3.0.9, likewise the platform
+version, and with ``-Werror`` on GCC 14.
 
 **Linux-only paths.** Netlink FIB install, TCP-MD5 and kernel TCP-AO are Linux
 kernel features. On macOS the engine runs as a control-plane speaker: the
 protocol machinery, policy, RIB and API all work, FIB install is unavailable,
-and TCP-AO is unavailable. A kernel 4.18 class appliance has TCP-MD5 but not
-TCP-AO, which is the common case in practice and the reason AO's fail-closed
-behaviour matters.
+and TCP-AO is unavailable. Kernel TCP-AO needs Linux 6.7 or later; on an older
+kernel, which has TCP-MD5 but not TCP-AO, AO's fail-closed behaviour is what
+applies.
 
 Running the tests
 ~~~~~~~~~~~~~~~~~

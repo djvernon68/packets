@@ -3454,6 +3454,19 @@ class TestPackets(unittest.TestCase):
         for name in devices:
             self.assertIsInstance(name, str)
 
+    def test_lookupdev_is_the_first_device_findalldevs_reports(self):
+        """lookupdev keeps pcap_lookupdev's answer without calling it.
+
+        libpcap 1.10 deprecates pcap_lookupdev, and GCC 14 builds with the
+        warning; packets now does what libpcap's own implementation does:
+        the first device pcap_findalldevs lists, unless it is a loopback.
+        """
+        devices = list_devices()
+        if not devices or devices[0] in ('lo', 'lo0'):
+            self.skipTest('no non-loopback device listed first here')
+        errbuf = bytearray(256)
+        self.assertEqual(_pcap.lookupdev(errbuf), devices[0].encode())
+
 
 if __name__ == '__main__':
     unittest.main()

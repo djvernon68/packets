@@ -1,6 +1,24 @@
 CHANGELOG
 ---------
 
+[2.4.0]
+ * **AlmaLinux 10.2: Python 3.12, Cython 3.0.9 and GCC 14.** The floors are now
+   the platform's own RPM versions: Python 3.12, Cython 3.0.9, Flask 3.1,
+   Werkzeug 3.1 and PyYAML 6.0. The 2.3.x releases remain the AlmaLinux 8.x
+   line.
+ * **Builds warning-free under GCC 14 with `-Werror`.** 2.3.0 does not build
+   there: GCC 14 rejects the incompatible-pointer casts that Cython 3.0.9 emits
+   when a `@cython.final` class's override of an inherited method is called
+   directly (cython/cython#2747), at 15 call sites. Each is now a call through
+   the base type. `pcap_lookupdev`, deprecated in libpcap 1.10, is replaced by
+   the same logic on `pcap_findalldevs`, with the same result. The libpcap
+   callback used by `pcap_info` is declared `noexcept`, which Cython 3 requires
+   of a C callback.
+ * **`pyproject.toml` (PEP 621).** Metadata, extras and entry points moved
+   there. `setup.py` only declares the extensions, and builds them through
+   `cythonize()` so that compiler directives are applied. Build offline with
+   the platform toolchain: `pip install --no-build-isolation .`.
+
 [2.3.0]
  * **The last release for AlmaLinux 8.x** (Python 3.6.8, Cython 0.28.1,
    Flask 0.12.2).

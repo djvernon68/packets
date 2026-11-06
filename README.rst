@@ -37,16 +37,25 @@ environment on your machine.
 
 Requirements:
 
-1. Python 3.6 or later
-2. Development tools for your OS
-3. Cython
+1. Python 3.12 or later
+2. Development tools for your OS (GCC 14 on AlmaLinux 10.2)
+3. Cython 3.0.9 or later
 4. libpcap headers. See note below on installing libpcap on MacOS and Linux.
+
+packets 2.4 and later target AlmaLinux 10.2. The 2.3.x releases are the line
+for AlmaLinux 8.x (Python 3.6.8, Cython 0.28.1).
 
 Steps:
 
 1. Install development tools and libpcap as shown below.
 2. $ pip install Cython
 3. $ pip install .
+
+On AlmaLinux 10.2, use the platform packages and build without downloading
+anything (``python3-cython`` is in the CRB repository)::
+
+  $ sudo dnf install gcc python3-devel python3-cython libpcap-devel
+  $ pip install --no-build-isolation .
 
 Because this package builds Cython extensions against libpcap, it is installed
 from a source checkout rather than from an index.

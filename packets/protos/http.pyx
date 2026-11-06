@@ -1073,19 +1073,22 @@ cdef class HTTP(PKT):
     cdef int _write(self, PktWriter w, dict kwargs) except -1:
         # Delegate into the same writer rather than calling child.pkt2net(),
         # which would allocate and copy a complete intermediate message.
+        # <PKT>: a vtable call, because a direct call to a @cython.final
+        # override fails GCC 14 under Cython 3.0.9; see the note above
+        # PKT in inetpkt.pyx (cython/cython#2747).
         cdef:
             HTTPRequest request
             HTTPResponse response
             HTTPBodyFragment fragment
         if isinstance(self.message, HTTPRequest):
             request = self.message
-            return request._write(w, kwargs)
+            return (<PKT>request)._write(w, kwargs)
         elif isinstance(self.message, HTTPResponse):
             response = self.message
-            return response._write(w, kwargs)
+            return (<PKT>response)._write(w, kwargs)
         elif isinstance(self.message, HTTPBodyFragment):
             fragment = self.message
-            return fragment._write(w, kwargs)
+            return (<PKT>fragment)._write(w, kwargs)
         raise TypeError('HTTP message must be HTTPRequest, HTTPResponse, '
                         'or HTTPBodyFragment')
 

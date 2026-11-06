@@ -2,8 +2,14 @@
 
 ## Compatibility
 
-- Keep the supported baseline compatible with Python 3.6.8 and Cython 0.28.1.
-  Do not use newer Python syntax or newer Cython-only features in shipping code.
+- The supported baseline is AlmaLinux 10.2: Python 3.12, Cython 3.0.9 and
+  GCC 14, all from the platform's RPMs. Python 3.12 syntax and library and
+  Cython 3.0.9 features are fair game; nothing newer than either. The 2.3.x
+  releases are the Python 3.6.8 / Cython 0.28.1 line for AlmaLinux 8.x.
+- The extensions must build with ``CFLAGS=-Werror`` on GCC 14. Cython 3.0.9
+  mis-casts ``self`` on a direct call to a ``@cython.final`` class's override
+  of an inherited ``cdef`` method, which GCC 14 rejects; write such calls as
+  ``(<PKT>obj).method(...)`` (see the note above ``PKT`` in ``inetpkt.pyx``).
 - Treat the public `PKT` constructors, fields, `query_info()`, `get_field_val()`,
   `pkt2net()`, and Layer-7 registration behavior as compatibility contracts.
 - Rebuild from clean generated artifacts after changing a `.pxd` file. Cython
