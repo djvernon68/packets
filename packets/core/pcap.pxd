@@ -311,6 +311,13 @@ cdef struct pcapdumper:
 
 ctypedef pcap_pkthdr pcap_pkthdr_t
 
+# What PCAPReader._next_raw / PCAPSocket._next_raw read: a packet, a live
+# read timeout with no packet, or the end of the capture.
+cdef enum:
+    RAW_PACKET = 1
+    RAW_TIMEOUT = 0
+    RAW_END = -1
+
 cpdef uint32_t ip2int(str addr)
 cpdef str int2ip(uint32_t addr)
 
@@ -388,6 +395,8 @@ cdef class PCAPSocket(PCAPBase):
     cpdef int add_bpf_filter(self, str bpf_filter) except -1
     cpdef int open_pcap_dumper(self, str file_name) except? -1
     cpdef void close(self)
+    # __next__ without building its tuple and header dict; see PCAPReader.
+    cdef bytes _next_raw(self, double *ts, pcap_pkthdr_t *hdr, int *status)
 
 
 cdef class PCAPReader(PCAPBase):
@@ -402,6 +411,7 @@ cdef class PCAPReader(PCAPBase):
     cpdef void close(self)
     cpdef int open_pcap_dumper(self, str file_name) except? -1
     cpdef int add_bpf_filter(self, str bpf_filter) except -1
+    cdef bytes _next_raw(self, double *ts, pcap_pkthdr_t *hdr, int *status)
 
 
 cdef class PCAPWriter(PCAPBase):

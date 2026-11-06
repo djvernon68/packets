@@ -282,6 +282,37 @@ class HTTPTestCase(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     HTTPResponse(wire)
 
+    def test_header_line_split_and_trim(self):
+        # _parse_headers splits and trims each line by index on the parse
+        # view. These are the cases bytes.find(b':') and .strip(b' \t')
+        # defined.
+        cases = [
+            (b'A: v', (b'A', b'v')),
+            (b'A:v', (b'A', b'v')),
+            (b'A: \t v \t ', (b'A', b'v')),
+            (b'A:', (b'A', b'')),
+            (b'A: \t ', (b'A', b'')),
+            (b'A: x:y: z', (b'A', b'x:y: z')),
+            (b'A: in  side', (b'A', b'in  side')),
+            (b'A: \x80\xff obs', (b'A', b'\x80\xff obs')),
+            (b"!#$%&'*+-.^_`|~09azAZ: t", (b"!#$%&'*+-.^_`|~09azAZ", b't')),
+        ]
+        for line, header in cases:
+            with self.subTest(line=line):
+                wire = b'GET / HTTP/1.1\r\n' + line + b'\r\n\r\n'
+                request = HTTPRequest(wire)
+                self.assertEqual(request.headers, [header])
+                response = HTTPResponse(b'HTTP/1.1 204 No Content\r\n' +
+                                        line + b'\r\n\r\n')
+                self.assertEqual(response.headers, [header])
+
+        for line in (b': v', b'NoColon', b'A B: v', b'A\t: v', b' A: v',
+                     b'A(: v', b'A: bad\x00', b'A: bad\x7f', b'A: \x01',
+                     b'\xc3\xa9: v'):
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    HTTPRequest(b'GET / HTTP/1.1\r\n' + line + b'\r\n\r\n')
+
     def test_rejects_malformed_chunked_bodies(self):
         prefix = (b'HTTP/1.1 200 OK\r\n'
                   b'Transfer-Encoding: chunked\r\n\r\n')

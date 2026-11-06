@@ -114,11 +114,24 @@ cdef bytes _sort_groups(bytes v, Py_ssize_t width):
     cdef Py_ssize_t count = n // width
     cdef list groups
     cdef Py_ssize_t i
+    cdef const unsigned char *p
 
     if count < 2:
         # 0 or 1 whole records: nothing to order. Still truncate, so the
         # "whole records only" invariant holds for every stored value.
         return v[:count * width]
+    # Exporters almost always send communities already in order, and a
+    # strictly ascending run is its own sorted, deduplicated form. Checking
+    # that in place costs one memcmp per record, against a slice, a set, a
+    # list and a join for the general case below.
+    if n == count * width:
+        p = <const unsigned char*>PyBytes_AS_STRING(v)
+        i = 1
+        while i < count and memcmp(p + (i - 1) * width, p + i * width,
+                                   width) < 0:
+            i += 1
+        if i == count:
+            return v
     # W-7: deduplicated as well as sorted. A community list is a set, so
     # `A B A` and `A B` mean the same thing; sorted but not deduplicated,
     # they interned as two attribute sets, and re-advertising either

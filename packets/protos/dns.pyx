@@ -12,7 +12,7 @@ from cpython.array cimport array
 from libc.stdint cimport uint16_t, uint32_t
 cimport cython
 
-from packets.core.inetpkt cimport PKT, set_bit, unset_bit, \
+from packets.core.inetpkt cimport PKT, _fmt_ipv4_buf, set_bit, unset_bit, \
     set_short_nibble, get_short_nibble, rd_u16, rd_u32, rd_bytes, \
     need_bytes, PktWriter, w_u8, w_u16, w_u32, w_bytes, w_set_u16, _serialize
 
@@ -250,9 +250,12 @@ cdef tuple parse_resource(const unsigned char[:] byte_array,
                                      offset,
                                      label_store)
     elif r_type == DNSTYPE_A:
-        r_data = socket.inet_ntop(socket.AF_INET,
-                                  rd_bytes(byte_array, offset[PNTR],
-                                           offset[PNTR] + 4))
+        # Formatted in C from the parse buffer: socket.inet_ntop was two
+        # module attribute lookups, a 4 byte copy and a Python call per
+        # answer. The explicit check stands in for inet_ntop's length
+        # check, so truncated rdata is still a ValueError.
+        need_bytes(byte_array, offset[PNTR] + 4, 'DNS')
+        r_data = _fmt_ipv4_buf(&byte_array[offset[PNTR]])
         offset[PNTR] += 4
     elif r_type == DNSTYPE_AAAA:
         r_data = socket.inet_ntop(socket.AF_INET6,
@@ -503,6 +506,57 @@ cdef class DNSResource:
         return 0
 
 
+cdef inline bint _is_dns_name(str val):
+    """The part of the domain_name and query_name setters' test that does
+    not depend on the record type."""
+    return (domainname_re.match(val) is not None or
+            hostname_re.match(val) is not None or
+            val == '')
+
+
+# A parsed message builds its records with __new__ and sets their fields
+# directly, rather than through DNSQuery(...) / DNSResource(*args): that was a
+# full Python call with argument parsing per record. The name still goes
+# through its setter's test, but a message repeats the same few names through
+# compression pointers and the regexes are most of a record's cost, so each
+# message remembers the names that have passed. Only a name the regexes
+# accept is remembered; one accepted because of its record type (TXT, OPT)
+# goes through the setter every time.
+
+cdef DNSQuery _parsed_query(str name, uint16_t query_type,
+                            uint16_t query_class, set valid_names):
+    cdef DNSQuery query = DNSQuery.__new__(DNSQuery)
+    query.query_type = query_type
+    query.query_class = query_class
+    if name in valid_names:
+        query._query_name = name
+    elif _is_dns_name(name):
+        valid_names.add(name)
+        query._query_name = name
+    else:
+        query.query_name = name
+    return query
+
+
+cdef DNSResource _parsed_resource(tuple args, set valid_names):
+    """args is parse_resource's tuple, in DNSResource.__init__ order."""
+    cdef DNSResource res = DNSResource.__new__(DNSResource)
+    cdef str name = args[0]
+    res.res_type = args[1]
+    res.res_class = args[2]
+    res.res_ttl = args[3]
+    res.res_len = args[4]
+    if name in valid_names:
+        res._domain_name = name
+    elif _is_dns_name(name):
+        valid_names.add(name)
+        res._domain_name = name
+    else:
+        res.domain_name = name
+    res.res_data = args[5]
+    return res
+
+
 @cython.final
 cdef class DNS(PKT):
     """ Wrapper for RFC 1035 DNS packet data. Reads and writes.
@@ -580,6 +634,7 @@ cdef class DNS(PKT):
             str query_name
             uint16_t query_type, query_class
             tuple resource_args
+            set valid_names = set()
 
         # read the first 12 bytes into six unsigned shorts.
         need_bytes(mv, 12, 'DNS')
@@ -603,9 +658,8 @@ cdef class DNS(PKT):
                 need_bytes(mv, offset + 4, 'DNS')
                 query_type = rd_u16(mv, offset)
                 query_class = rd_u16(mv, offset + 2)
-                self.queries.append(DNSQuery(query_name,
-                                               query_type,
-                                               query_class))
+                self.queries.append(_parsed_query(query_name, query_type,
+                                                  query_class, valid_names))
                 offset += 4
         # Now unpack the resources by the 3 remaining types.
         if self.answer_count:
@@ -614,21 +668,24 @@ cdef class DNS(PKT):
                                                &offset,
                                                self.labels
                 )
-                self.answers.append(DNSResource(*resource_args))
+                self.answers.append(_parsed_resource(resource_args,
+                                                     valid_names))
         if self.auth_count:
             for _ in range(self.auth_count):
                 resource_args = parse_resource(mv,
                                                &offset,
                                                self.labels
                 )
-                self.authority.append(DNSResource(*resource_args))
+                self.authority.append(_parsed_resource(resource_args,
+                                                     valid_names))
         if self.ad_count:
             for _ in range(self.ad_count):
                 resource_args = parse_resource(mv,
                                                &offset,
                                                self.labels
                 )
-                self.ad.append(DNSResource(*resource_args))
+                self.ad.append(_parsed_resource(resource_args,
+                                                     valid_names))
         return 0
 
     @classmethod

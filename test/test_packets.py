@@ -430,6 +430,45 @@ class TestPackets(unittest.TestCase):
         self.assertEqual(dns.pkt2net({'update': 1, 'compress': 0}),
                          header + first + second_full)
 
+    def test_DNS_parsed_name_validation_per_record_type(self):
+        # A parsed message remembers names that passed the hostname test, so
+        # a repeat skips the regexes. A name only a TXT record may carry must
+        # not be remembered: the A record that points back at it is invalid.
+        header = _struct.pack('!HHHHHH', 0x1234, 0x8180, 0, 2, 0, 0)
+        txt = (b'\x03b d\x00' +
+               _struct.pack('!HHIH', DNSTYPE_TXT, RCLASS_IN, 60, 3) + b'abc')
+        a = (b'\xc0\x0c' +
+             _struct.pack('!HHIH', DNSTYPE_A, RCLASS_IN, 60, 4) +
+             b'\x0a\x00\x00\x01')
+        self.assertEqual(DNS(header + txt + txt).answers[1].domain_name,
+                         'b d')
+        with self.assertRaisesRegex(ValueError, 'valid host name'):
+            DNS(header + txt + a)
+        # A name that passed is reused across sections and pointers.
+        header = _struct.pack('!HHHHHH', 0x1234, 0x8180, 1, 1, 1, 1)
+        question = (b'\x03www\x07example\x03com\x00' +
+                    _struct.pack('!HH', DNSTYPE_A, RCLASS_IN))
+        parsed = DNS(header + question + a + a + a)
+        self.assertEqual(parsed.queries[0].query_name, 'www.example.com')
+        for section in (parsed.answers, parsed.authority, parsed.ad):
+            self.assertEqual([(r.domain_name, r.res_type, r.res_class,
+                               r.res_ttl, r.res_len, r.res_data)
+                              for r in section],
+                             [('www.example.com', DNSTYPE_A, RCLASS_IN, 60,
+                               4, '10.0.0.1')])
+
+    def test_DNS_a_record_address_and_truncation(self):
+        header = _struct.pack('!HHHHHH', 0x1234, 0x8180, 0, 1, 0, 0)
+        name = b'\x01h\x00'
+        rr = _struct.pack('!HHIH', DNSTYPE_A, RCLASS_IN, 60, 4)
+        for raw in (b'\x00\x00\x00\x00', b'\xff\xff\xff\xff',
+                    b'\x0a\x09\x63\xc8'):
+            self.assertEqual(DNS(header + name + rr + raw).answers[0].res_data,
+                             _socket.inet_ntop(_socket.AF_INET, raw))
+        for short in (b'', b'\x0a', b'\x0a\x00\x00'):
+            with self.assertRaises(ValueError):
+                DNS(header + name + rr + short)
+
     def test_DNS_invalid_compression_pointers(self):
         header = _struct.pack('!HHHHHH', 0x1234, 0, 1, 0, 0, 0)
         qtype_class = _struct.pack('!HH', DNSTYPE_A, RCLASS_IN)

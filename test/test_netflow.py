@@ -142,6 +142,36 @@ class TestNetflow(unittest.TestCase):
             packet = Netflow(wire)
             self.assertEqual(packet.pkt2net({}), wire)
 
+    def test_netflow_fixed_versions_record_loop_bounds(self):
+        # The record loop stops at the header count or at the last whole
+        # record, whichever comes first, and keeps what follows as raw data.
+        # It reads both bounds as C values now; this pins where it stops.
+        headers = {1: struct.pack('!HHIII', 1, 0, 1, 2, 3),
+                   5: struct.pack('!HHIIIIBBH', 5, 0, 1, 2, 3, 4, 0, 0, 0),
+                   7: struct.pack('!HHIIIII', 7, 0, 1, 2, 3, 4, 5)}
+        lengths = {1: 48, 5: 48, 7: 52}
+        for version, header in headers.items():
+            size = lengths[version]
+            body = bytes(range(256)) * 2
+            for count, present, tail in ((3, 3, b''), (5, 3, b''),
+                                         (2, 3, b''), (3, 2, b'\x01' * 7),
+                                         (0, 1, b'')):
+                wire = (header[:2] + struct.pack('!H', count) + header[4:] +
+                        body[:size * present] + tail)
+                packet = Netflow(wire)
+                expected = min(count, present)
+                self.assertEqual(len(packet.records), expected,
+                                 (version, count, present))
+                self.assertEqual(packet.raw_data,
+                                 wire[len(header) + size * expected:])
+                self.assertEqual(packet.records[-1].src_addr if expected
+                                 else None,
+                                 '.'.join(str(b) for b in
+                                          body[size * (expected - 1):
+                                               size * (expected - 1) + 4])
+                                 if expected else None)
+                self.assertEqual(packet.pkt2net({}), wire)
+
     def test_netflow_simple_compatibility_exports(self):
         wire = struct.pack('!HHIII', 9, 2, 100, 200, 300) + b'opaque'
 

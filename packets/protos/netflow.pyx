@@ -56,6 +56,15 @@ NETFLOW_V7_RECORD_LEN = 52
 NETFLOW_V9_HEADER_LEN = 20
 IPFIX_HEADER_LEN = 16
 
+# The fixed record lengths again, as C constants for the record loops in
+# Netflow._parse. The names above are module globals, so every use there was
+# a global lookup and Python integer arithmetic per record. Keep the two
+# sets equal: the Python names are public.
+cdef enum:
+    _V1_RECORD_LEN = 48
+    _V5_RECORD_LEN = 48
+    _V7_RECORD_LEN = 52
+
 cdef int CODEC_BYTES = 0
 cdef int CODEC_UNSIGNED = 1
 cdef int CODEC_IPV4 = 2
@@ -904,7 +913,17 @@ cdef class IPFIXHeader:
         return 0
 
 
-cdef inline void _read_common_record(object record,
+# The record types _read_common_record fills. A fused type rather than
+# object, so each version gets its own specialization that stores straight
+# into the record's fields; through object every one of the eleven stores
+# below was a setattr by name.
+ctypedef fused _FixedRecord:
+    NetflowV1Record
+    NetflowV5Record
+    NetflowV7Record
+
+
+cdef inline void _read_common_record(_FixedRecord record,
                                      const unsigned char[:] data,
                                      Py_ssize_t offset):
     # Three addresses per record, and a real v5 exporter packs 30 records
@@ -1417,11 +1436,11 @@ cdef class NetflowCodecPlan:
         cdef dict fields = {}
         cdef tuple original_values = PyTuple_New(self.operation_count)
         cdef object raw_ranges = [] if self.has_variable else None
+        cdef type rc
+        cdef NetflowFieldMap fmap
 
         for index in range(self.operation_count):
-            field = self.codec_fields[index]
             key = self.keys[index]
-            identity = self.identities[index]
             if self.c_operations[index].variable_length:
                 if offset >= len(data):
                     return None
@@ -1455,16 +1474,24 @@ cdef class NetflowCodecPlan:
                 value = _decode_string(mv, value_start, value_length)
             else:
                 raw_value = data[value_start:offset]
-                value = _decode_value(field, raw_value)
+                value = _decode_value(self.codec_fields[index], raw_value)
             fields[key] = value
             Py_INCREF(value)
             PyTuple_SET_ITEM(original_values, index, value)
             if raw_ranges is not None:
                 raw_ranges.append((value_start - start, value_length))
 
-        record = self.record_class.__new__(self.record_class)
+        # Both objects are allocated directly: through the Python-level
+        # record_class.__new__ lookup and NetflowFieldMap(...) call, with its
+        # keyword parsing, they were two full calls per data record. The map
+        # is set up as __init__ sets it up for canonical=True.
+        rc = self.record_class
+        record = rc.__new__(rc)
         record.template_id = template.template_id
-        record.fields = NetflowFieldMap(fields, self.aliases, True)
+        fmap = NetflowFieldMap.__new__(NetflowFieldMap)
+        fmap._values = fields
+        fmap._aliases = self.aliases if self.aliases is not None else {}
+        record.fields = fmap
         record._raw_fields = None
         record._raw_ranges = (tuple(raw_ranges)
                               if raw_ranges is not None else None)
@@ -1815,7 +1842,8 @@ cdef class Netflow(PKT):
         return packet
 
     cdef int _parse(self, bytes data) except -1:
-        cdef int offset, record_count
+        cdef int offset, record_count, hdr_count
+        cdef Py_ssize_t data_len
         cdef const unsigned char[:] mv = data
         cdef NetflowV1Header v1_header
         cdef NetflowV5Header v5_header
@@ -1842,12 +1870,14 @@ cdef class Netflow(PKT):
             self.header = v1_header
             offset = NETFLOW_V1_HEADER_LEN
             record_count = 0
-            while (record_count < self.header.count and
-                   offset + NETFLOW_V1_RECORD_LEN <= len(data)):
+            hdr_count = v1_header.count
+            data_len = len(data)
+            while (record_count < hdr_count and
+                   offset + _V1_RECORD_LEN <= data_len):
                 v1_record = NetflowV1Record.__new__(NetflowV1Record)
                 _read_v1_record(v1_record, mv, offset)
                 self.records.append(v1_record)
-                offset += NETFLOW_V1_RECORD_LEN
+                offset += _V1_RECORD_LEN
                 record_count += 1
             self.raw_data = rd_bytes(mv, offset, -1)
         elif self.version == 5:
@@ -1858,12 +1888,14 @@ cdef class Netflow(PKT):
             self.header = v5_header
             offset = NETFLOW_V5_HEADER_LEN
             record_count = 0
-            while (record_count < self.header.count and
-                   offset + NETFLOW_V5_RECORD_LEN <= len(data)):
+            hdr_count = v5_header.count
+            data_len = len(data)
+            while (record_count < hdr_count and
+                   offset + _V5_RECORD_LEN <= data_len):
                 v5_record = NetflowV5Record.__new__(NetflowV5Record)
                 _read_v5_record(v5_record, mv, offset)
                 self.records.append(v5_record)
-                offset += NETFLOW_V5_RECORD_LEN
+                offset += _V5_RECORD_LEN
                 record_count += 1
             self.raw_data = rd_bytes(mv, offset, -1)
         elif self.version == 7:
@@ -1874,12 +1906,14 @@ cdef class Netflow(PKT):
             self.header = v7_header
             offset = NETFLOW_V7_HEADER_LEN
             record_count = 0
-            while (record_count < self.header.count and
-                   offset + NETFLOW_V7_RECORD_LEN <= len(data)):
+            hdr_count = v7_header.count
+            data_len = len(data)
+            while (record_count < hdr_count and
+                   offset + _V7_RECORD_LEN <= data_len):
                 v7_record = NetflowV7Record.__new__(NetflowV7Record)
                 _read_v7_record(v7_record, mv, offset)
                 self.records.append(v7_record)
-                offset += NETFLOW_V7_RECORD_LEN
+                offset += _V7_RECORD_LEN
                 record_count += 1
             self.raw_data = rd_bytes(mv, offset, -1)
         elif self.version == 9:

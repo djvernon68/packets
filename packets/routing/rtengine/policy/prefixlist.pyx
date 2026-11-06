@@ -541,7 +541,7 @@ cdef class PrefixList:
         cdef Prefix p
         cdef PrefixListEntry entry
 
-        if not isinstance(prefix, _Prefix):
+        if not isinstance(prefix, Prefix):
             raise ValueError('a Prefix is required, not %s'
                              % type(prefix).__name__)
         p = <Prefix>prefix

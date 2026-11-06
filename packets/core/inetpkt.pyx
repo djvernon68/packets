@@ -1044,6 +1044,8 @@ cdef class PKT:
         """
         cdef:
             int fnd
+            object nxt
+            PKT p
 
         fnd = found
         if self.pkt_name == name:
@@ -1051,17 +1053,19 @@ cdef class PKT:
             if fnd == instance:
                 return self
 
-        if hasattr(self, 'payload') and isinstance(self.payload, PKT):
-            if self.payload.pkt_name == name:
+        # payload is declared by each subclass rather than by PKT, so it is
+        # fetched once by name; everything after that is typed, and the
+        # recursion is a vtable call instead of a Python call building an
+        # argument tuple and a keyword dict at every layer.
+        nxt = getattr(self, 'payload', None)
+        if isinstance(nxt, PKT):
+            p = <PKT>nxt
+            if p.pkt_name == name:
                 fnd += 1
             if fnd == instance:
-                return self.payload
-            else:
-                return self.payload.get_layer(name,
-                                              instance=instance,
-                                              found=fnd)
-        else:
-            return NullPkt()
+                return p
+            return p.get_layer(name, instance, fnd)
+        return NullPkt()
 
     cpdef PKT get_layer_by_type(self,
                                 uint16_t pq_type,
@@ -1084,6 +1088,8 @@ cdef class PKT:
         """
         cdef:
             int fnd
+            object nxt
+            PKT p
 
         fnd = found
 
@@ -1092,17 +1098,17 @@ cdef class PKT:
             if fnd == instance:
                 return self
 
-        if hasattr(self, 'payload') and isinstance(self.payload, PKT):
-            if self.payload.pq_type == pq_type:
+        # Typed the same way as get_layer: PcapQuery calls this once per
+        # packet for every layer a query names.
+        nxt = getattr(self, 'payload', None)
+        if isinstance(nxt, PKT):
+            p = <PKT>nxt
+            if p.pq_type == pq_type:
                 fnd += 1
             if fnd == instance:
-                return self.payload
-            else:
-                return self.payload.get_layer_by_type(pq_type,
-                                                      instance=instance,
-                                                      found=fnd)
-        else:
-            return NullPkt()
+                return p
+            return p.get_layer_by_type(pq_type, instance, fnd)
+        return NullPkt()
 
     cpdef bytes pkt2net(self, dict kwargs):
         """Used to export a PKT based packet class in network order for writing
@@ -1536,9 +1542,7 @@ cdef class Ip4Ph:
     """
 
     def __init__(self, **kwargs):
-        """Initialize a new Ip4Ph object. Actual initialization is done by the
-        classes Cython __cinit__ function. __init__ exists to support
-        documentation generation.
+        """Initialize a new Ip4Ph object.
 
         Args:
             :src (bytes): IPv4 src address for parent IP Object
@@ -1549,16 +1553,33 @@ cdef class Ip4Ph:
             :payload_len (uint16_t): Total length of IP payload in octets.
 
         """
-
-    def __cinit__(self, **kwargs):
-        """The real C level init function for Ip4Ph. __init__ above is only
-        for documentation.
-        """
         self.src = kwargs.get('src', b'\x00\x00\x00\x00')
         self.dst = kwargs.get('dst', b'\x00\x00\x00\x00')
         self.reserved = kwargs.get('reserved', 0)
         self.proto = kwargs.get('proto', 0)
         self.payload_len = kwargs.get('payload_len', 0)
+
+    def __cinit__(self):
+        """Give the object a valid zero pseudo header before __init__ runs.
+
+        The IP decoders allocate one of these per packet with
+        ``Ip4Ph.__new__(Ip4Ph)`` and then set every field themselves, so they
+        skip __init__. The keyword handling used to live here, which made
+        that allocation build and search a keyword dict per packet. A
+        __cinit__ that takes only ``self`` ignores the constructor's
+        arguments, so ``Ip4Ph(src=...)`` still reaches __init__ unchanged.
+        The integer fields are already 0 in a freshly allocated object.
+        """
+        self.src = b'\x00\x00\x00\x00'
+        self.dst = b'\x00\x00\x00\x00'
+
+
+# The pseudo header a TCP or UDP layer checksums against when it is
+# serialized on its own, without an enclosing IP to supply one. It was a new
+# Ip4Ph() per write, built even when IP._write had passed the real one,
+# because a kwargs.get default is evaluated before the lookup. The writers
+# only read it and it never leaves them, so one shared instance is safe.
+cdef Ip4Ph _ZERO_IP4PH = Ip4Ph.__new__(Ip4Ph)
 
 
 @cython.final
@@ -1584,20 +1605,22 @@ cdef class Ip6Ph:
     """
 
     def __init__(self, **kwargs):
-        """Initialize a new Ip6Ph object. Actual initialization happens in
-        __cinit__; __init__ exists for documentation generation.
+        """Initialize a new Ip6Ph object.
 
         Args:
             :src (bytes): 16-byte IPv6 src address of the parent IP6 object.
             :dst (bytes): 16-byte IPv6 dst address of the parent IP6 object.
             :nh (unsigned char): upper-layer protocol number (6, 17 or 58).
         """
-
-    def __cinit__(self, **kwargs):
-        """The real C level init for Ip6Ph. __init__ above is documentation."""
         self.src = kwargs.get('src', b'\x00' * 16)
         self.dst = kwargs.get('dst', b'\x00' * 16)
         self.nh = kwargs.get('nh', 0)
+
+    def __cinit__(self):
+        """A valid zero pseudo header before __init__; see Ip4Ph.__cinit__
+        for why the keyword handling is in __init__."""
+        self.src = b'\x00' * 16
+        self.dst = b'\x00' * 16
 
 
 @cython.final
@@ -1954,7 +1977,7 @@ cdef class UDP(PKT):
             self.checksum = 0
         else:
             _csum = kwargs.get('csum', 0)
-        _ipv4_pheader = kwargs.get('ipv4_pheader', Ip4Ph())
+        _ipv4_pheader = kwargs.get('ipv4_pheader', _ZERO_IP4PH)
         _ipv6_pheader = kwargs.get('ipv6_pheader')
 
         start = w.n
@@ -2445,7 +2468,7 @@ cdef class TCP(PKT):
             unsigned char ph[40]
 
         _csum = kwargs.get('csum', 0)
-        _ipv4_pheader = kwargs.get('ipv4_pheader', Ip4Ph())
+        _ipv4_pheader = kwargs.get('ipv4_pheader', _ZERO_IP4PH)
         _ipv6_pheader = kwargs.get('ipv6_pheader')
 
         start = w.n
@@ -4773,8 +4796,8 @@ cdef class ICMP6(PKT):
             off += size
         return 0
 
-    cdef int _parse_options(self, bytes owner, Py_ssize_t off,
-                            Py_ssize_t end) except -1:
+    cdef int _parse_options(self, bytes owner, const unsigned char[:] mv,
+                            Py_ssize_t off, Py_ssize_t end) except -1:
         """Walk the Neighbor Discovery option TLVs at the end of an ND
         message.
 
@@ -4791,7 +4814,6 @@ cdef class ICMP6(PKT):
         :return: 0.
         """
         cdef:
-            const unsigned char[:] mv = owner
             Py_ssize_t size
             ICMP6Opt opt
         while off < end:
@@ -4807,7 +4829,7 @@ cdef class ICMP6(PKT):
             opt.pkt_name = 'ICMP6Opt'
             opt.pq_type, opt.query_fields = _QI_ICMP6Opt
             opt._data = b''
-            _decode_icmp6_opt(opt, owner, off, off + size)
+            _decode_icmp6_opt(opt, owner, mv, off, off + size)
             self.options.append(opt)
             off += size
         return 0
@@ -7827,9 +7849,16 @@ cdef BGP _bgp_chain(bytes owner, const unsigned char[:] mv, Py_ssize_t start,
     return nxt
 
 
-cdef list _bgp_read_prefixes(const unsigned char[:] mv, Py_ssize_t o,
+cdef tuple _bgp_first_prefix(const unsigned char[:] mv, Py_ssize_t o,
                              Py_ssize_t end, bint add_path):
-    """Read a run of length-prefixed NLRI, each a (dotted-quad, prefix_len).
+    """Read the first of a run of length-prefixed NLRI as
+    (dotted-quad, prefix_len), or None if there is no whole entry.
+
+    The dissector exposes only the first withdrawn and the first announced
+    prefix. This used to render the whole run into a list and keep entry 0:
+    a formatted string and a tuple for every prefix in the UPDATE, of which
+    a full-table UPDATE carries hundreds. The walk has no side effects, so
+    stopping after one entry changes nothing else.
 
     The walk itself is _bgp_nlri_next; this is the rendering half of it. The
     ``max_addr_bytes=4`` argument is where the IPv4-only restriction now
@@ -7837,26 +7866,21 @@ cdef list _bgp_read_prefixes(const unsigned char[:] mv, Py_ssize_t o,
     routing engine can read the same prefixes as IPv6 by passing 16 without
     this function changing at all.
 
-    Never raises: a partial entry ends the run.
+    Never raises: a partial entry is no entry.
     """
     cdef:
-        list out = []
-        Py_ssize_t nxt, addr
+        Py_ssize_t nxt, addr, i
         unsigned char plen = 0, nbytes
-        unsigned char b0, b1, b2, b3
+        unsigned char quad[4]
         uint32_t path_id = 0
-    while True:
-        nxt = _bgp_nlri_next(mv, o, end, add_path, 4, &path_id, &plen, &addr)
-        if nxt < 0 or nxt <= o:
-            break
-        nbytes = (plen + 7) // 8
-        b0 = mv[addr] if nbytes > 0 else 0
-        b1 = mv[addr + 1] if nbytes > 1 else 0
-        b2 = mv[addr + 2] if nbytes > 2 else 0
-        b3 = mv[addr + 3] if nbytes > 3 else 0
-        out.append(('%d.%d.%d.%d' % (b0, b1, b2, b3), plen))
-        o = nxt
-    return out
+    nxt = _bgp_nlri_next(mv, o, end, add_path, 4, &path_id, &plen, &addr)
+    if nxt < 0 or nxt <= o:
+        return None
+    # The truncated on-wire address, zero filled to four bytes.
+    nbytes = (plen + 7) // 8
+    for i in range(4):
+        quad[i] = mv[addr + i] if i < nbytes else 0
+    return (_fmt_ipv4_buf(quad), plen)
 
 
 cdef void _decode_bgp_attr_value(BGPParam p, unsigned char atype,
@@ -8113,7 +8137,7 @@ cdef void _decode_bgp_update(BGP pkt, const unsigned char[:] mv,
     cdef:
         Py_ssize_t o = off, wend, tpa_end, nxt
         uint16_t wlen, tpalen
-        list withdrawn, nlri
+        tuple withdrawn, nlri
     if not _have_range(o, end, 2):
         return
     wlen = rd_u16(mv, o)
@@ -8122,9 +8146,9 @@ cdef void _decode_bgp_update(BGP pkt, const unsigned char[:] mv,
     wend = o + wlen
     if wend > end:
         wend = end
-    withdrawn = _bgp_read_prefixes(mv, o, wend, pkt._add_path)
-    if withdrawn:
-        pkt.body['bgp.withdrawn_prefix'] = withdrawn[0][0]
+    withdrawn = _bgp_first_prefix(mv, o, wend, pkt._add_path)
+    if withdrawn is not None:
+        pkt.body['bgp.withdrawn_prefix'] = withdrawn[0]
     o = wend
     if not _have_range(o, end, 2):
         return
@@ -8140,10 +8164,10 @@ cdef void _decode_bgp_update(BGP pkt, const unsigned char[:] mv,
             break
         o = nxt
     o = tpa_end
-    nlri = _bgp_read_prefixes(mv, o, end, pkt._add_path)
-    if nlri:
-        pkt.body['bgp.nlri_prefix'] = nlri[0][0]
-        pkt.body['bgp.prefix_length'] = nlri[0][1]
+    nlri = _bgp_first_prefix(mv, o, end, pkt._add_path)
+    if nlri is not None:
+        pkt.body['bgp.nlri_prefix'] = nlri[0]
+        pkt.body['bgp.prefix_length'] = nlri[1]
 
 
 cdef void _decode_bgp_notify(BGP pkt, const unsigned char[:] mv,
@@ -9112,10 +9136,9 @@ cdef int _decode_netflow_simple(NetflowSimple pkt, bytes owner,
     return 0
 
 
-cdef int _decode_icmp(ICMP pkt, bytes owner, Py_ssize_t start,
-                      Py_ssize_t end) except -1:
+cdef int _decode_icmp(ICMP pkt, bytes owner, const unsigned char[:] mv,
+                      Py_ssize_t start, Py_ssize_t end) except -1:
     cdef:
-        const unsigned char[:] mv = owner
         IP ip
     pkt.identifier = 0
     pkt.sequence = 0
@@ -9124,8 +9147,8 @@ cdef int _decode_icmp(ICMP pkt, bytes owner, Py_ssize_t start,
     pkt.orig_ts = 0
     pkt.rec_ts = 0
     pkt.trans_ts = 0
-    pkt.hdr_pkt = NullPkt()
-    pkt.data = array('B')
+    pkt.hdr_pkt = None
+    pkt.data = clone(_EMPTY_BUF, 0, False)
     pkt.echo_data = b''
     pkt._address = b'\x00\x00\x00\x00'
     pkt.have_data = 0
@@ -9168,14 +9191,19 @@ cdef int _decode_icmp(ICMP pkt, bytes owner, Py_ssize_t start,
     else:
         pkt.have_data = 1
         pkt._raw = rd_bytes(mv, start, end)
+    # Only the error types carry an inner IP header. For the rest the empty
+    # header is made here, once, rather than made for every packet and then
+    # thrown away again by the error branch.
+    if pkt.hdr_pkt is None:
+        pkt.hdr_pkt = NullPkt()
     return 0
 
 
 cdef int _decode_igmp_group_record(IGMPGroupRecord pkt, bytes owner,
+                                   const unsigned char[:] mv,
                                    Py_ssize_t start,
                                    Py_ssize_t end) except -1:
     cdef:
-        const unsigned char[:] mv = owner
         Py_ssize_t src_end, aux_len
     pkt._source_addresses = pkt._group_address = pkt.aux_data = b''
     _need_range(start, end, 8, 'IGMPGroupRecord')
@@ -9201,10 +9229,10 @@ cdef int _decode_igmp_group_record(IGMPGroupRecord pkt, bytes owner,
     return 0
 
 
-cdef int _decode_igmp(IGMP pkt, bytes owner, Py_ssize_t start,
-                      Py_ssize_t end, object packet_len_arg) except -1:
+cdef int _decode_igmp(IGMP pkt, bytes owner, const unsigned char[:] mv,
+                      Py_ssize_t start, Py_ssize_t end,
+                      object packet_len_arg) except -1:
     cdef:
-        const unsigned char[:] mv = owner
         unsigned char operation, version = 0
         uint16_t i, packet_len
         Py_ssize_t offset
@@ -9273,16 +9301,16 @@ cdef int _decode_igmp(IGMP pkt, bytes owner, Py_ssize_t start,
             rec._l7_ports = None
             rec.pkt_name = 'IGMPGroupRecord'
             rec.pq_type, rec.query_fields = _QI_IGMPGroupRecord
-            _decode_igmp_group_record(rec, owner, offset, end)
+            _decode_igmp_group_record(rec, owner, mv, offset, end)
             pkt.group_records.append(rec)
             offset += rec.byte_len
     return 0
 
 
-cdef int _decode_icmp6_opt(ICMP6Opt pkt, bytes owner, Py_ssize_t start,
+cdef int _decode_icmp6_opt(ICMP6Opt pkt, bytes owner,
+                           const unsigned char[:] mv, Py_ssize_t start,
                            Py_ssize_t end) except -1:
     cdef:
-        const unsigned char[:] mv = owner
         Py_ssize_t total
     _need_range(start, end, 2, 'ICMP6Opt')
     pkt.type = mv[start]
@@ -9295,10 +9323,10 @@ cdef int _decode_icmp6_opt(ICMP6Opt pkt, bytes owner, Py_ssize_t start,
 
 
 cdef int _decode_mldv2_address_record(MLDv2AddressRecord pkt, bytes owner,
+                                      const unsigned char[:] mv,
                                       Py_ssize_t start,
                                       Py_ssize_t end) except -1:
     cdef:
-        const unsigned char[:] mv = owner
         Py_ssize_t src_end, aux_len
     pkt._multicast_address = _V6_ANY
     pkt._source_addresses = pkt.aux_data = b''
@@ -9319,10 +9347,9 @@ cdef int _decode_mldv2_address_record(MLDv2AddressRecord pkt, bytes owner,
     return 0
 
 
-cdef int _decode_icmp6(ICMP6 pkt, bytes owner, Py_ssize_t start,
-                       Py_ssize_t end) except -1:
+cdef int _decode_icmp6(ICMP6 pkt, bytes owner, const unsigned char[:] mv,
+                       Py_ssize_t start, Py_ssize_t end) except -1:
     cdef:
-        const unsigned char[:] mv = owner
         uint16_t i
         Py_ssize_t offset, src_end
         MLDv2AddressRecord rec
@@ -9384,12 +9411,12 @@ cdef int _decode_icmp6(ICMP6 pkt, bytes owner, Py_ssize_t start,
             rec._l7_ports = None
             rec.pkt_name = 'MLDv2AddressRecord'
             rec.pq_type, rec.query_fields = _QI_MLDv2AddressRecord
-            _decode_mldv2_address_record(rec, owner, offset, end)
+            _decode_mldv2_address_record(rec, owner, mv, offset, end)
             pkt.records.append(rec)
             offset += rec.byte_len
     elif pkt.type == ICMP6_ND_ROUTER_SOLICIT:
         _need_range(start, end, 8, 'ICMP6')
-        pkt._parse_options(owner, start + 8, end)
+        pkt._parse_options(owner, mv, start + 8, end)
     elif pkt.type == ICMP6_ND_ROUTER_ADVERT:
         _need_range(start, end, 16, 'ICMP6')
         pkt.cur_hop_limit = mv[start + 4]
@@ -9397,19 +9424,19 @@ cdef int _decode_icmp6(ICMP6 pkt, bytes owner, Py_ssize_t start,
         pkt.router_lifetime = rd_u16(mv, start + 6)
         pkt.reachable_time = rd_u32(mv, start + 8)
         pkt.retrans_timer = rd_u32(mv, start + 12)
-        pkt._parse_options(owner, start + 16, end)
+        pkt._parse_options(owner, mv, start + 16, end)
     elif pkt.type in (ICMP6_ND_NEIGHBOR_SOLICIT,
                       ICMP6_ND_NEIGHBOR_ADVERT):
         _need_range(start, end, 24, 'ICMP6')
         if pkt.type == ICMP6_ND_NEIGHBOR_ADVERT:
             pkt._na_flags = mv[start + 4]
         pkt._target_address = rd_bytes(mv, start + 8, start + 24)
-        pkt._parse_options(owner, start + 24, end)
+        pkt._parse_options(owner, mv, start + 24, end)
     elif pkt.type == ICMP6_ND_REDIRECT:
         _need_range(start, end, 40, 'ICMP6')
         pkt._target_address = rd_bytes(mv, start + 8, start + 24)
         pkt._dest_address = rd_bytes(mv, start + 24, start + 40)
-        pkt._parse_options(owner, start + 40, end)
+        pkt._parse_options(owner, mv, start + 40, end)
     else:
         pkt._body = rd_bytes(mv, start + 4, end)
     return 0
@@ -9441,19 +9468,22 @@ cdef inline int _decode_eth_ip_udp_fast(Ethernet pkt, bytes owner,
     ip._l7_ports = pkt._l7_ports
     ip.pkt_name = 'IP'
     ip.pq_type, ip.query_fields = _QI_IP
-    ip.ipv4_pheader = Ip4Ph()
+    ip.ipv4_pheader = Ip4Ph.__new__(Ip4Ph)
     ip.options = b''
     ip._version_iphl = mv[ip_start]
-    iphl = ip.iphl
+    iphl = get_char_nibble(ip._version_iphl, 0)
     ip.tos = mv[ip_start + 1]
     ip.total_len = rd_u16(mv, ip_start + 2)
     ip.ident = rd_u16(mv, ip_start + 4)
     ip._flags_offset = rd_u16(mv, ip_start + 6)
     ip.ttl = mv[ip_start + 8]
-    ip.proto = mv[ip_start + 9]
+    # proto, src and dst are stored the way their property setters store
+    # them, C field and pseudo header together, without going through the
+    # setters: each was an attribute lookup and a Python call per packet.
+    ip._proto = ip.ipv4_pheader.proto = mv[ip_start + 9]
     ip.checksum = rd_u16(mv, ip_start + 10)
-    ip.src_nochk = rd_bytes(mv, ip_start + 12, ip_start + 16)
-    ip.dst_nochk = rd_bytes(mv, ip_start + 16, ip_start + 20)
+    ip._src = ip.ipv4_pheader.src = rd_bytes(mv, ip_start + 12, ip_start + 16)
+    ip._dst = ip.ipv4_pheader.dst = rd_bytes(mv, ip_start + 16, ip_start + 20)
     hl_bytes = iphl * 4
     _need_range(ip_start, end, hl_bytes, 'IP')
     udp_start = ip_start + hl_bytes
@@ -9517,6 +9547,10 @@ cdef inline NullPkt _null_range(bytes owner, Py_ssize_t start,
 # cache, keeping the source-keyed exporter tuple byte-identical.
 cdef str _PROTO_UDP = 'udp'
 cdef str _PROTO_TCP = 'tcp'
+
+# The keywords _decode_tcp is given when it parses wire bytes: none. It only
+# ever reads them, so one shared empty dict replaces a new one per segment.
+cdef dict _NO_KW = {}
 
 
 cdef inline PKT _l7_range(bytes owner, const unsigned char[:] mv,
@@ -9614,6 +9648,7 @@ cdef inline int _decode_tcp(TCP pkt, bytes owner,
     cdef:
         Py_ssize_t header_end
         Py_ssize_t length = end - start
+        uint16_t doff
     pkt.ws_len = length
     pkt._pad = b''
     if length >= 20:
@@ -9625,22 +9660,26 @@ cdef inline int _decode_tcp(TCP pkt, bytes owner,
         pkt.window = rd_u16(mv, start + 14)
         pkt.checksum = rd_u16(mv, start + 16)
         pkt.urg_ptr = rd_u16(mv, start + 18)
-        if pkt.data_offset < TCP_MIN_DATA_OFFSET:
+        # The data_offset property's own body, read once: through the
+        # property each of the three uses below was an attribute lookup and
+        # a boxed int.
+        doff = get_short_nibble(pkt._off_flags, 12)
+        if doff < TCP_MIN_DATA_OFFSET:
             # data_offset is where the header ends and the payload begins.
             # Below 5 it points back inside the header, so the header bytes
             # themselves used to be handed to the layer 7 parser.
             raise ValueError('TCP: data offset field is %d 32 bit words, '
                              'less than the %d word minimum header'
-                             % (pkt.data_offset, TCP_MIN_DATA_OFFSET))
-        header_end = start + (pkt.data_offset * 4)
+                             % (doff, TCP_MIN_DATA_OFFSET))
+        header_end = start + doff * 4
         if header_end > end:
             # The options the header claims are not in the capture. Clamping
             # silently produced short options and a payload starting inside
             # the header.
             raise ValueError('TCP: truncated packet, data offset field needs '
                              '%d header bytes, got %d'
-                             % (pkt.data_offset * 4, length))
-        if pkt.data_offset > 5:
+                             % (doff * 4, length))
+        if doff > 5:
             pkt._options = rd_bytes(mv, start + 20, header_end)
         else:
             pkt._options = b''
@@ -9693,10 +9732,10 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         GRE gre
         OSPFv2 ospf2
     _need_range(start, end, 20, 'IP')
-    pkt.ipv4_pheader = Ip4Ph()
+    pkt.ipv4_pheader = Ip4Ph.__new__(Ip4Ph)
     pkt.options = b''
     pkt._version_iphl = mv[start]
-    iphl = pkt.iphl
+    iphl = get_char_nibble(pkt._version_iphl, 0)
     if iphl < IPV4_MIN_HDR_LEN:
         # ihl is where the layer 4 header starts. Below 5 it points back
         # inside the IPv4 header itself, which used to be decoded as the
@@ -9710,10 +9749,13 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
     pkt.ident = rd_u16(mv, start + 4)
     pkt._flags_offset = rd_u16(mv, start + 6)
     pkt.ttl = mv[start + 8]
-    pkt.proto = mv[start + 9]
+    # proto, src and dst are stored the way their property setters store
+    # them, C field and pseudo header together, without going through the
+    # setters: each was an attribute lookup and a Python call per packet.
+    pkt._proto = pkt.ipv4_pheader.proto = mv[start + 9]
     pkt.checksum = rd_u16(mv, start + 10)
-    pkt.src_nochk = rd_bytes(mv, start + 12, start + 16)
-    pkt.dst_nochk = rd_bytes(mv, start + 16, start + 20)
+    pkt._src = pkt.ipv4_pheader.src = rd_bytes(mv, start + 12, start + 16)
+    pkt._dst = pkt.ipv4_pheader.dst = rd_bytes(mv, start + 16, start + 20)
     hl_bytes = iphl * 4
     _need_range(start, end, hl_bytes, 'IP')
     payload_start = start + hl_bytes
@@ -9730,7 +9772,7 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         pkt.payload = PKT()
         return 0
 
-    if pkt.proto == PROTO_UDP:
+    if pkt._proto == PROTO_UDP:
         udp = UDP.__new__(UDP)
         udp._l7_ports = l7_ports
         udp._decode_context = pkt._decode_context
@@ -9745,7 +9787,7 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         udp.pq_type, udp.query_fields = _QI_UDP
         _decode_udp(udp, owner, mv, payload_start, end, l7_ports)
         pkt.payload = udp
-    elif pkt.proto == PROTO_TCP:
+    elif pkt._proto == PROTO_TCP:
         tcp = TCP.__new__(TCP)
         tcp._l7_ports = l7_ports
         tcp._decode_context = pkt._decode_context
@@ -9755,16 +9797,16 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
                                 else pkt._src)
         tcp.pkt_name = 'TCP'
         tcp.pq_type, tcp.query_fields = _QI_TCP
-        _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, {})
+        _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, _NO_KW)
         pkt.payload = tcp
-    elif pkt.proto == PROTO_ICMP:
+    elif pkt._proto == PROTO_ICMP:
         icmp = ICMP.__new__(ICMP)
         icmp._l7_ports = None
         icmp.pkt_name = 'ICMP'
         icmp.pq_type, icmp.query_fields = _QI_ICMP
-        _decode_icmp(icmp, owner, payload_start, end)
+        _decode_icmp(icmp, owner, mv, payload_start, end)
         pkt.payload = icmp
-    elif pkt.proto == PROTO_IGMP:
+    elif pkt._proto == PROTO_IGMP:
         igmp = IGMP.__new__(IGMP)
         igmp._l7_ports = None
         igmp.pkt_name = 'IGMP'
@@ -9777,16 +9819,17 @@ cdef inline int _decode_ip(IP pkt, bytes owner,
         # it from the range rather than subtracting keeps a total_len smaller
         # than the header from reaching a uint16 conversion, and gives the
         # version guard a real length when total_len is 0.
-        _decode_igmp(igmp, owner, payload_start, end, end - payload_start)
+        _decode_igmp(igmp, owner, mv, payload_start, end,
+                     end - payload_start)
         pkt.payload = igmp
-    elif pkt.proto == PROTO_GRE:
+    elif pkt._proto == PROTO_GRE:
         gre = GRE.__new__(GRE)
         gre._l7_ports = l7_ports
         gre.pkt_name = 'GRE'
         gre.pq_type, gre.query_fields = _QI_GRE
         _decode_gre(gre, owner, mv, payload_start, end, l7_ports)
         pkt.payload = gre
-    elif pkt.proto == PROTO_OSPF:
+    elif pkt._proto == PROTO_OSPF:
         ospf2 = OSPFv2.__new__(OSPFv2)
         ospf2._l7_ports = l7_ports
         ospf2.pkt_name = 'OSPFv2'
@@ -9863,15 +9906,17 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
         GRE gre
         OSPFv3 ospf3
     _need_range(start, end, IPV6_HDR_LEN, 'IP6')
-    pkt.ipv6_pheader = Ip6Ph()
+    pkt.ipv6_pheader = Ip6Ph.__new__(Ip6Ph)
     pkt._ext_hdrs = b''
     pkt._upper_proto = 0
     pkt._v_tc_flow = rd_u32(mv, start)
     pkt.payload_len = rd_u16(mv, start + 4)
     pkt._nh = mv[start + 6]
     pkt.hop_limit = mv[start + 7]
-    pkt.src_nochk = rd_bytes(mv, start + 8, start + 24)
-    pkt.dst_nochk = rd_bytes(mv, start + 24, start + 40)
+    # As in _decode_ip: what the src_nochk/dst_nochk setters store, stored
+    # directly rather than through two property calls per packet.
+    pkt._src = pkt.ipv6_pheader.src = rd_bytes(mv, start + 8, start + 24)
+    pkt._dst = pkt.ipv6_pheader.dst = rd_bytes(mv, start + 24, start + 40)
     # payload_len counts everything after the 40 byte header, so the datagram
     # ends there. Clamped before the extension header walk so padding cannot
     # be mistaken for another extension header either. A payload_len of 0 is
@@ -9921,14 +9966,14 @@ cdef inline int _decode_ip6(IP6 pkt, bytes owner,
                                 else pkt._src)
         tcp.pkt_name = 'TCP'
         tcp.pq_type, tcp.query_fields = _QI_TCP
-        _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, {})
+        _decode_tcp(tcp, owner, mv, payload_start, end, l7_ports, _NO_KW)
         pkt.payload = tcp
     elif pkt._upper_proto == PROTO_ICMPV6:
         icmp6 = ICMP6.__new__(ICMP6)
         icmp6._l7_ports = None
         icmp6.pkt_name = 'ICMP6'
         icmp6.pq_type, icmp6.query_fields = _QI_ICMP6
-        _decode_icmp6(icmp6, owner, payload_start, end)
+        _decode_icmp6(icmp6, owner, mv, payload_start, end)
         pkt.payload = icmp6
     elif pkt._upper_proto == PROTO_GRE:
         gre = GRE.__new__(GRE)
@@ -9971,7 +10016,8 @@ cdef int _decode_mpls(MPLS pkt, bytes owner, const unsigned char[:] mv,
         if payload_start >= end:
             label.payload = NullPkt()
             return 0
-        if label.s:
+        if (label._data >> 8) & 1:
+            # The bottom-of-stack bit, read as the s property does.
             break
         if depth >= MPLS_MAX_STACK_DEPTH:
             # Past any real deployment. Keep the rest of the stack as opaque

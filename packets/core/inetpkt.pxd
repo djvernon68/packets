@@ -935,8 +935,8 @@ cdef class ICMP6(PKT):
 
     cdef int _parse_options_buffer(self, array buf,
                                    Py_ssize_t off) except -1
-    cdef int _parse_options(self, bytes owner, Py_ssize_t off,
-                            Py_ssize_t end) except -1
+    cdef int _parse_options(self, bytes owner, const unsigned char[:] mv,
+                            Py_ssize_t off, Py_ssize_t end) except -1
 
     cpdef bytes pkt2net(self, dict kwargs)
 
@@ -1209,20 +1209,27 @@ cdef int _decode_arp(ARP pkt, bytes owner, Py_ssize_t start,
 cdef int _decode_netflow_simple(NetflowSimple pkt, bytes owner,
                                 Py_ssize_t start,
                                 Py_ssize_t end) except -1
-cdef int _decode_icmp(ICMP pkt, bytes owner, Py_ssize_t start,
-                      Py_ssize_t end) except -1
+# The ICMP, ICMPv6 and IGMP decoders take the caller's view of owner as
+# well as owner itself: each used to acquire a fresh one, so an ICMPv6 ND
+# message with N options acquired 2 + N views of the same buffer.
+cdef int _decode_icmp(ICMP pkt, bytes owner, const unsigned char[:] mv,
+                      Py_ssize_t start, Py_ssize_t end) except -1
 cdef int _decode_igmp_group_record(IGMPGroupRecord pkt, bytes owner,
+                                   const unsigned char[:] mv,
                                    Py_ssize_t start,
                                    Py_ssize_t end) except -1
-cdef int _decode_igmp(IGMP pkt, bytes owner, Py_ssize_t start,
-                      Py_ssize_t end, object packet_len_arg) except -1
-cdef int _decode_icmp6_opt(ICMP6Opt pkt, bytes owner, Py_ssize_t start,
+cdef int _decode_igmp(IGMP pkt, bytes owner, const unsigned char[:] mv,
+                      Py_ssize_t start, Py_ssize_t end,
+                      object packet_len_arg) except -1
+cdef int _decode_icmp6_opt(ICMP6Opt pkt, bytes owner,
+                           const unsigned char[:] mv, Py_ssize_t start,
                            Py_ssize_t end) except -1
 cdef int _decode_mldv2_address_record(MLDv2AddressRecord pkt, bytes owner,
+                                      const unsigned char[:] mv,
                                       Py_ssize_t start,
                                       Py_ssize_t end) except -1
-cdef int _decode_icmp6(ICMP6 pkt, bytes owner, Py_ssize_t start,
-                       Py_ssize_t end) except -1
+cdef int _decode_icmp6(ICMP6 pkt, bytes owner, const unsigned char[:] mv,
+                       Py_ssize_t start, Py_ssize_t end) except -1
 cdef int _decode_eth_ip_udp_fast(Ethernet pkt, bytes owner,
                                  const unsigned char[:] mv,
                                  Py_ssize_t end) except -1

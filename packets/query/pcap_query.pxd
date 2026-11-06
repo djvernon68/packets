@@ -47,6 +47,10 @@ cdef class PcapQuery:
 
     cdef tuple _extract_row(self, list layers)
 
+    cdef bytes _read(self, double *ts, pcap_pkthdr_t *hdr, int *status)
+
+    cdef list _layers(self, bytes pkt, double ts, pcap_pkthdr_t *hdr)
+
     cpdef bint fields_supported(self, list field_names)
 
     cpdef dict show_fields(self)

@@ -43,13 +43,14 @@ are all per-session results of capability negotiation, so every decoder
 takes a :class:`DecodeCtx` rather than consulting anything global.
 """
 
-from libc.stdint cimport uint16_t, uint32_t
+from libc.stdint cimport uint16_t, uint32_t, uint64_t
+from libc.string cimport memset
 
 from cpython.bytes cimport PyBytes_AS_STRING, PyBytes_GET_SIZE
 
 from packets.core.inetpkt cimport (
     PktWriter, w_acquire, w_release, w_u8, w_u16, w_u32, w_raw, w_bytes,
-    w_zeros, w_set_u16, w_take, rd_u16, rd_u32, _have_range,
+    w_zeros, w_set_u16, w_take, rd_u16, rd_u32, rd_bytes, _have_range,
     _bgp_msg_header, _bgp_open_fixed, _bgp_cap_next, _bgp_attr_next,
     _bgp_nlri_next, _bgp_mp_reach_hdr, _bgp_mp_unreach_hdr,
     _bgp_aspath_seg_next)
@@ -290,20 +291,25 @@ cdef bytes _canon_as_path(const unsigned char[:] mv, Py_ssize_t s,
             return None
         if asn_start + (<Py_ssize_t>count * width) > e:
             return None
+        o = nxt
+        if as4:
+            continue
         out.append(seg_type)
         out.append(count)
         for i in range(count):
-            if as4:
-                asn = rd_u32(mv, asn_start + i * 4)
-            else:
-                asn = rd_u16(mv, asn_start + i * 2)
-            out.append(<unsigned char>((asn >> 24) & 0xff))
-            out.append(<unsigned char>((asn >> 16) & 0xff))
+            asn = rd_u16(mv, asn_start + i * 2)
+            out.append(0)
+            out.append(0)
             out.append(<unsigned char>((asn >> 8) & 0xff))
             out.append(<unsigned char>(asn & 0xff))
-        o = nxt
     if o != e:
         return None
+    if as4:
+        # The canonical form is the 4-octet wire form, and the walk above
+        # has just checked the value is exactly a run of well formed
+        # segments, so it is copied out whole. Rebuilding it one byte at a
+        # time was a bytearray resize per byte on every UPDATE.
+        return rd_bytes(mv, s, e)
     return bytes(out)
 
 
@@ -1015,7 +1021,9 @@ def decode_update(bytes msg, DecodeCtx ctx):
     cdef bint add_path_v4
     cdef Py_ssize_t rc
     cdef Py_ssize_t host_bits = 0
-    cdef set seen = set()
+    # Attribute types already decoded, as a 256 bit set: a Python set of
+    # boxed ints was an allocation per UPDATE and two lookups per attribute.
+    cdef uint64_t seen[4]
     cdef bint saw_origin = 0, saw_as_path = 0, saw_nexthop = 0
     # AS4_PATH and AS4_AGGREGATOR are carried out of the per-attribute
     # decoder in a two-slot list rather than through `bytes *` out
@@ -1034,6 +1042,7 @@ def decode_update(bytes msg, DecodeCtx ctx):
     m.mp_unreach = None
     m.end_of_rib = 0
     m.host_bits = 0
+    memset(seen, 0, sizeof(seen))
 
     if n < BGP_MIN_UPDATE:
         _fault(m.errors, ATTR_LIST, REASON_LENGTH,
@@ -1092,7 +1101,7 @@ def decode_update(bytes msg, DecodeCtx ctx):
                    % (ATTR_NAMES.get(atype, atype), ve - vs, vclamp - vs))
             o = nxt
             continue
-        if atype in seen:
+        if seen[atype >> 6] & (<uint64_t>1 << (atype & 63)):
             # RFC 7606 s3g: a repeated attribute is an error. Which error is
             # the matrix's decision; the decoder only records that it
             # happened and keeps the first occurrence.
@@ -1100,7 +1109,7 @@ def decode_update(bytes msg, DecodeCtx ctx):
                    'duplicate %s' % ATTR_NAMES.get(atype, atype))
             o = nxt
             continue
-        seen.add(atype)
+        seen[atype >> 6] |= <uint64_t>1 << (atype & 63)
         _decode_attr(mv, msg, ctx, m, a, flags, atype, vs, vclamp, carry,
                      &saw_origin, &saw_as_path, &saw_nexthop)
         o = nxt
@@ -2039,6 +2048,7 @@ def encode_withdraw(prefixes, int afi=PFX_AFI_IP, int safi=1,
     cdef PktWriter w
     cdef Prefix p
     cdef uint32_t pid
+    cdef object item
 
     if n == 0:
         return out
@@ -2054,8 +2064,13 @@ def encode_withdraw(prefixes, int afi=PFX_AFI_IP, int safi=1,
                 budget = max_size - BGP_HEADER_LEN - 4
                 used = 0
                 while i < n:
-                    p = items[i][0]
-                    pid = items[i][1]
+                    item = items[i]
+                    if isinstance(item, Prefix):
+                        p = <Prefix>item
+                        pid = 0
+                    else:
+                        p = <Prefix>(<tuple>item)[0]
+                        pid = (<tuple>item)[1]
                     if used + _prefix_wire_len(p, add_path) > budget:
                         break
                     _w_prefix(w, p, pid, add_path)
@@ -2086,8 +2101,13 @@ def encode_withdraw(prefixes, int afi=PFX_AFI_IP, int safi=1,
                 budget = max_size - BGP_HEADER_LEN - 4 - 4 - 3
                 used = 0
                 while i < n:
-                    p = items[i][0]
-                    pid = items[i][1]
+                    item = items[i]
+                    if isinstance(item, Prefix):
+                        p = <Prefix>item
+                        pid = 0
+                    else:
+                        p = <Prefix>(<tuple>item)[0]
+                        pid = (<tuple>item)[1]
                     if used + _prefix_wire_len(p, add_path) > budget:
                         break
                     _w_prefix(w, p, pid, add_path)
@@ -2140,6 +2160,7 @@ def encode_announce(prefixes, AttrSet attrs, int afi=PFX_AFI_IP, int safi=1,
     cdef PktWriter w
     cdef Prefix p
     cdef uint32_t pid
+    cdef object item
     cdef bytes nh
     cdef bint mp = not (afi == PFX_AFI_IP and safi == 1)
 
@@ -2193,8 +2214,13 @@ def encode_announce(prefixes, AttrSet attrs, int afi=PFX_AFI_IP, int safi=1,
                                  % (attrs_len, max_size))
             used = 0
             while i < n:
-                p = items[i][0]
-                pid = items[i][1]
+                item = items[i]
+                if isinstance(item, Prefix):
+                    p = <Prefix>item
+                    pid = 0
+                else:
+                    p = <Prefix>(<tuple>item)[0]
+                    pid = (<tuple>item)[1]
                 if used + _prefix_wire_len(p, add_path) > budget:
                     break
                 _w_prefix(w, p, pid, add_path)
@@ -2248,14 +2274,20 @@ def encode_end_of_rib(int afi=PFX_AFI_IP, int safi=1):
 
 
 cdef list _as_pairs(prefixes):
-    """Normalise a prefix iterable to ``[(Prefix, path_id)]``."""
+    """Normalise a prefix iterable to a list of ``Prefix`` (path id 0) or
+    ``(Prefix, path_id)``."""
     cdef list out = []
 
+    # A bare Prefix is kept as it is, not wrapped as (prefix, 0): the
+    # encoders branch on the item type instead. A tuple per prefix, built
+    # here and indexed generically there, was most of the per-prefix cost
+    # of a full-table advertisement. Pairs are typed here, so a bad item
+    # fails before any of the UPDATE is written.
     for item in prefixes:
         if isinstance(item, Prefix):
-            out.append((item, 0))
+            out.append(item)
         else:
-            out.append((item[0], item[1]))
+            out.append((<Prefix?>item[0], <uint32_t>item[1]))
     return out
 
 

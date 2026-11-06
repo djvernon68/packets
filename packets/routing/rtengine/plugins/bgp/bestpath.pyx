@@ -119,6 +119,12 @@ MULTIPATH_BOUNDARY = STEP_IGP_METRIC
 
 MED_WORST = 0xffffffff
 
+# The multipath set of a destination or result that has none, which is
+# nearly all of them: one shared empty list rather than one each, a list per
+# destination for its whole life. _fill_multipath assigns a new list when
+# there are members, and nothing appends to this one. Treat it as read only.
+cdef list _NO_MULTIPATH = []
+
 
 cdef inline uint32_t _med_of(AttrSet a, BestpathConfig cfg):
     """The MED to compare with, honouring med-missing-as-worst."""
@@ -526,6 +532,13 @@ def select(list paths, BestpathConfig cfg):
     :return: a :class:`BestpathResult`. ``best`` is None when the list is
         empty or every path is unresolved.
     """
+    return _select(paths, cfg)
+
+
+cdef BestpathResult _select(list paths, BestpathConfig cfg):
+    """select() for C callers: BgpDest.reselect runs it once per destination
+    per selection pass, and through the module-level def that was a Python
+    call with argument parsing each time."""
     cdef BestpathResult res = BestpathResult.__new__(BestpathResult)
     cdef list eligible = []
     cdef list winners
@@ -536,7 +549,7 @@ def select(list paths, BestpathConfig cfg):
     cdef int step = STEP_NONE
     cdef int c
 
-    res.multipath = []
+    res.multipath = _NO_MULTIPATH
     res.best = None
     res.reason = STEP_NONE
     res.considered = len(paths)
@@ -722,7 +735,7 @@ cdef class BgpDest:
         self.prefix = prefix
         self.paths = []
         self.best = None
-        self.multipath = []
+        self.multipath = _NO_MULTIPATH
         self.reason = STEP_NONE
         self.version = 0
         self.queued = 0
@@ -806,7 +819,7 @@ cdef class BgpDest:
             so ``show`` can report the winner and the reason without
             re-selecting.
         """
-        cdef BestpathResult res = select(self.paths, cfg)
+        cdef BestpathResult res = _select(self.paths, cfg)
 
         self.best = res.best
         self.multipath = res.multipath
@@ -874,7 +887,7 @@ def explain(list paths, BestpathConfig cfg):
 
 
 cdef dict _explain(list paths, BestpathConfig cfg):
-    cdef BestpathResult res = select(paths, cfg)
+    cdef BestpathResult res = _select(paths, cfg)
     cdef BgpPath p
     cdef int step = STEP_NONE
     cdef list rows = []

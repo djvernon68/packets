@@ -60,16 +60,22 @@ cdef inline bytes _owned_bytes(object value):
     return bytes(value)
 
 
-cdef bint _is_token(bytes value):
-    """Validate an RFC token without relying on locale-sensitive text APIs."""
+cdef bint _is_token_range(const unsigned char[:] mv, Py_ssize_t start,
+                          Py_ssize_t end):
+    """Validate mv[start:end] as an RFC token without relying on
+    locale-sensitive text APIs.
+
+    A range of a view the caller already holds, so _parse_headers can check
+    a header name in place: taking it as bytes meant slicing the name out of
+    the line and acquiring a fresh view of it, per header.
+    """
     cdef:
-        const unsigned char[:] mv = value
         Py_ssize_t i
         unsigned char ch
 
-    if mv.shape[0] == 0:
+    if end <= start:
         return 0
-    for i in range(mv.shape[0]):
+    for i in range(start, end):
         ch = mv[i]
         if ((ch >= 48 and ch <= 57) or
                 (ch >= 65 and ch <= 90) or
@@ -78,6 +84,12 @@ cdef bint _is_token(bytes value):
             continue
         return 0
     return 1
+
+
+cdef bint _is_token(bytes value):
+    """Validate an RFC token held as bytes; see _is_token_range."""
+    cdef const unsigned char[:] mv = value
+    return _is_token_range(mv, 0, mv.shape[0])
 
 
 cdef bint _is_decimal(bytes value):
@@ -111,19 +123,26 @@ cdef bint _is_hex(bytes value):
     return 1
 
 
-cdef bint _is_field_value(bytes value):
-    """Reject bare controls while retaining opaque visible and obs-text bytes."""
+cdef bint _is_field_value_range(const unsigned char[:] mv,
+                                Py_ssize_t start, Py_ssize_t end):
+    """Reject bare controls in mv[start:end] while retaining opaque visible
+    and obs-text bytes. A range for the reason _is_token_range is one."""
     cdef:
-        const unsigned char[:] mv = value
         Py_ssize_t i
         unsigned char ch
 
-    for i in range(mv.shape[0]):
+    for i in range(start, end):
         ch = mv[i]
         if ch == 9 or (ch >= 32 and ch != 127):
             continue
         return 0
     return 1
+
+
+cdef bint _is_field_value(bytes value):
+    """Validate a field value held as bytes; see _is_field_value_range."""
+    cdef const unsigned char[:] mv = value
+    return _is_field_value_range(mv, 0, mv.shape[0])
 
 
 cdef bint _is_request_target(bytes value):
@@ -197,27 +216,40 @@ cdef tuple _parse_headers(const unsigned char[:] mv, Py_ssize_t start,
         list result = list()
         Py_ssize_t line_end
         Py_ssize_t colon
-        bytes line
-        bytes name
-        bytes value
+        Py_ssize_t value_start, value_end
 
+    # Each line is split and checked by index on the caller's view, and only
+    # the name and value that are kept are copied out. Copying the line and
+    # then slicing and stripping it made three temporary bytes and two view
+    # acquisitions per header.
     while True:
         line_end = _find_crlf(mv, start)
         if line_end < 0:
             raise ValueError('HTTP: incomplete %s' % section)
         if line_end == start:
             return result, start + 2
-        line = rd_bytes(mv, start, line_end)
-        colon = line.find(b':')
-        if colon <= 0:
+        # The first colon, as bytes.find found it. None, or one at the start
+        # of the line (an empty name), is not a header line.
+        colon = start
+        while colon < line_end and mv[colon] != 58:
+            colon += 1
+        if colon == line_end or colon == start:
             raise ValueError('HTTP: invalid %s line' % section)
-        name = line[:colon]
-        if not _is_token(name):
+        if not _is_token_range(mv, start, colon):
             raise ValueError('HTTP: invalid %s name' % section)
-        value = line[colon + 1:].strip(b' \t')
-        if not _is_field_value(value):
+        # Trim SP and HTAB from both ends, as .strip(b' \t') did.
+        value_start = colon + 1
+        value_end = line_end
+        while value_start < value_end and (mv[value_start] == 32 or
+                                           mv[value_start] == 9):
+            value_start += 1
+        while value_end > value_start and (mv[value_end - 1] == 32 or
+                                           mv[value_end - 1] == 9):
+            value_end -= 1
+        if not _is_field_value_range(mv, value_start, value_end):
             raise ValueError('HTTP: invalid %s value' % section)
-        result.append((name, value))
+        result.append((rd_bytes(mv, start, colon),
+                       rd_bytes(mv, value_start, value_end)))
         start = line_end + 2
 
 

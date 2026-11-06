@@ -590,5 +590,32 @@ class AttrTableTestCase(unittest.TestCase):
         self.assertEqual(hash(canonical), hash(fresh))
 
 
+class CommunityFastPathTestCase(unittest.TestCase):
+    """Communities already strictly ascending are kept as given; anything
+    else is sorted and deduplicated as before."""
+
+    def test_ascending_runs_are_kept(self):
+        for width, pack in ((4, lambda v: _u32s(*v)),
+                            (8, lambda v: _ext(*v)),
+                            (12, lambda v: _large(*[(v_, 0, 0) for v_ in v]))):
+            key = {4: 'communities', 8: 'ext_communities',
+                   12: 'large_communities'}[width]
+            with self.subTest(width=width):
+                ascending = pack([1, 2, 0x10000, 0xfffffffe])
+                self.assertEqual(getattr(AttrSet(**{key: ascending}), key),
+                                 ascending)
+                # Equal neighbours are a duplicate, not an ascending pair.
+                self.assertEqual(
+                    getattr(AttrSet(**{key: pack([1, 2, 2, 3])}), key),
+                    pack([1, 2, 3]))
+                self.assertEqual(
+                    getattr(AttrSet(**{key: pack([3, 1, 2])}), key),
+                    pack([1, 2, 3]))
+                # An ascending run with a partial record behind it is still
+                # truncated to whole records.
+                self.assertEqual(
+                    getattr(AttrSet(**{key: ascending + b'\x01'}), key),
+                    ascending)
+
 if __name__ == '__main__':
     unittest.main()

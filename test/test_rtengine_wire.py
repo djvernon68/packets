@@ -1354,5 +1354,117 @@ class ConstantAgreementTestCase(unittest.TestCase):
                          set())
 
 
+class CanonicalAsPathTestCase(unittest.TestCase):
+    """A 4-octet AS_PATH is stored as its wire bytes once the segment walk
+    has checked them, rather than rebuilt; a 2-octet one is still widened.
+    Both must land on the same canonical form, and the walk must still
+    reject what it rejected when it was also doing the copy."""
+
+    SEGMENTS = ((2, [65001, BIG_AS, 65002]), (1, [7, 3, BIG_AS]),
+                (3, [64512]), (4, [64513, 64514]))
+
+    def _as_path(self, ctx, value):
+        attrs = A_ORIGIN + _attr(0x40, wire.TYPE_AS_PATH, value) + A_NEXT_HOP
+        return wire.decode_update(_update(attrs=attrs, nlri=N_10_1), ctx)
+
+    def test_every_segment_type_at_both_widths(self):
+        four = wire.DecodeCtx(as4=True, is_ebgp=True)
+        two = wire.DecodeCtx(as4=False, is_ebgp=True)
+        canonical = b''.join(_seg(t, asns) for t, asns in self.SEGMENTS)
+        decoded = self._as_path(four, canonical)
+        self.assertEqual(decoded.errors, [])
+        self.assertEqual(decoded.attrs.as_path, canonical)
+        narrow = [(t, [a if a <= 0xffff else 23456 for a in asns])
+                  for t, asns in self.SEGMENTS]
+        decoded = self._as_path(two, b''.join(_seg(t, asns, width=2)
+                                              for t, asns in narrow))
+        self.assertEqual(decoded.errors, [])
+        self.assertEqual(decoded.attrs.as_path,
+                         b''.join(_seg(t, asns) for t, asns in narrow))
+
+    def test_malformed_four_octet_paths_are_still_rejected(self):
+        four = wire.DecodeCtx(as4=True, is_ebgp=True)
+        good = _seg(2, [65001, 65002])
+        for value in (b'\x05\x01' + struct.pack('>I', 1),  # segment type
+                      b'\x02\x00',                        # zero count
+                      b'\x02\x03' + struct.pack('>II', 1, 2),  # overrun
+                      good + b'\x02',                       # trailing byte
+                      good[:-1]):                           # short ASN
+            with self.subTest(value=value):
+                decoded = self._as_path(four, value)
+                self.assertEqual([(e[0], e[1]) for e in decoded.errors],
+                                 [(wire.TYPE_AS_PATH, wire.REASON_VALUE)])
+
+
+class DuplicateAttributeTypeTestCase(unittest.TestCase):
+    """The decoder's seen-set is a 256 bit map; every type code, including
+    both ends of the range, must be tracked on its own."""
+
+    def test_duplicates_at_each_end_of_the_type_range(self):
+        ctx = wire.DecodeCtx(as4=True, is_ebgp=True)
+        for atype in (0, 63, 64, 127, 128, 191, 192, 255):
+            with self.subTest(atype=atype):
+                # A neighbouring bit in the map, but never ORIGIN, AS_PATH
+                # or NEXT_HOP, which A_MANDATORY already carries.
+                neighbour = atype - 1 if atype > 4 else 250
+                unknown = _attr(0xc0, atype, b'\x01')
+                other = _attr(0xc0, neighbour, b'\x02')
+                decoded = wire.decode_update(
+                    _update(attrs=A_MANDATORY + unknown + other + unknown,
+                            nlri=N_10_1), ctx)
+                self.assertIn((atype, wire.REASON_DUPLICATE),
+                              [(e[0], e[1]) for e in decoded.errors])
+                self.assertNotIn((neighbour, wire.REASON_DUPLICATE),
+                                 [(e[0], e[1]) for e in decoded.errors])
+
+
+class _SubPrefix(Prefix):
+    pass
+
+
+class EncodeItemTestCase(unittest.TestCase):
+    """The encoders take bare prefixes and (prefix, path_id) pairs mixed,
+    without wrapping every bare prefix in a tuple first."""
+
+    def setUp(self):
+        self.attrs = _attrset()
+        self.prefixes = [parse_prefix('10.%d.0.0/16' % i) for i in range(40)]
+
+    def test_mixed_items_encode_as_pairs_would(self):
+        mixed = [p if i % 2 else (p, 0) for i, p in enumerate(self.prefixes)]
+        pairs = [(p, 0) for p in self.prefixes]
+        for max_size in (4096, 80):
+            self.assertEqual(
+                wire.encode_announce(mixed, self.attrs, max_size=max_size),
+                wire.encode_announce(pairs, self.attrs, max_size=max_size))
+            self.assertEqual(
+                wire.encode_withdraw(mixed, max_size=max_size),
+                wire.encode_withdraw(pairs, max_size=max_size))
+        with_ids = [p if i % 3 else (p, i) for i, p in
+                    enumerate(self.prefixes)]
+        ctx = wire.DecodeCtx(add_path=[(AFI_IP, 1)])
+        nlri = []
+        for raw in wire.encode_announce(with_ids, self.attrs,
+                                        add_path=True):
+            nlri += wire.decode_update(raw, ctx).nlri
+        self.assertEqual(nlri, [(p, 0 if i % 3 else i)
+                                for i, p in enumerate(self.prefixes)])
+
+    def test_v6_mixed_items(self):
+        v6 = [parse_prefix('2001:db8:%x::/48' % i) for i in range(20)]
+        attrs = _attrset(nexthop=_v6('2001:db8::1'))
+        mixed = [p if i % 2 else (p, 0) for i, p in enumerate(v6)]
+        self.assertEqual(
+            wire.encode_announce(mixed, attrs, afi=AFI_IP6),
+            wire.encode_announce([(p, 0) for p in v6], attrs, afi=AFI_IP6))
+
+    def test_bad_items_are_rejected_before_encoding(self):
+        good = self.prefixes[0]
+        for bad in ([(good, -1)], [('10.0.0.0/8', 0)], [(good,)], [7]):
+            with self.subTest(bad=bad):
+                with self.assertRaises((TypeError, OverflowError,
+                                        IndexError)):
+                    wire.encode_announce([good] + bad, self.attrs)
+
 if __name__ == '__main__':
     unittest.main()

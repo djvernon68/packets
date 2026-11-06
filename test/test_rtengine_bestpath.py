@@ -998,5 +998,36 @@ class ExplainTestCase(unittest.TestCase):
         self.assertEqual(verdicts, ['best', 'multipath'])
 
 
+class SharedEmptyMultipathTestCase(unittest.TestCase):
+    """Destinations and results with no multipath set share one empty list;
+    one that has a set gets its own."""
+
+    def test_a_multipath_set_is_never_shared(self):
+        cfg = BestpathConfig(local_as=65000, maximum_paths=4)
+        wide, narrow = BgpDest(PREFIX), BgpDest(parse_prefix('10.1.0.0/16'))
+        self.assertEqual(wide.multipath, [])
+        wide.add(path(attrs((65001,)), peer(1, router_id=1)))
+        wide.add(path(attrs((65001,)), peer(2, router_id=2)))
+        narrow.add(path(attrs((65001,)), peer(3, router_id=3)))
+        wide.reselect(cfg)
+        narrow.reselect(cfg)
+        self.assertEqual(len(wide.multipath), 2)
+        self.assertEqual(narrow.multipath, [])
+        self.assertEqual(BgpDest(PREFIX).multipath, [])
+        self.assertEqual(select([], cfg).multipath, [])
+        self.assertIsNot(select(list(wide.paths), cfg).multipath,
+                         wide.multipath)
+
+    def test_select_and_reselect_agree(self):
+        cfg = BestpathConfig(local_as=65000, maximum_paths=2)
+        dest = BgpDest(PREFIX)
+        for n in range(1, 4):
+            dest.add(path(attrs((65001,), med=n), peer(n, router_id=n)))
+        result = dest.reselect(cfg)
+        again = select(list(dest.paths), cfg)
+        self.assertIs(result.best, again.best)
+        self.assertEqual(result.multipath, again.multipath)
+        self.assertEqual(result.reason, again.reason)
+
 if __name__ == '__main__':
     unittest.main()

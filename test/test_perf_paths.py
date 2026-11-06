@@ -14,7 +14,8 @@ import tempfile
 import unittest
 
 from packets.core.inetpkt import Ethernet, IP, IP6, UDP, TCP, ARP, ICMP6, \
-    ICMP6Opt, IGMP, IGMPGroupRecord, MLDv2AddressRecord, NullPkt, IP_CONST
+    ICMP6Opt, IGMP, IGMPGroupRecord, MLDv2AddressRecord, NullPkt, IP_CONST, \
+    Ip4Ph, Ip6Ph, MPLS, PKT
 from packets.core.pcap import PCAPWriter
 from packets.protos.dhcp import DHCP, DHCP_MAGIC
 from packets.protos.netflow import Netflow, NetflowDecodeContext
@@ -493,6 +494,132 @@ class TestDhcpAddresses(unittest.TestCase):
                                ('dhcp.ip.server', packet.siaddr),
                                ('dhcp.ip.relay', packet.giaddr)):
             self.assertEqual(packet.get_field_val(name), expected)
+
+
+def ones_complement(data):
+    if len(data) % 2:
+        data += b'\x00'
+    total = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return ~total & 0xffff
+
+
+class TestPseudoHeaders(unittest.TestCase):
+    """The decoders build Ip4Ph/Ip6Ph with __new__ and fill them field by
+    field, and a TCP or UDP layer serialized without an IP shares one zero
+    Ip4Ph. Keyword construction moved from __cinit__ to __init__ for that."""
+
+    def test_ip4ph_keywords_and_defaults(self):
+        ph = Ip4Ph(src=b'\x01\x02\x03\x04', dst=b'\x05\x06\x07\x08',
+                   reserved=1, proto=17, payload_len=300)
+        self.assertEqual((ph.src, ph.dst, ph.reserved, ph.proto,
+                          ph.payload_len),
+                         (b'\x01\x02\x03\x04', b'\x05\x06\x07\x08', 1, 17,
+                          300))
+        ph = Ip4Ph()
+        self.assertEqual((ph.src, ph.dst, ph.reserved, ph.proto,
+                          ph.payload_len), (b'\x00' * 4, b'\x00' * 4, 0, 0, 0))
+
+    def test_ip6ph_keywords_and_defaults(self):
+        ph = Ip6Ph(src=b'\x01' * 16, dst=b'\x02' * 16, nh=58)
+        self.assertEqual((ph.src, ph.dst, ph.nh),
+                         (b'\x01' * 16, b'\x02' * 16, 58))
+        ph = Ip6Ph()
+        self.assertEqual((ph.src, ph.dst, ph.nh),
+                         (b'\x00' * 16, b'\x00' * 16, 0))
+
+    def test_positional_arguments_still_rejected(self):
+        with self.assertRaises(TypeError):
+            Ip4Ph(b'\x01\x02\x03\x04')
+        with self.assertRaises(TypeError):
+            Ip6Ph(b'\x01' * 16)
+
+    def test_parsed_layers_carry_the_pseudo_header(self):
+        # A recomputed checksum is only right if the decoder put the parsed
+        # src, dst and proto into the pseudo header.
+        for wire in (udp_frame(), tcp_frame(), ip6_udp_frame(),
+                     ip6_tcp_frame()):
+            self.assertEqual(
+                Ethernet(wire).pkt2net({'csum': 1, 'update': 1}), wire)
+
+    def test_standalone_l4_checksums_against_a_zero_pseudo_header(self):
+        udp = UDP(sport=1, dport=2, payload=NullPkt(b'\x11' * 9))
+        wire = udp.pkt2net({'csum': 1, 'update': 1})
+        zero_ph = b'\x00' * 8 + struct.pack('!HH', 0, len(wire))
+        expected = ones_complement(zero_ph + wire[:6] + b'\x00\x00' +
+                                   wire[8:]) or 0xffff
+        self.assertEqual(struct.unpack('!H', wire[6:8])[0], expected)
+        # Serializing inside an IP in between must not leave the shared
+        # default holding that IP's addresses.
+        IP(proto=C.PROTO_UDP, src='10.0.0.1', dst='10.0.0.2',
+           payload=UDP(sport=1, dport=2, payload=NullPkt(b'\x11' * 9))
+           ).pkt2net({'csum': 1, 'update': 1})
+        self.assertEqual(
+            UDP(sport=1, dport=2, payload=NullPkt(b'\x11' * 9)).pkt2net(
+                {'csum': 1, 'update': 1}), wire)
+        tcp = TCP(sport=1, dport=2, payload=NullPkt(b'\x22' * 5))
+        first = tcp.pkt2net({'csum': 1, 'update': 1})
+        IP(proto=C.PROTO_TCP, src='10.0.0.1', dst='10.0.0.2',
+           payload=TCP(sport=1, dport=2, payload=NullPkt(b'\x22' * 5))
+           ).pkt2net({'csum': 1, 'update': 1})
+        self.assertEqual(
+            TCP(sport=1, dport=2, payload=NullPkt(b'\x22' * 5)).pkt2net(
+                {'csum': 1, 'update': 1}), first)
+
+
+class _PythonLayer(PKT):
+    """A downstream layer whose payload is a plain instance attribute."""
+
+    def __init__(self, payload):
+        self.pkt_name = 'PythonLayer'
+        self.payload = payload
+
+
+class TestLayerWalk(unittest.TestCase):
+    """get_layer and get_layer_by_type fetch payload once and recurse with
+    a typed call instead of a Python call per layer."""
+
+    @staticmethod
+    def mpls_frame():
+        # Two labels, the second with the bottom-of-stack bit, over IPv4/UDP.
+        inner = udp_frame()[14:]
+        return (b'\x01\x02\x03\x04\x05\x06\x0a\x0b\x0c\x0d\x0e\x0f\x88\x47' +
+                struct.pack('!II', (100 << 12) | 64, (200 << 12) | 0x100 | 64) +
+                inner)
+
+    def test_name_and_type_lookups(self):
+        frame = Ethernet(tcp_frame())
+        self.assertIsInstance(frame.get_layer('TCP'), TCP)
+        self.assertIsInstance(frame.get_layer_by_type(C.PQ_TCP), TCP)
+        self.assertIs(frame.get_layer('IP'), frame.payload)
+        self.assertIs(frame.get_layer('Ethernet'), frame)
+
+    def test_missing_layer_is_a_null_pkt(self):
+        frame = Ethernet(tcp_frame())
+        self.assertIsInstance(frame.get_layer('UDP'), NullPkt)
+        self.assertIsInstance(frame.get_layer_by_type(C.PQ_UDP), NullPkt)
+
+    def test_nth_instance_on_an_mpls_stack(self):
+        frame = Ethernet(self.mpls_frame())
+        first = frame.get_layer('MPLS')
+        self.assertIsInstance(first, MPLS)
+        self.assertEqual(first.label, 100)
+        self.assertIs(frame.get_layer_by_type(C.PQ_MPLS), first)
+        for instance in (2, 3):
+            by_name = frame.get_layer('MPLS', instance=instance)
+            by_type = frame.get_layer_by_type(C.PQ_MPLS, instance=instance)
+            self.assertIs(type(by_name), type(by_type))
+            if isinstance(by_name, MPLS):
+                self.assertIs(by_name, by_type)
+        self.assertIsInstance(frame.get_layer('UDP'), UDP)
+
+    def test_python_layer_payload_attribute(self):
+        tcp = Ethernet(tcp_frame()).get_layer('TCP')
+        outer = _PythonLayer(tcp)
+        self.assertIs(outer.get_layer('TCP'), tcp)
+        self.assertIs(outer.get_layer_by_type(C.PQ_TCP), tcp)
+        self.assertIsInstance(_PythonLayer(b'raw').get_layer('TCP'), NullPkt)
 
 
 if __name__ == '__main__':

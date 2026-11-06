@@ -700,21 +700,46 @@ cdef class PCAPSocket(PCAPBase):
 
     def __next__(self):
         cdef:
-            pcap_pkthdr * hdr = NULL
+            pcap_pkthdr_t hdr
+            double ts
+            int status
+            bytes pkt
+
+        pkt = self._next_raw(&ts, &hdr, &status)
+        if status == RAW_END:
+            raise StopIteration
+        elif status == RAW_TIMEOUT:
+            # read timeout: no packet arrived, but the capture is still live.
+            return 0, None, None
+        return ts, hdr, pkt
+
+    cdef bytes _next_raw(self, double *ts, pcap_pkthdr_t *hdr, int *status):
+        """Read the next packet into ts and hdr and return its bytes.
+
+        __next__'s work without its result: the tuple, the float and the
+        header converted to a dict of dicts. PcapQuery reads every packet
+        through here and stores the header in its Frame as the struct it
+        is, where going through __next__ converted it to a dict and then
+        straight back again.
+
+        :param status: set to RAW_PACKET, RAW_TIMEOUT (the return value is
+            then None) or RAW_END (None, and the socket is closed).
+        """
+        cdef:
+            pcap_pkthdr * h = NULL
             const unsigned char * buff
             pcap_t * sock = self.sock
             int err = 1
-            double ts
-            bytes pkt = b''
             str err_txt
 
+        status[0] = RAW_END
         if sock is NULL or self.stop_event.is_set():
             self.close()
-            raise StopIteration
+            return None
         # The read blocks for up to to_ms milliseconds; holding the GIL for
         # that long stalls every other thread in the process.
         with nogil:
-            err = pcap_next_ex(sock, &hdr, &buff)
+            err = pcap_next_ex(sock, &h, &buff)
         if err == ERROR:
             # A capture error is not the end of the capture. Read the
             # message before close() invalidates the handle.
@@ -726,17 +751,17 @@ cdef class PCAPSocket(PCAPBase):
                               err_txt))
         elif err == ERROR_BREAK or self.stop_event.is_set():
             self.close()
-            raise StopIteration
+            return None
         elif err == 0:
-            # read timeout: no packet arrived, but the capture is still live.
-            return 0, None, None
+            status[0] = RAW_TIMEOUT
+            return None
+        if h[0].ts.tv_usec > 0:
+            ts[0] = (h[0].ts.tv_sec + (h[0].ts.tv_usec / USECCONST))
         else:
-            if hdr[0].ts.tv_usec > 0:
-                ts = (hdr[0].ts.tv_sec + (hdr[0].ts.tv_usec / USECCONST))
-            else:
-                ts = hdr[0].ts.tv_sec
-            pkt = <bytes> buff[:hdr[0].caplen]
-            return ts, hdr[0], pkt
+            ts[0] = h[0].ts.tv_sec
+        hdr[0] = h[0]
+        status[0] = RAW_PACKET
+        return <bytes> buff[:h[0].caplen]
 
     cpdef void close(self):
         if self.dumper is not NULL:
@@ -797,17 +822,31 @@ cdef class PCAPReader(PCAPBase):
 
     def __next__(self):
         cdef:
-            pcap_pkthdr * hdr = NULL
+            pcap_pkthdr_t hdr
+            double ts
+            int status
+            bytes pkt
+
+        pkt = self._next_raw(&ts, &hdr, &status)
+        if status != RAW_PACKET:
+            raise StopIteration
+        return ts, hdr, pkt
+
+    cdef bytes _next_raw(self, double *ts, pcap_pkthdr_t *hdr, int *status):
+        """Read the next packet into ts and hdr and return its bytes; see
+        PCAPSocket._next_raw. A file has no read timeout, so status is
+        RAW_PACKET or RAW_END, and at RAW_END the reader is closed."""
+        cdef:
+            pcap_pkthdr * h = NULL
             const unsigned char * buff
             pcap_t * reader = self.reader
             int err = 1
-            double ts
-            bytes pkt = b''
             str err_txt
 
+        status[0] = RAW_END
         if reader is NULL:
-            raise StopIteration
-        err = pcap_next_ex(reader, &hdr, &buff)
+            return None
+        err = pcap_next_ex(reader, &h, &buff)
         if err == ERROR:
             # -1 is a read error, not end of file. Reporting it as EOF hid
             # truncated and corrupt captures. Read the message first: close()
@@ -819,14 +858,14 @@ cdef class PCAPReader(PCAPBase):
                                     err_txt))
         elif err != 1:
             self.close()
-            raise StopIteration
+            return None
+        if h[0].ts.tv_usec > 0:
+            ts[0] = (h[0].ts.tv_sec + (h[0].ts.tv_usec / USECCONST))
         else:
-            if hdr[0].ts.tv_usec > 0:
-                ts = (hdr[0].ts.tv_sec + (hdr[0].ts.tv_usec / USECCONST))
-            else:
-                ts = hdr[0].ts.tv_sec
-            pkt = <bytes> buff[:hdr[0].caplen]
-            return ts, hdr[0], pkt
+            ts[0] = h[0].ts.tv_sec
+        hdr[0] = h[0]
+        status[0] = RAW_PACKET
+        return <bytes> buff[:h[0].caplen]
 
     cpdef list pkts(self):
         return list(self)
@@ -1153,6 +1192,7 @@ cpdef int netflow_replay_raw_sock(str device,
         int family
         double now, ts, offset, add
         pcap_pkthdr_t hdr
+        int status
         bytes pkt, frame
         uint32_t sent, failed, skipped
 
@@ -1180,7 +1220,12 @@ cpdef int netflow_replay_raw_sock(str device,
     # copy of the rewrite. It also means an empty capture, or a
     # pcap_dst_port matching nothing, no longer raises StopIteration at the
     # caller.
-    for ts, hdr, pkt in reader:
+    # _next_raw rather than iterating the reader: the header is not used
+    # here, and __next__ converts it to a dict for every packet.
+    while True:
+        pkt = reader._next_raw(&ts, &hdr, &status)
+        if status != RAW_PACKET:
+            break
         now = time.time()
         if first:
             offset = now - ts
@@ -1272,6 +1317,7 @@ cpdef int netflow_replay_system_sock(str pcap_file,
         int family
         double now, ts, offset, add
         pcap_pkthdr_t hdr
+        int status
         bytes pkt, the_flow, type_byte
         dict l7_ports
         Ethernet eth
@@ -1297,7 +1343,12 @@ cpdef int netflow_replay_system_sock(str pcap_file,
     # drifted from the loop body and applied neither new_type nor
     # new_version, so the first flow of every replay carried the capture's
     # own engine type and version.
-    for ts, hdr, pkt in reader:
+    # _next_raw rather than iterating the reader: the header is not used
+    # here, and __next__ converts it to a dict for every packet.
+    while True:
+        pkt = reader._next_raw(&ts, &hdr, &status)
+        if status != RAW_PACKET:
+            break
         now = time.time()
         if first:
             offset = now - ts

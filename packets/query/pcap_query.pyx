@@ -17,7 +17,7 @@ from packets.core.inetpkt cimport PKT, Ethernet, IP, TCP, ICMP, \
     IGMP, UDP, ARP, MPLS, NullPkt, IP6, ICMP6, PQ_FRAME, PQ_TCP, PQ_UDP, \
     get_short_nibble
 from packets.core.pcap cimport PCAPSocket, PCAPReader, \
-    pcap_pkthdr_t, findalldevs
+    pcap_pkthdr_t, findalldevs, RAW_END
 
 # Regex to determine if the field matches a payload offset pattern.
 offset_re = re.compile(r'^(udp|tcp)\.payload\.offset\[(\d*):(\d*)\]$')
@@ -147,7 +147,9 @@ cdef bint valid_file(str file):
 
 
 cdef class Frame:
-    def __cinit__(self, ts, hdr):
+    # __init__ rather than __cinit__ so that PcapQuery can allocate one with
+    # Frame.__new__(Frame) and store the header struct straight into it.
+    def __init__(self, ts, hdr):
         self.ts = ts
         self.hdr = hdr
 
@@ -483,45 +485,61 @@ cdef class PcapQuery:
     def __iter__(self):
         return self
 
-    def __next__(self):
+    cdef bytes _read(self, double *ts, pcap_pkthdr_t *hdr, int *status):
+        """Read the next packet from the reader without going through its
+        __next__, which converts the header to a dict that a Frame then
+        converts back. Returns None, with status RAW_TIMEOUT or RAW_END,
+        when there is no packet."""
+        if self.use_device:
+            return (<PCAPSocket>self.reader)._next_raw(ts, hdr, status)
+        return (<PCAPReader>self.reader)._next_raw(ts, hdr, status)
+
+    cdef list _layers(self, bytes pkt, double ts, pcap_pkthdr_t *hdr):
+        """The layer for each entry of layer_order, decoding pkt if any
+        layer other than the frame is wanted."""
         cdef:
             PKT spkt
-            bytes pkt
+            Frame frame = Frame.__new__(Frame)
             uint16_t pq_type
-            tuple row
-            object ts, hdr
-            list layers
+            list layers = list()
 
-        # The row is unpacked untyped. PCAPSocket reports a read timeout as
-        # (0, None, None), and binding that None to a pcap_pkthdr_t local
-        # raised a TypeError before the packet could even be tested for.
+        # Every frame entry of a row is the same values, so one Frame
+        # serves them all; nothing a row extracts writes to it.
+        frame.ts = ts
+        frame.hdr = hdr[0]
+        if self._skip_decode:
+            if len(pkt) < 14:
+                Ethernet(pkt)
+            for pq_type in self.layer_order:
+                layers.append(frame)
+        else:
+            spkt = Ethernet(pkt, l7_ports=self.l7_ports,
+                            decode_context=self.decode_context)
+            for pq_type in self.layer_order:
+                if pq_type == PQ_FRAME:
+                    layers.append(frame)
+                else:
+                    layers.append(spkt.get_layer_by_type(pq_type))
+        return layers
+
+    def __next__(self):
+        cdef:
+            bytes pkt
+            double ts
+            pcap_pkthdr_t hdr
+            int status
+
         while not self.stop_event.is_set():
-            row = next(self.reader)
-            ts = row[0]
-            hdr = row[1]
-            pkt = row[2]
+            pkt = self._read(&ts, &hdr, &status)
+            if status == RAW_END:
+                break
             if not pkt:
                 if self.use_device:
                     # A quiet interval on the wire is not the end of the
-                    # capture. Wait for the next read. A file reader raises
-                    # StopIteration at EOF and never arrives here.
+                    # capture. Wait for the next read.
                     continue
                 break
-            layers = list()
-            if self._skip_decode:
-                if len(pkt) < 14:
-                    Ethernet(pkt)
-                for pq_type in self.layer_order:
-                    layers.append(Frame(ts, hdr))
-            else:
-                spkt = Ethernet(pkt, l7_ports=self.l7_ports,
-                                decode_context=self.decode_context)
-                for pq_type in self.layer_order:
-                    if pq_type == PQ_FRAME:
-                        layers.append(Frame(ts, hdr))
-                    else:
-                        layers.append(spkt.get_layer_by_type(pq_type))
-            return self._extract_row(layers)
+            return self._extract_row(self._layers(pkt, ts, &hdr))
         raise StopIteration()
 
     def query(self,
@@ -555,14 +573,12 @@ cdef class PcapQuery:
         """
         cdef:
             bint count_packets, st, et
-            int pkts, no_result
-            PKT spkt
+            int pkts, no_result, status
             bytes pkt
             double ts
-            uint16_t pq_type
-            tuple row, src_row
-            object hdr
-            list layers, data
+            tuple row
+            pcap_pkthdr_t hdr
+            list data
         if num_packets:
             count_packets = 1
         else:
@@ -578,14 +594,11 @@ cdef class PcapQuery:
 
         pkts = 0
         no_result = len(self.field_descriptors)
-        layers = list()
         data = list()
-        # As in __next__, the row is unpacked untyped so that a live read
-        # timeout, (0, None, None), does not fail the unpack itself.
-        for src_row in self.reader:
-            ts = src_row[0]
-            hdr = src_row[1]
-            pkt = src_row[2]
+        while True:
+            pkt = self._read(&ts, &hdr, &status)
+            if status == RAW_END:
+                break
             if not pkt:
                 if self.use_device and not self.stop_event.is_set():
                     # Live read timeout. Keep waiting; the caller's endtime,
@@ -609,21 +622,7 @@ cdef class PcapQuery:
                 elif self.stop_event.is_set():
                     break
                 else:
-                    layers = list()
-                    if self._skip_decode:
-                        if len(pkt) < 14:
-                            Ethernet(pkt)
-                        for pq_type in self.layer_order:
-                            layers.append(Frame(ts, hdr))
-                    else:
-                        spkt = Ethernet(pkt, l7_ports=self.l7_ports,
-                                        decode_context=self.decode_context)
-                        for pq_type in self.layer_order:
-                            if pq_type == PQ_FRAME:
-                                layers.append(Frame(ts, hdr))
-                            else:
-                                layers.append(spkt.get_layer_by_type(pq_type))
-                    row = self._extract_row(layers)
+                    row = self._extract_row(self._layers(pkt, ts, &hdr))
                     if row.count(None) != no_result:
                         data.append(row)
                         pkts += 1
