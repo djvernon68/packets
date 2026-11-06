@@ -1,6 +1,13 @@
 CHANGELOG
 ---------
 
+[2.4.1]
+ * **The first release for AlmaLinux 10.2 and later**, with the platform work
+   listed under 2.4.0 below.
+ * **Copyright notices updated for the 2026 work.** Files first written in
+   2026 say 2026; files that predate 2026 and changed this year, including
+   `LICENSE`, say 2019-2026.
+
 [2.4.0]
  * **AlmaLinux 10.2: Python 3.12, Cython 3.0.9 and GCC 14.** The floors are now
    the platform's own RPM versions: Python 3.12, Cython 3.0.9, Flask 3.1,

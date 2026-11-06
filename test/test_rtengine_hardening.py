@@ -554,8 +554,8 @@ def _pyproject():
 class VersionTestCase(unittest.TestCase):
     """L-12: one version, written once."""
 
-    def test_it_is_2_4_0(self):
-        self.assertEqual('2.4.0', _source_version())
+    def test_it_is_2_4_1(self):
+        self.assertEqual('2.4.1', _source_version())
 
     def test_every_reader_agrees(self):
         self.assertEqual(_source_version(), packets.__version__)
